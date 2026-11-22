@@ -94,11 +94,11 @@ func TestGitWorktreeIsolationAcrossBranches(t *testing.T) {
 	}
 
 	// Remote lease mutual exclusion.
-	ns1, err := mgr.AcquireRemoteNamespace(ctx, st, "ssh:pchan:gpu0", b1.ID, 60*time.Second)
+	ns1, err := mgr.AcquireRemoteNamespace(ctx, st, "ssh:gpu-node-01:gpu0", b1.ID, 60*time.Second)
 	if err != nil || ns1 != "runs/run_git/b1" {
 		t.Fatalf("AcquireRemoteNamespace b1: ns=%q err=%v", ns1, err)
 	}
-	if _, err := mgr.AcquireRemoteNamespace(ctx, st, "ssh:pchan:gpu0", b2.ID, 60*time.Second); !errors.Is(err, ErrRemoteResourceBusy) {
+	if _, err := mgr.AcquireRemoteNamespace(ctx, st, "ssh:gpu-node-01:gpu0", b2.ID, 60*time.Second); !errors.Is(err, ErrRemoteResourceBusy) {
 		t.Fatalf("expected ErrRemoteResourceBusy for b2, got %v", err)
 	}
 

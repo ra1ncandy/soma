@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-verify:
+    name: Test & Race Verification (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: true
+
+      - name: Install bubblewrap & git
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap git python3
+
+      - name: Configure unprivileged userns for bwrap in CI
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run full test & B1-B6 benchmark suite with race detector
+        run: go test -count=1 -race ./...
+
+      - name: Verify cross-platform static CGO_ENABLED=0 builds
+        run: |
+          for target in "linux/amd64" "linux/arm64" "darwin/amd64" "darwin/arm64"; do
+            GOOS="${target%/*}"
+            GOARCH="${target#*/}"
+            echo "Building static binaries for ${GOOS}/${GOARCH}..."
+            CGO_ENABLED=0 GOOS="${GOOS}" GOARCH="${GOARCH}" go build -trimpath -ldflags="-s -w" -o "bin/soma-${GOOS}-${GOARCH}" ./cmd/soma
+            CGO_ENABLED=0 GOOS="${GOOS}" GOARCH="${GOARCH}" go build -trimpath -ldflags="-s -w" -o "bin/soma-bridge-discord-${GOOS}-${GOARCH}" ./cmd/soma-bridge-discord
+          done

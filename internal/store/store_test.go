@@ -233,16 +233,16 @@ func TestAncestrySnapshotsJournalDeclassLeases(t *testing.T) {
 	}
 
 	// Remote lease mutual exclusion.
-	if _, err := st.AcquireRemoteLease(ctx, "gpu:pchan:0", "b_main", "runs/run_1/b_main", 60*time.Second); err != nil {
+	if _, err := st.AcquireRemoteLease(ctx, "gpu:node01:0", "b_main", "runs/run_1/b_main", 60*time.Second); err != nil {
 		t.Fatalf("AcquireRemoteLease b_main: %v", err)
 	}
-	if _, err := st.AcquireRemoteLease(ctx, "gpu:pchan:0", "b_alt", "runs/run_1/b_alt", 60*time.Second); !errors.Is(err, ErrLeaseBusy) {
+	if _, err := st.AcquireRemoteLease(ctx, "gpu:node01:0", "b_alt", "runs/run_1/b_alt", 60*time.Second); !errors.Is(err, ErrLeaseBusy) {
 		t.Fatalf("expected ErrLeaseBusy for b_alt, got %v", err)
 	}
-	if err := st.ReleaseRemoteLease(ctx, "gpu:pchan:0", "b_main"); err != nil {
+	if err := st.ReleaseRemoteLease(ctx, "gpu:node01:0", "b_main"); err != nil {
 		t.Fatalf("ReleaseRemoteLease: %v", err)
 	}
-	if _, err := st.AcquireRemoteLease(ctx, "gpu:pchan:0", "b_alt", "runs/run_1/b_alt", 60*time.Second); err != nil {
+	if _, err := st.AcquireRemoteLease(ctx, "gpu:node01:0", "b_alt", "runs/run_1/b_alt", 60*time.Second); err != nil {
 		t.Fatalf("AcquireRemoteLease b_alt after release: %v", err)
 	}
 

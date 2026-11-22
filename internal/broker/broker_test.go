@@ -158,11 +158,11 @@ func TestSSHBrokerPrefixInjectionLeaseAndFSBrokerTraversal(t *testing.T) {
 	wsMgr := workspace.NewManager(somaDir)
 	sshRunner := &mockSSHRunner{holdChan: make(chan struct{})}
 	sb := NewSSHBroker(st, wsMgr, sshRunner, HostPolicy{
-		Alias:                  "pchan",
-		Hostname:               "192.168.1.14",
-		User:                   "ame",
+		Alias:                  "gpu-node-01",
+		Hostname:               "192.0.2.14",
+		User:                   "runner",
 		AllowedCommandPrefixes: []string{"nvidia-smi", "python3 train.py"},
-		ResourceKey:            "gpu:pchan:0",
+		ResourceKey:            "gpu:gpu-node-01:0",
 		LeaseTTL:               30 * time.Second,
 	})
 
@@ -171,14 +171,14 @@ func TestSSHBrokerPrefixInjectionLeaseAndFSBrokerTraversal(t *testing.T) {
 	fb := NewFSBroker(FSRootPolicy{RootPath: extRoot, ReadOnly: true})
 
 	pol := policy.NewEngine(
-		policy.Rule{ID: "allow-ssh", Effect: taint.DecisionAllow, Capability: "ssh", OpPattern: "exec", TargetPattern: "pchan"},
+		policy.Rule{ID: "allow-ssh", Effect: taint.DecisionAllow, Capability: "ssh", OpPattern: "exec", TargetPattern: "gpu-node-01"},
 		policy.Rule{ID: "allow-fs", Effect: taint.DecisionAllow, Capability: "fs", OpPattern: "*", TargetPattern: "*"},
 	)
 	router := NewRouter(st, pol, sb, fb)
 
 	// 1. Reject shell metacharacter injection in SSH.
 	if _, err := router.Call(ctx, BrokerRequest{
-		RunID: "run_s", BranchID: "b1", Broker: "ssh", Op: "exec", Target: "pchan",
+		RunID: "run_s", BranchID: "b1", Broker: "ssh", Op: "exec", Target: "gpu-node-01",
 		ParamsJSON:  `{"command":"nvidia-smi; cat ~/.ssh/id_rsa"}`,
 		EffectClass: taint.EffectExternalWrite,
 	}); !errors.Is(err, ErrPolicyDenied) {
@@ -192,7 +192,7 @@ func TestSSHBrokerPrefixInjectionLeaseAndFSBrokerTraversal(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		_, b1Err = router.Call(ctx, BrokerRequest{
-			RunID: "run_s", BranchID: "b1", Broker: "ssh", Op: "exec", Target: "pchan",
+			RunID: "run_s", BranchID: "b1", Broker: "ssh", Op: "exec", Target: "gpu-node-01",
 			ParamsJSON:  `{"command":"nvidia-smi --query-gpu=memory.free"}`,
 			EffectClass: taint.EffectExternalWrite,
 		})
@@ -208,7 +208,7 @@ func TestSSHBrokerPrefixInjectionLeaseAndFSBrokerTraversal(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	_, b2Err := router.Call(ctx, BrokerRequest{
-		RunID: "run_s", BranchID: "b2", Broker: "ssh", Op: "exec", Target: "pchan",
+		RunID: "run_s", BranchID: "b2", Broker: "ssh", Op: "exec", Target: "gpu-node-01",
 		ParamsJSON:  `{"command":"nvidia-smi"}`,
 		EffectClass: taint.EffectExternalWrite,
 	})

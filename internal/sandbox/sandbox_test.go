@@ -158,7 +158,7 @@ func TestDockerAndSSHBackends_BuildArgsAndScrubEnv(t *testing.T) {
 		t.Fatalf("expected scrubbed env in docker args: %s", dkJoined)
 	}
 
-	sshB := NewSSHBackend("pchan-ml", "/home/ame/soma-remote", "-p", "22")
+	sshB := NewSSHBackend("gpu-node-01", "/srv/lab/soma-remote", "-p", "22")
 	sshArgs := sshB.BuildArgs(ExecSpec{
 		WorkspaceDir: ws,
 		Command:      "python3",
@@ -169,7 +169,7 @@ func TestDockerAndSSHBackends_BuildArgsAndScrubEnv(t *testing.T) {
 		},
 	})
 	sshJoined := strings.Join(sshArgs, " ")
-	if !strings.Contains(sshJoined, "BatchMode=yes") || !strings.Contains(sshJoined, "pchan-ml") || !strings.Contains(sshJoined, "/home/ame/soma-remote/") {
+	if !strings.Contains(sshJoined, "BatchMode=yes") || !strings.Contains(sshJoined, "gpu-node-01") || !strings.Contains(sshJoined, "/srv/lab/soma-remote/") {
 		t.Fatalf("unexpected ssh args: %s", sshJoined)
 	}
 	if strings.Contains(sshJoined, "rp-secret") || !strings.Contains(sshJoined, "CUDA_VISIBLE='0'") {

@@ -260,10 +260,10 @@ func (p *sshOpsProvider) Generate(_ context.Context, req dag.GenerateRequest) (*
 	switch req.TurnIndex {
 	case 1:
 		return &dag.GenerateResponse{
-			Reasoning: "attempt unallowlisted chained command on lila (must be denied by broker)",
+			Reasoning: "attempt unallowlisted chained command on vm-lab-01 (must be denied by broker)",
 			ToolCall: &dag.ToolCallSpec{
 				Name:        "ssh_exec",
-				ArgsJSON:    `{"host":"lila","command":"ls /tmp; rm -rf /"}`,
+				ArgsJSON:    `{"host":"vm-lab-01","command":"ls /tmp; rm -rf /"}`,
 				EffectClass: taint.EffectReadOnly,
 			},
 			StateHash:       "ops_inject_probe",
@@ -273,35 +273,35 @@ func (p *sshOpsProvider) Generate(_ context.Context, req dag.GenerateRequest) (*
 		}, nil
 	case 2:
 		return &dag.GenerateResponse{
-			Reasoning: "broker blocked metacharacter; run allowlisted export status checks on lila & pchan",
+			Reasoning: "broker blocked metacharacter; run allowlisted export status checks on vm-lab-01 & gpu-node-01",
 			ToolCall: &dag.ToolCallSpec{
 				Name:        "ssh_exec",
-				ArgsJSON:    `{"host":"lila","command":"ls -1 /home/ame/cyberfm-lab-lin/export"}`,
+				ArgsJSON:    `{"host":"vm-lab-01","command":"ls -1 /srv/lab/cyberfm-lab-lin/export"}`,
 				EffectClass: taint.EffectReadOnly,
 			},
-			StateHash:       "ops_lila_ok",
+			StateHash:       "ops_lab_ok",
 			InputTokens:     200,
 			CacheReadTokens: 2700,
 			OutputTokens:    35,
 		}, nil
 	case 3:
 		return &dag.GenerateResponse{
-			Reasoning: "check pchan GPU runner status via allowlisted prefix",
+			Reasoning: "check gpu-node-01 GPU runner status via allowlisted prefix",
 			ToolCall: &dag.ToolCallSpec{
 				Name:        "ssh_exec",
-				ArgsJSON:    `{"host":"pchan","command":"nvidia-smi --query-gpu=name --format=csv"}`,
+				ArgsJSON:    `{"host":"gpu-node-01","command":"nvidia-smi --query-gpu=name --format=csv"}`,
 				EffectClass: taint.EffectReadOnly,
 			},
-			StateHash:       "ops_pchan_ok",
+			StateHash:       "ops_gpu_ok",
 			InputTokens:     180,
 			CacheReadTokens: 2950,
 			OutputTokens:    30,
 		}, nil
 	default:
 		return &dag.GenerateResponse{
-			Reasoning:       "verified lila and pchan hosts safely under remote_leases without exposing host ~/.ssh",
+			Reasoning:       "verified vm-lab-01 and gpu-node-01 hosts safely under remote_leases without exposing host ~/.ssh",
 			Done:            true,
-			FinalSummary:    "lila & pchan fleet verified via allowlisted SSHBroker",
+			FinalSummary:    "vm-lab-01 & gpu-node-01 fleet verified via allowlisted SSHBroker",
 			StateHash:       "ops_done",
 			InputTokens:     150,
 			CacheReadTokens: 3150,
@@ -350,17 +350,17 @@ func (r *Runner) runSSHOpsShadow(ctx context.Context, wsDir string) (TaskResult,
 	sshRunner := &shadowSSHRunner{}
 	sshBroker := broker.NewSSHBroker(r.Store, wsMgr, sshRunner,
 		broker.HostPolicy{
-			Alias:                  "lila",
-			Hostname:               "192.168.88.194",
+			Alias:                  "vm-lab-01",
+			Hostname:               "198.51.100.194",
 			AllowedCommandPrefixes: []string{"ls -1 "},
-			ResourceKey:            "host:lila",
+			ResourceKey:            "host:vm-lab-01",
 			LeaseTTL:               30 * time.Second,
 		},
 		broker.HostPolicy{
-			Alias:                  "pchan",
-			Hostname:               "192.168.1.14",
+			Alias:                  "gpu-node-01",
+			Hostname:               "192.0.2.14",
 			AllowedCommandPrefixes: []string{"nvidia-smi "},
-			ResourceKey:            "gpu:pchan:0",
+			ResourceKey:            "gpu:gpu-node-01:0",
 			LeaseTTL:               30 * time.Second,
 		},
 	)
@@ -370,7 +370,7 @@ func (r *Runner) runSSHOpsShadow(ctx context.Context, wsDir string) (TaskResult,
 	runID, brID, err := execDag.StartRun(ctx, dag.RunRequest{
 		Title:         "shadow-ops-01",
 		WorkspacePath: wsDir,
-		GoalSpec:      "Verify lila exports and pchan GPU availability via SSHBroker",
+		GoalSpec:      "Verify vm-lab-01 exports and gpu-node-01 GPU availability via SSHBroker",
 		AccountIDs:    []string{"shadow-worker"},
 	})
 	if err != nil {
@@ -390,7 +390,7 @@ func (r *Runner) runSSHOpsShadow(ctx context.Context, wsDir string) (TaskResult,
 	return TaskResult{
 		ID:                  "shadow-ops-01",
 		Category:            "ssh_ops",
-		Title:               "Multi-host allowlisted SSHBroker (lila + pchan) + injection guard",
+		Title:               "Multi-host allowlisted SSHBroker (vm-lab-01 + gpu-node-01) + injection guard",
 		RunID:               runID,
 		WinningBranchID:     brID,
 		HeadStepID:          res.HeadStepID,
@@ -405,7 +405,7 @@ func (r *Runner) runSSHOpsShadow(ctx context.Context, wsDir string) (TaskResult,
 		ExactReplayVerified: exactOK,
 		ReplayStepsChecked:  checked,
 		DurationMS:          time.Since(start).Milliseconds(),
-		Notes:               "Blocked metacharacter injection; ran lila & pchan checks under remote_leases (vs Hermes 547 BLOCKED errors)",
+		Notes:               "Blocked metacharacter injection; ran vm-lab-01 & gpu-node-01 checks under remote_leases (vs Hermes 547 BLOCKED errors)",
 	}, nil
 }
 

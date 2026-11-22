@@ -85,7 +85,7 @@ func (d *DockerBackend) Exec(ctx context.Context, spec ExecSpec) (ExecResult, er
 	return runExternalBackendCmd(ctx, d.Name(), d.BinPath, args, spec.Timeout)
 }
 
-// SSHBackend executes commands on a remote compute host (e.g., pchan GPU node or lila VM lab)
+// SSHBackend executes commands on a remote compute host (e.g., gpu-node-01 or vm-lab-01)
 // over non-interactive SSH inside an isolated remote workspace directory with scrubbed env exports.
 type SSHBackend struct {
 	BinPath    string

@@ -27,9 +27,9 @@ func TestPolicyPrecedenceDenyOverAskOverAllow(t *testing.T) {
 	}
 
 	// Only Allow matching -> Allow.
-	dec3, _ := eng.Evaluate(Request{Capability: "ssh", Op: "exec", Target: "pchan"})
+	dec3, _ := eng.Evaluate(Request{Capability: "ssh", Op: "exec", Target: "gpu-node-01"})
 	if dec3 != taint.DecisionAllow {
-		t.Fatalf("expected Allow for pchan, got %s", dec3)
+		t.Fatalf("expected Allow for gpu-node-01, got %s", dec3)
 	}
 
 	// No match -> default Ask.

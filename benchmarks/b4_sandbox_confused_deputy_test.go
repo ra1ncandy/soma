@@ -155,15 +155,15 @@ func TestB4_SandboxContainmentAndConfusedDeputyDefense(t *testing.T) {
 	})
 	sshRunner := &b4SSHRunner{holdCh: make(chan struct{})}
 	sb := broker.NewSSHBroker(st, workspace.NewManager(somaDir), sshRunner, broker.HostPolicy{
-		Alias:                  "pchan",
-		Hostname:               "192.168.1.14",
+		Alias:                  "gpu-node-01",
+		Hostname:               "192.0.2.14",
 		AllowedCommandPrefixes: []string{"nvidia-smi"},
-		ResourceKey:            "gpu:pchan:0",
+		ResourceKey:            "gpu:gpu-node-01:0",
 		LeaseTTL:               30 * time.Second,
 	})
 	pol := policy.NewEngine(
 		policy.Rule{ID: "allow-gh", Effect: taint.DecisionAllow, Capability: "http", OpPattern: "POST", TargetPattern: "*/repos/*"},
-		policy.Rule{ID: "allow-ssh", Effect: taint.DecisionAllow, Capability: "ssh", OpPattern: "exec", TargetPattern: "pchan"},
+		policy.Rule{ID: "allow-ssh", Effect: taint.DecisionAllow, Capability: "ssh", OpPattern: "exec", TargetPattern: "gpu-node-01"},
 	)
 	router := broker.NewRouter(st, pol, hb, sb)
 
@@ -217,7 +217,7 @@ func TestB4_SandboxContainmentAndConfusedDeputyDefense(t *testing.T) {
 
 	// 4. SSH broker rejects injection and enforces remote lease exclusivity.
 	if _, err := router.Call(ctx, broker.BrokerRequest{
-		RunID: "run_b4", BranchID: "b4_1", Broker: "ssh", Op: "exec", Target: "pchan",
+		RunID: "run_b4", BranchID: "b4_1", Broker: "ssh", Op: "exec", Target: "gpu-node-01",
 		ParamsJSON: `{"command":"nvidia-smi && cat ~/.ssh/id_rsa"}`, EffectClass: taint.EffectExternalWrite,
 	}); !errors.Is(err, broker.ErrPolicyDenied) {
 		t.Fatalf("expected SSH injection rejected, got %v", err)
@@ -229,7 +229,7 @@ func TestB4_SandboxContainmentAndConfusedDeputyDefense(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		_, b1Err = router.Call(ctx, broker.BrokerRequest{
-			RunID: "run_b4", BranchID: "b4_1", Broker: "ssh", Op: "exec", Target: "pchan",
+			RunID: "run_b4", BranchID: "b4_1", Broker: "ssh", Op: "exec", Target: "gpu-node-01",
 			ParamsJSON: `{"command":"nvidia-smi"}`, EffectClass: taint.EffectExternalWrite,
 		})
 	}()
@@ -243,7 +243,7 @@ func TestB4_SandboxContainmentAndConfusedDeputyDefense(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if _, b2Err := router.Call(ctx, broker.BrokerRequest{
-		RunID: "run_b4", BranchID: "b4_2", Broker: "ssh", Op: "exec", Target: "pchan",
+		RunID: "run_b4", BranchID: "b4_2", Broker: "ssh", Op: "exec", Target: "gpu-node-01",
 		ParamsJSON: `{"command":"nvidia-smi"}`, EffectClass: taint.EffectExternalWrite,
 	}); !errors.Is(b2Err, workspace.ErrRemoteResourceBusy) {
 		t.Fatalf("expected ErrRemoteResourceBusy on concurrent SSH branch, got %v", b2Err)

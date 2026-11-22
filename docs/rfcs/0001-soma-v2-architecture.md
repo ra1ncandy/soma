@@ -17,7 +17,7 @@
 Mainstream AI coding and personal agent harnesses—**OpenClaw**, **Hermes**, **Claude Code**, and **Codex CLI**—all share the same 2024 architectural root: **an agent is a mutable linear chat transcript that directly executes side effects.**
 
 That single abstraction creates the systemic failures observed across production autonomous runs:
-1. **Linear Fragility & Crash/429 Loss**: When a rate limit (`HTTP 429`), network timeout, or process reap hits mid-run, linear transcripts either hang, retry blindly into exhaustion, or lose execution state. In 9 days of live Hermes telemetry (`hackuj` fleet), **417 / 781 kanban `task_runs` (53.4%)** died `rate_limited` and **739 / 1,662 sessions (44.5%)** ended in `ws_orphan_reap` (including **72.5%** of `ml-arch` sessions dying at 0 tokens).
+1. **Linear Fragility & Crash/429 Loss**: When a rate limit (`HTTP 429`), network timeout, or process reap hits mid-run, linear transcripts either hang, retry blindly into exhaustion, or lose execution state. In 9 days of live Hermes telemetry (multi-host research fleet), **417 / 781 kanban `task_runs` (53.4%)** died `rate_limited` and **739 / 1,662 sessions (44.5%)** ended in `ws_orphan_reap` (including **72.5%** of `ml-arch` sessions dying at 0 tokens).
 2. **Raw Log Dumping & Compaction Thrashing**: Injecting raw stdout/stderr directly into the conversation forces lossy LLM summarization loops. Across those 9 Hermes days, **3,458 messages exceeded 16 KiB** (683 over 50 KiB; max 164,660 B), triggering **567 LLM compactions** (peaking at 23 compactions in one `data-lab` session, dropping KV-cache reuse from 94.15% to 81.9%).
 3. **Flat-File Memory Rot & Self-Mutation**: Storing facts in flat markdown (`MEMORY.md` saturated at 2,199 / 2,200 B) and append-only logs (`STATUS.md` / `TASKS.md` / `scoreboard.json` ballooned to 833.6 KB) causes stale facts to fight new decisions, while agent self-editing (`150` Curator mutations bloating core skills to ~72 KB) injects harmful defensive rules.
 4. **Unconstrained Side Effects & Supply-Chain Exposure**: Broad skill hubs (OpenClaw's ClawHub, "ClawHavoc") and unguarded tool descriptions compromise even frontier models when untrusted observations mix into trusted control flow.
@@ -354,7 +354,7 @@ To support general-purpose automation—multi-host SSH/GPU clusters, GitHub/API 
 | Broker | Scope & Enforced Schema | Example General-Use Workflow |
 |---|---|---|
 | **`http`** | Allowlisted domain + path regex + HTTP method + JSON field constraints; host injects auth header directly into its own outbound HTTPS client (zero CA/MITM injection inside sandbox). | Create GitHub Draft PR (`draft: true` enforced), query RunPod API, fetch Hugging Face model cards. |
-| **`ssh`** | Allowlisted host alias (`lila`, `pchan`) + parameterized command templates / prefix allowlists + remote path scoping; host executes via host-managed SSH agent (`ControlMaster` / key). | Launch `hermes-task` training on `pchan`, check `virsh` / `nvidia-smi`, `rsync` bounded export directories—**without ever mounting `~/.ssh` into the sandbox**. |
+| **`ssh`** | Allowlisted host alias (`vm-lab-01`, `gpu-node-01`) + parameterized command templates / prefix allowlists + remote path scoping; host executes via host-managed SSH agent (`ControlMaster` / key). | Launch training on `gpu-node-01`, check `virsh` / `nvidia-smi`, `rsync` bounded export directories—**without ever mounting `~/.ssh` into the sandbox**. |
 | **`fs`** | Explicit policy-gated access to declared external read-only datasets or output directories outside the primary workspace. | Read `/data/eval_freeze_v1` (`ro`) while preventing writes to frozen benchmarks. |
 | **`channel`** | Route outbound drafts, status cards, and approval prompts to configured out-of-process Channel Bridges. | Post verification summaries to Discord/Telegram without holding bot tokens inside compute. |
 
@@ -482,7 +482,7 @@ triggers:
   - id: remote-lab-export-watch
     type: sentinel
     interval: 15m
-    command: "soma broker ssh lila list_exports_hash"
+    command: "soma broker ssh vm-lab-01 list_exports_hash"
     wake_on: output_hash_changed
     debounce: 60s
     session_mode: isolated
@@ -765,7 +765,7 @@ Calm, keyboard-first interface with four tabs (`1`–`4`):
 │ Account: codex-plus (gpt-6.2-sol) | Sandbox: bwrap(strict) | Scope: Action   │
 │ Frame: [L0: 7.8k | L1: 1.9k | L2: 4.1k | L3: 0.9k] = 14.7k / 100k (Epoch 1)  │
 ├──────────────────────────────────────────────────────────────────────────────┤
-│ ● s_15 broker_call ssh pchan run_eval → @page_19 [142 KB → 410B preview]     │
+│ ● s_15 broker_call ssh gpu-node-01 run_eval → @page_19 [142 KB → 410B preview]│
 │   └─ Preview (tabular/log): D3_60x_Dilated=0.0021 (FAIL < 0.9502)            │
 │ ● s_16 fs_patch model/time_encoder.py (+18 -9) [85ms]                        │
 │ ◌ s_17 oracle command_oracle lala_bench_track_d ...                          │

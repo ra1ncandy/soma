@@ -1,8 +1,8 @@
 # `soma` v0.4 Reproducible Shadow Gauntlet Benchmark Report (Suite B6)
 
-- **Generated At**: `2026-11-22T15:46:05Z`
+- **Generated At**: `2026-11-22T19:55:02Z`
 - **Kernel Version**: `v0.4.0 (RFC-0001 v2.1 Complete — Shadow Gauntlet & Branching Search)`
-- **Reference Baseline**: Hermes Forensic Audit (hackuj/lila/pchan, Nov 2026)
+- **Reference Baseline**: Hermes Multi-Host Production Audit (Nov 2026)
 - **Suite B6 Acceptance Gate**: **PASS** (`soma` `100%` vs. Linear `25%` = **4.00x**, `ExactReplay=100%`, `Compactions=0`)
 
 ---
@@ -34,7 +34,7 @@
 | Task ID | Domain | `soma` | Linear | Branches | Graveyard | Turns | Cache Hit | Oracles | Replay (`exact`) | Notes |
 |---|---|---|---|---:|---:|---:|---:|---|---|---|
 | `shadow-coding-01` | `coding` | **PASS** | FAIL | 1 | 0 | 4 | 93.0% | 1/2 runs | PASS (4 steps) | Oracle caught Turn-2 premature Done cleanly; repaired & passed in git_worktree |
-| `shadow-ops-01` | `ssh_ops` | **PASS** | FAIL | 1 | 0 | 4 | 93.4% | policy+lease | PASS (4 steps) | Blocked metacharacter injection; ran lila & pchan checks under remote_leases (vs Hermes 547 BLOCKED errors) |
+| `shadow-ops-01` | `ssh_ops` | **PASS** | FAIL | 1 | 0 | 4 | 93.4% | policy+lease | PASS (4 steps) | Blocked metacharacter injection; ran vm-lab-01 & gpu-node-01 checks under remote_leases (vs Hermes 547 BLOCKED errors) |
 | `shadow-ml-lala-01` | `ml_rd` | **PASS** | FAIL | 3 | 2 | 10 | 94.4% | 2/2 tracks | PASS (12 steps) | Abandoned 2 trapped branches into Graveyard; 3rd copy_snapshot branch passed Track D+E |
 | `shadow-quota-01` | `quota_chaos` | **PASS** | PASS (degraded) | 1 | 0 | 2 | 91.7% | 0 lost steps | PASS (2 steps) | Epoch 2 Handoff Packet avoided 429 reap; primary preference restored after cooldown (linear stuck on fallback) |
 
@@ -48,8 +48,8 @@ go test -count=1 -race -v ./benchmarks/...
 
 # Inspect or regenerate this shadow gauntlet report cleanly
 make shadow
-# Exact SHA-256 replay for shadow-coding-01 (coding): soma replay br_18ea688f2958de5a_0002 --mode exact (head step: step_9f1bd5e850da81d741d5799b)
-# Exact SHA-256 replay for shadow-ops-01 (ssh_ops): soma replay br_18ea688f2b1656ba_0002 --mode exact (head step: step_d7ef18d0a93ca938ac456de8)
-# Exact SHA-256 replay for shadow-ml-lala-01 (ml_rd): soma replay br_18ea688f2bfcac54_0009 --mode exact (head step: step_86289b45fd84226ebedc6d09)
-# Exact SHA-256 replay for shadow-quota-01 (quota_chaos): soma replay br_18ea688f2ca7237a_0002 --mode exact (head step: step_71b58a39dc10e5e7b173a39d)
+# Exact SHA-256 replay for shadow-coding-01 (coding): soma replay br_18ea7624fc6ed551_0002 --mode exact (head step: step_2fcf6140a627e59b77cd4c2d)
+# Exact SHA-256 replay for shadow-ops-01 (ssh_ops): soma replay br_18ea7624fe7c5f89_0002 --mode exact (head step: step_c7b12f1720f3e6cf84de57f7)
+# Exact SHA-256 replay for shadow-ml-lala-01 (ml_rd): soma replay br_18ea7624ff9d137a_0009 --mode exact (head step: step_016a03782eecb4e282e4a022)
+# Exact SHA-256 replay for shadow-quota-01 (quota_chaos): soma replay br_18ea762500551319_0002 --mode exact (head step: step_1d9263ecdcb2f4484021f330)
 ```

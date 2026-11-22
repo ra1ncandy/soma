@@ -21,10 +21,10 @@ type BaselineMetrics struct {
 	LinearCompletionRate   float64 `json:"linear_completion_rate"`
 }
 
-// DefaultHermesBaseline returns the empirical Hermes forensic baseline measured across hackuj/lila/pchan.
+// DefaultHermesBaseline returns the empirical Hermes forensic baseline measured across multi-host production runs.
 func DefaultHermesBaseline() BaselineMetrics {
 	return BaselineMetrics{
-		SourceLabel:            "Hermes Forensic Audit (hackuj/lila/pchan, Nov 2026)",
+		SourceLabel:            "Hermes Multi-Host Production Audit (Nov 2026)",
 		Sessions:               324,
 		Compactions:            567,
 		RateLimitDeaths:        417,
