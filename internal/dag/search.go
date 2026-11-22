@@ -127,11 +127,12 @@ func (s *BranchSearcher) SearchExistingRun(ctx context.Context, runID, rootBranc
 		att.FailureReason = reason
 		out.Attempts = append(out.Attempts, att)
 
-		// Suspend cleanly without abandoning when blocked by quota or operator gates.
+		// Suspend cleanly without abandoning when blocked by quota, approvals, or transient network errors.
 		var sqErr *SuspendedQuotaError
 		var saErr *SuspendedApprovalError
 		var srErr *SuspendedReconcileError
-		if errors.As(execErr, &sqErr) || errors.As(execErr, &saErr) || errors.As(execErr, &srErr) {
+		var trErr *TransientError
+		if errors.As(execErr, &sqErr) || errors.As(execErr, &saErr) || errors.As(execErr, &srErr) || errors.As(execErr, &trErr) {
 			break
 		}
 

@@ -3,6 +3,8 @@ package dag
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -39,20 +41,20 @@ type GenerateRequest struct {
 
 // GenerateResponse represents the normalized model emission for one turn.
 type GenerateResponse struct {
-	Reasoning        string              `json:"reasoning"`
-	Done             bool                `json:"done"`
-	FinalSummary     string              `json:"final_summary,omitempty"`
-	ToolCall         *ToolCallSpec       `json:"tool_call,omitempty"`
-	DynamicSkill     *compiler.SkillBody `json:"dynamic_skill,omitempty"`
+	Reasoning        string               `json:"reasoning"`
+	Done             bool                 `json:"done"`
+	FinalSummary     string               `json:"final_summary,omitempty"`
+	ToolCall         *ToolCallSpec        `json:"tool_call,omitempty"`
+	DynamicSkill     *compiler.SkillBody  `json:"dynamic_skill,omitempty"`
 	DynamicMCP       *compiler.ToolSchema `json:"dynamic_mcp,omitempty"`
-	StateHash        string              `json:"state_hash"`
-	InputTokens      int                 `json:"input_tokens"`
-	CacheReadTokens  int                 `json:"cache_read_tokens"`
-	CacheWriteTokens int                 `json:"cache_write_tokens"`
-	OutputTokens     int                 `json:"output_tokens"`
-	CostUSD          float64             `json:"cost_usd"`
-	LatencyMS        int64               `json:"latency_ms"`
-	RawEmitted       []byte              `json:"-"`
+	StateHash        string               `json:"state_hash"`
+	InputTokens      int                  `json:"input_tokens"`
+	CacheReadTokens  int                  `json:"cache_read_tokens"`
+	CacheWriteTokens int                  `json:"cache_write_tokens"`
+	OutputTokens     int                  `json:"output_tokens"`
+	CostUSD          float64              `json:"cost_usd"`
+	LatencyMS        int64                `json:"latency_ms"`
+	RawEmitted       []byte               `json:"-"`
 }
 
 // RateLimitError signals an HTTP 429 or subscription quota limit so the kernel can suspend cleanly.
@@ -86,20 +88,118 @@ type ModelProvider interface {
 	Generate(ctx context.Context, req GenerateRequest) (*GenerateResponse, error)
 }
 
-// OpenAICompatProvider talks to any OpenAI-compatible /v1/chat/completions endpoint.
+// OpenAICompatProvider talks to any OpenAI-compatible /v1/chat/completions endpoint
+// with deterministic tool schemas, KV-cache usage parsing, and OpenCode Go session routing.
 type OpenAICompatProvider struct {
-	BaseURL    string
-	APIKey     string
-	HTTPClient *http.Client
+	BaseURL     string
+	APIKey      string
+	HTTPClient  *http.Client
+	MaxTokens   int
+	EnableTools bool
 }
 
-// NewOpenAICompatProvider creates a client targeting baseURL (e.g. http://127.0.0.1:11434/v1).
+// NewOpenAICompatProvider creates a client targeting baseURL (e.g. https://opencode.ai/zen/go/v1).
 func NewOpenAICompatProvider(baseURL, apiKey string) *OpenAICompatProvider {
 	return &OpenAICompatProvider{
-		BaseURL: strings.TrimRight(baseURL, "/"),
-		APIKey:  apiKey,
+		BaseURL:     strings.TrimRight(baseURL, "/"),
+		APIKey:      apiKey,
+		MaxTokens:   2048,
+		EnableTools: true,
 		HTTPClient: &http.Client{
-			Timeout: 90 * time.Second,
+			Timeout: 120 * time.Second,
+		},
+	}
+}
+
+func canonicalOpenAITools() []map[string]any {
+	// Lexicographically ordered by function name to keep prompt/tool prefixes byte-stable across turns.
+	return []map[string]any{
+		{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "exec",
+				"description": "Execute a shell command inside the isolated branch workspace.",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"command": map[string]any{"type": "string", "description": "Shell command to execute inside workspace"},
+					},
+					"required": []string{"command"},
+				},
+			},
+		},
+		{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "fs_list",
+				"description": "List relative file paths inside the workspace or a subdirectory.",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"path": map[string]any{"type": "string", "description": "Optional relative subdirectory (default '.')"},
+					},
+				},
+			},
+		},
+		{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "fs_read",
+				"description": "Read a file inside the workspace (large files spill to @page handles).",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"path": map[string]any{"type": "string", "description": "Relative path inside workspace"},
+					},
+					"required": []string{"path"},
+				},
+			},
+		},
+		{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "fs_write",
+				"description": "Write complete file contents inside the workspace.",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"content": map[string]any{"type": "string", "description": "Exact UTF-8 file contents"},
+						"path":    map[string]any{"type": "string", "description": "Relative target file path"},
+					},
+					"required": []string{"path", "content"},
+				},
+			},
+		},
+		{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "page_grep",
+				"description": "Search a spilled @page virtual memory handle using a regex or substring pattern.",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"page_id": map[string]any{"type": "string", "description": "Page handle ID (e.g. page_0001)"},
+						"pattern": map[string]any{"type": "string", "description": "Regex pattern to match lines"},
+					},
+					"required": []string{"page_id", "pattern"},
+				},
+			},
+		},
+		{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "page_slice",
+				"description": "Read a specific 1-indexed line range from a spilled @page virtual memory handle.",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"end_line":   map[string]any{"type": "integer", "description": "1-indexed end line inclusive"},
+						"page_id":    map[string]any{"type": "string", "description": "Page handle ID (e.g. page_0001)"},
+						"start_line": map[string]any{"type": "integer", "description": "1-indexed start line"},
+					},
+					"required": []string{"page_id", "start_line", "end_line"},
+				},
+			},
 		},
 	}
 }
@@ -108,6 +208,11 @@ func (p *OpenAICompatProvider) Generate(ctx context.Context, req GenerateRequest
 	if p.BaseURL == "" {
 		return nil, errors.New("openai-compat provider: empty BaseURL")
 	}
+	maxToks := p.MaxTokens
+	if maxToks <= 0 {
+		maxToks = 2048
+	}
+
 	payload := map[string]any{
 		"model": req.ModelID,
 		"messages": []map[string]string{
@@ -115,7 +220,13 @@ func (p *OpenAICompatProvider) Generate(ctx context.Context, req GenerateRequest
 			{"role": "user", "content": req.Frame.Layer2 + "\n" + req.Frame.Layer3},
 		},
 		"temperature": 0.0,
+		"max_tokens":  maxToks,
 	}
+	if p.EnableTools {
+		payload["tools"] = canonicalOpenAITools()
+		payload["tool_choice"] = "auto"
+	}
+
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
@@ -126,8 +237,20 @@ func (p *OpenAICompatProvider) Generate(ctx context.Context, req GenerateRequest
 		return nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("User-Agent", "soma/0.4")
 	if p.APIKey != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+p.APIKey)
+	}
+	if strings.Contains(strings.ToLower(p.BaseURL), "opencode.ai") {
+		sessRun := req.RunID
+		if sessRun == "" {
+			sessRun = "run"
+		}
+		sessBr := req.BranchID
+		if sessBr == "" {
+			sessBr = "main"
+		}
+		httpReq.Header.Set("x-opencode-session", fmt.Sprintf("soma-%s-%s", sessRun, sessBr))
 	}
 
 	start := time.Now()
@@ -168,39 +291,119 @@ func (p *OpenAICompatProvider) Generate(ctx context.Context, req GenerateRequest
 	var parsed struct {
 		Choices []struct {
 			Message struct {
-				Content string `json:"content"`
+				Content          string `json:"content"`
+				ReasoningContent string `json:"reasoning_content"`
+				ToolCalls        []struct {
+					ID       string `json:"id"`
+					Type     string `json:"type"`
+					Function struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls"`
 			} `json:"message"`
 		} `json:"choices"`
 		Usage struct {
-			PromptTokens        int `json:"prompt_tokens"`
-			CompletionTokens    int `json:"completion_tokens"`
+			PromptTokens        int     `json:"prompt_tokens"`
+			CompletionTokens    int     `json:"completion_tokens"`
+			Cost                float64 `json:"cost"`
 			PromptTokensDetails struct {
 				CachedTokens int `json:"cached_tokens"`
 			} `json:"prompt_tokens_details"`
+			OpenCode struct {
+				Tokens struct {
+					CacheRead int `json:"cache_read"`
+				} `json:"tokens"`
+			} `json:"opencode"`
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal(respBytes, &parsed); err != nil {
 		return nil, fmt.Errorf("decode chat completion: %w", err)
 	}
-	content := ""
-	if len(parsed.Choices) > 0 {
-		content = parsed.Choices[0].Message.Content
+
+	cached := parsed.Usage.PromptTokensDetails.CachedTokens
+	if parsed.Usage.OpenCode.Tokens.CacheRead > cached {
+		cached = parsed.Usage.OpenCode.Tokens.CacheRead
 	}
-	uncached := parsed.Usage.PromptTokens - parsed.Usage.PromptTokensDetails.CachedTokens
+	uncached := parsed.Usage.PromptTokens - cached
 	if uncached < 0 {
 		uncached = parsed.Usage.PromptTokens
 	}
-	return &GenerateResponse{
-		Reasoning:       content,
-		Done:            true,
-		FinalSummary:    content,
-		StateHash:       fmt.Sprintf("http_t%d", req.TurnIndex),
+
+	gen := &GenerateResponse{
 		InputTokens:     uncached,
-		CacheReadTokens: parsed.Usage.PromptTokensDetails.CachedTokens,
+		CacheReadTokens: cached,
 		OutputTokens:    parsed.Usage.CompletionTokens,
+		CostUSD:         parsed.Usage.Cost,
 		LatencyMS:       time.Since(start).Milliseconds(),
 		RawEmitted:      respBytes,
-	}, nil
+	}
+
+	if len(parsed.Choices) == 0 {
+		gen.Done = true
+		gen.StateHash = shortHashHex([]byte("empty"))
+		return gen, nil
+	}
+
+	msg := parsed.Choices[0].Message
+	content := strings.TrimSpace(msg.Content)
+	reasoning := content
+	if reasoning == "" {
+		reasoning = strings.TrimSpace(msg.ReasoningContent)
+	}
+	if len(reasoning) > 280 {
+		reasoning = reasoning[:277] + "..."
+	}
+
+	if len(msg.ToolCalls) > 0 {
+		fn := msg.ToolCalls[0].Function
+		argsJSON := strings.TrimSpace(fn.Arguments)
+		if argsJSON == "" {
+			argsJSON = "{}"
+		}
+		if reasoning == "" {
+			reasoning = fmt.Sprintf("invoke %s", fn.Name)
+		}
+		var refs []string
+		var argMap map[string]any
+		if json.Unmarshal([]byte(argsJSON), &argMap) == nil {
+			if pid, ok := argMap["page_id"].(string); ok && strings.TrimSpace(pid) != "" {
+				refs = append(refs, strings.TrimPrefix(strings.TrimSpace(pid), "@"))
+			}
+		}
+		gen.Reasoning = reasoning
+		gen.Done = false
+		gen.ToolCall = &ToolCallSpec{
+			Name:              fn.Name,
+			ArgsJSON:          argsJSON,
+			EffectClass:       inferToolEffectClass(fn.Name),
+			ReferencedPageIDs: refs,
+		}
+		gen.StateHash = shortHashHex([]byte(fn.Name + "|" + argsJSON))
+		return gen, nil
+	}
+
+	gen.Reasoning = reasoning
+	gen.Done = true
+	gen.FinalSummary = content
+	gen.StateHash = shortHashHex([]byte("done|" + content))
+	return gen, nil
+}
+
+func inferToolEffectClass(toolName string) taint.EffectClass {
+	switch toolName {
+	case "fs_read", "fs_list", "page_slice", "page_grep":
+		return taint.EffectReadOnly
+	case "fs_write", "fs_patch", "exec":
+		return taint.EffectWorkspaceWrite
+	default:
+		return taint.EffectReadOnly
+	}
+}
+
+func shortHashHex(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:8])
 }
 
 func parseRetryAfter(hdr string) time.Duration {

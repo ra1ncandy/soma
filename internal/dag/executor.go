@@ -7,13 +7,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/ra1ncandy/soma/internal/compiler"
+	"github.com/ra1ncandy/soma/internal/sandbox"
 	"github.com/ra1ncandy/soma/internal/store"
 	"github.com/ra1ncandy/soma/internal/taint"
 	"github.com/ra1ncandy/soma/internal/vmem"
@@ -1437,7 +1441,7 @@ func (e *Executor) loadMemoryAndGraveyard(ctx context.Context, runID string) ([]
 func (e *Executor) buildEpochInput(run store.Run, activeMem []compiler.MemoryEntry, grave []compiler.GraveyardEntry) compiler.EpochInput {
 	sys := e.SystemPrompt
 	if sys == "" {
-		sys = "You are soma, executing inside an isolated branch workspace. Verify facts directly before declaring completion."
+		sys = "You are soma, executing inside an isolated branch workspace. Available workspace tools: fs_list, fs_read, fs_write, exec, page_grep, page_slice. When large outputs spill to @page_XXXX handles, inspect them using page_grep(page_id, pattern) or page_slice(page_id, start_line, end_line) instead of guessing. Verify all edits before declaring completion."
 	}
 	return compiler.EpochInput{
 		SystemPrompt:  sys,
@@ -1459,14 +1463,20 @@ func detectWorkspaceKind(wsPath string) string {
 	return "generic"
 }
 
-// LocalToolRunner executes safe workspace-scoped operations for v0.1 CLI and tests.
+// LocalToolRunner executes safe workspace-scoped operations (fs_list, fs_read, fs_write, exec, page_slice, page_grep).
 type LocalToolRunner struct {
-	vm *vmem.Manager
+	vm      *vmem.Manager
+	Sandbox *sandbox.Manager
 }
 
 // NewLocalToolRunner constructs a workspace-scoped tool runner.
 func NewLocalToolRunner(vm *vmem.Manager) *LocalToolRunner {
 	return &LocalToolRunner{vm: vm}
+}
+
+// NewSandboxedToolRunner constructs a workspace-scoped tool runner executing shell commands inside sbx.
+func NewSandboxedToolRunner(vm *vmem.Manager, sbx *sandbox.Manager) *LocalToolRunner {
+	return &LocalToolRunner{vm: vm, Sandbox: sbx}
 }
 
 func (r *LocalToolRunner) Execute(ctx context.Context, call ToolCall) (ToolOutput, error) {
@@ -1478,6 +1488,43 @@ func (r *LocalToolRunner) Execute(ctx context.Context, call ToolCall) (ToolOutpu
 	}
 
 	switch call.Name {
+	case "fs_list":
+		rel, _ := args["path"].(string)
+		root := call.WorkspaceDir
+		if strings.TrimSpace(rel) != "" && rel != "." {
+			target, err := resolveInsideWorkspace(call.WorkspaceDir, rel)
+			if err != nil {
+				return ToolOutput{}, err
+			}
+			root = target
+		}
+		var paths []string
+		err := filepath.WalkDir(root, func(p string, d fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			base := d.Name()
+			if d.IsDir() && (base == ".git" || base == ".soma") {
+				return filepath.SkipDir
+			}
+			if p == root || d.IsDir() {
+				return nil
+			}
+			relPath, rErr := filepath.Rel(call.WorkspaceDir, p)
+			if rErr == nil {
+				paths = append(paths, filepath.ToSlash(relPath))
+			}
+			return nil
+		})
+		if err != nil {
+			return ToolOutput{}, err
+		}
+		sort.Strings(paths)
+		if len(paths) > 2000 {
+			paths = paths[:2000]
+		}
+		return ToolOutput{NameHint: "fs_list.txt", Content: []byte(strings.Join(paths, "\n")), TrustTier: "trusted_repo"}, nil
+
 	case "fs_read":
 		rel, _ := args["path"].(string)
 		target, err := resolveInsideWorkspace(call.WorkspaceDir, rel)
@@ -1509,8 +1556,45 @@ func (r *LocalToolRunner) Execute(ctx context.Context, call ToolCall) (ToolOutpu
 			TrustTier: "trusted_repo",
 		}, nil
 
+	case "exec":
+		command, _ := args["command"].(string)
+		if strings.TrimSpace(command) == "" {
+			return ToolOutput{}, errors.New("exec requires non-empty command")
+		}
+		if r.Sandbox != nil {
+			res, err := r.Sandbox.Exec(ctx, sandbox.ExecSpec{
+				WorkspaceDir: call.WorkspaceDir,
+				Command:      "/bin/sh",
+				Args:         []string{"-c", command},
+				Timeout:      20 * time.Second,
+			})
+			if err != nil {
+				return ToolOutput{}, err
+			}
+			body := fmt.Sprintf("exit_code=%d\n%s", res.ExitCode, string(res.Combined))
+			return ToolOutput{NameHint: "exec.log", Content: []byte(body), TrustTier: "trusted_repo"}, nil
+		}
+		runCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(runCtx, "/bin/sh", "-c", command)
+		cmd.Dir = call.WorkspaceDir
+		cmd.Env = sandbox.ScrubEnv(nil)
+		out, err := cmd.CombinedOutput()
+		exitCode := 0
+		if err != nil {
+			var ee *exec.ExitError
+			if errors.As(err, &ee) {
+				exitCode = ee.ExitCode()
+			} else {
+				return ToolOutput{}, err
+			}
+		}
+		body := fmt.Sprintf("exit_code=%d\n%s", exitCode, string(out))
+		return ToolOutput{NameHint: "exec.log", Content: []byte(body), TrustTier: "trusted_repo"}, nil
+
 	case "page_slice":
 		pid, _ := args["page_id"].(string)
+		pid = strings.TrimPrefix(strings.TrimSpace(pid), "@")
 		startF, _ := args["start_line"].(float64)
 		endF, _ := args["end_line"].(float64)
 		out, err := r.vm.Slice(ctx, pid, int(startF), int(endF))
@@ -1521,6 +1605,7 @@ func (r *LocalToolRunner) Execute(ctx context.Context, call ToolCall) (ToolOutpu
 
 	case "page_grep":
 		pid, _ := args["page_id"].(string)
+		pid = strings.TrimPrefix(strings.TrimSpace(pid), "@")
 		pat, _ := args["pattern"].(string)
 		out, err := r.vm.Grep(ctx, pid, pat, 40)
 		if err != nil {

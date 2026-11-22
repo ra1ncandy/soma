@@ -14,6 +14,7 @@ import (
 	"github.com/ra1ncandy/soma/internal/oracle"
 	"github.com/ra1ncandy/soma/internal/sandbox"
 	"github.com/ra1ncandy/soma/internal/shadow"
+	"github.com/ra1ncandy/soma/internal/vmem"
 )
 
 func newShadowCmd() *cobra.Command {
@@ -144,17 +145,22 @@ func newSearchCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if err := ensureDefaultAccount(cmd.Context(), st, modelID); err != nil {
+			accID, err := ensureModelAccount(cmd.Context(), st, modelID, !useMock)
+			if err != nil {
 				return err
 			}
 
-			exec := dag.NewExecutor(st, prov, nil, prof)
-			exec.Verifier = oracle.NewVerifier(st, sandbox.NewManager())
+			sbx := sandbox.NewManager()
+			tools := dag.NewSandboxedToolRunner(vmem.NewManager(st), sbx)
+			exec := dag.NewExecutor(st, prov, tools, prof)
+			exec.AccountIDs = []string{accID}
+			exec.Verifier = oracle.NewVerifier(st, sbx)
 			searcher := dag.NewBranchSearcher(exec)
 			res, err := searcher.Search(cmd.Context(), dag.RunRequest{
 				WorkspacePath: absDir,
 				GoalSpec:      goal,
 				Profile:       prof,
+				AccountIDs:    []string{accID},
 			}, dag.SearchConfig{
 				MaxBranches:       maxBranches,
 				MaxTurnsPerBranch: maxTurns,

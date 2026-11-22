@@ -19,6 +19,7 @@ import (
 	"github.com/ra1ncandy/soma/internal/replay"
 	"github.com/ra1ncandy/soma/internal/sandbox"
 	"github.com/ra1ncandy/soma/internal/store"
+	"github.com/ra1ncandy/soma/internal/vmem"
 )
 
 const Version = "v0.4.0 (RFC-0001 v2.1 Complete — Shadow Gauntlet & Branching Search)"
@@ -161,16 +162,21 @@ func newRunCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if err := ensureDefaultAccount(cmd.Context(), st, modelID); err != nil {
+			accID, err := ensureModelAccount(cmd.Context(), st, modelID, !useMock)
+			if err != nil {
 				return err
 			}
 
-			exec := dag.NewExecutor(st, prov, nil, prof)
-			exec.Verifier = oracle.NewVerifier(st, sandbox.NewManager())
+			sbx := sandbox.NewManager()
+			tools := dag.NewSandboxedToolRunner(vmem.NewManager(st), sbx)
+			exec := dag.NewExecutor(st, prov, tools, prof)
+			exec.AccountIDs = []string{accID}
+			exec.Verifier = oracle.NewVerifier(st, sbx)
 			runID, branchID, err := exec.StartRun(cmd.Context(), dag.RunRequest{
 				WorkspacePath: absDir,
 				GoalSpec:      goal,
 				Profile:       prof,
+				AccountIDs:    []string{accID},
 			})
 			if err != nil {
 				return err
@@ -218,12 +224,16 @@ func newResumeCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if err := ensureDefaultAccount(cmd.Context(), st, modelID); err != nil {
+			accID, err := ensureModelAccount(cmd.Context(), st, modelID, !useMock)
+			if err != nil {
 				return err
 			}
 
-			exec := dag.NewExecutor(st, prov, nil, prof)
-			exec.Verifier = oracle.NewVerifier(st, sandbox.NewManager())
+			sbx := sandbox.NewManager()
+			tools := dag.NewSandboxedToolRunner(vmem.NewManager(st), sbx)
+			exec := dag.NewExecutor(st, prov, tools, prof)
+			exec.AccountIDs = []string{accID}
+			exec.Verifier = oracle.NewVerifier(st, sbx)
 			res, execErr := exec.ExecuteBranch(cmd.Context(), branch.ID, maxTurns)
 			printBranchResult(cmd.OutOrStdout(), branch.RunID, branch.ID, res)
 			return execErr
@@ -587,6 +597,39 @@ func ensureDefaultAccount(ctx context.Context, st *store.Store, modelID string) 
 		BillingMode:   "local",
 		MaxConcurrent: 2,
 	})
+}
+
+func ensureModelAccount(ctx context.Context, st *store.Store, modelID string, live bool) (string, error) {
+	accs, err := st.ListAccounts(ctx)
+	if err != nil {
+		return "", err
+	}
+	for _, a := range accs {
+		if a.ModelID == modelID {
+			return a.ID, nil
+		}
+	}
+	accID := "default"
+	provider := "local"
+	mode := "local"
+	if live {
+		clean := strings.NewReplacer("/", "-", ":", "-", " ", "-").Replace(modelID)
+		accID = "live-" + clean
+		provider = "openai-compat"
+		mode = "subscription"
+	} else if len(accs) > 0 {
+		accID = "mock-" + modelID
+	}
+	if err := st.UpsertAccount(ctx, store.Account{
+		ID:            accID,
+		Provider:      provider,
+		ModelID:       modelID,
+		BillingMode:   mode,
+		MaxConcurrent: 4,
+	}); err != nil {
+		return "", err
+	}
+	return accID, nil
 }
 
 func printBranchResult(w interface{ Write([]byte) (int, error) }, runID, branchID string, res *dag.BranchResult) {
