@@ -184,3 +184,28 @@ type InboxItem struct {
 	Status      string
 	CreatedAt   int64
 }
+
+// Contract binds an external verification oracle specification to a Run.
+type Contract struct {
+	ID         string
+	RunID      string
+	Kind       string
+	SpecJSON   string
+	PinnedHash string
+	Required   bool
+	CreatedAt  int64
+}
+
+// ContractRun records the outcome of evaluating a Contract against a specific Step on a Branch.
+type ContractRun struct {
+	ID                 string
+	ContractID         string
+	BranchID           string
+	StepID             string
+	Passed             bool
+	OutputPageID       string
+	ArtifactSHA256     string
+	CounterexampleText string
+	DurationMS         int64
+	CreatedAt          int64
+}

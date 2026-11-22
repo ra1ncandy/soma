@@ -113,6 +113,28 @@ type ActionReconciler interface {
 	Reconcile(ctx context.Context, entry store.ActionJournalEntry) (ReconcileOutcome, ToolOutput, error)
 }
 
+// VerifySummary aggregates external verification contract results for a branch.
+type VerifySummary struct {
+	AllPassed      bool
+	Counterexample string
+	OutputPageIDs  []string
+}
+
+// ContractVerifier checks attached external verification oracles before allowing StatusCompleted.
+type ContractVerifier interface {
+	VerifyBranch(ctx context.Context, run store.Run, branch store.Branch, stepID string) (VerifySummary, error)
+}
+
+// VerificationFailedError indicates a branch failed one or more required external verification contracts.
+type VerificationFailedError struct {
+	BranchID       string
+	Counterexample string
+}
+
+func (e *VerificationFailedError) Error() string {
+	return fmt.Sprintf("verification failed on branch %s: %s", e.BranchID, e.Counterexample)
+}
+
 // RunRequest configures a new Run and its root Branch.
 type RunRequest struct {
 	RunID         string
@@ -156,6 +178,7 @@ type Executor struct {
 	Provider          ModelProvider
 	Tools             ToolRunner
 	Reconciler        ActionReconciler
+	Verifier          ContractVerifier
 	Profile           compiler.ModelProfile
 	SystemPrompt      string
 	AccountIDs        []string
@@ -510,6 +533,7 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 	}
 
 	lastStateHash := ""
+	lastOracleError := ""
 	if branch.HeadStepID != "" {
 		if hs, err := e.Store.GetStep(ctx, branch.HeadStepID); err == nil {
 			lastStateHash = hs.StateHash
@@ -536,6 +560,7 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 		tail := compiler.LiveTailState{
 			WorkspaceKind:       run.WorkspaceKind,
 			ResearchStatus:      fmt.Sprintf("workspace=%s (%s)", filepath.Base(branch.WorkspaceDir), branch.WorkspaceStrategy),
+			LastOracleError:     lastOracleError,
 			StepBudgetRemaining: maxTurns - turn,
 			AccountQuotaSummary: fmt.Sprintf("%s:%s", acc.ID, acc.ModelID),
 			StallCount:          branch.StallCount,
@@ -628,6 +653,11 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 				return res, err
 			}
 			sid := ComputeStepID(branch.HeadStepID, branch.ID, snapID, acc.ModelID, deltaHash, frame.CompiledFrameHash, emHash, "")
+
+			initialStatus := string(StatusCompleted)
+			if e.Verifier != nil {
+				initialStatus = string(StatusVerifying)
+			}
 			if err := e.Store.AppendStep(ctx, store.Step{
 				ID:                 sid,
 				RunID:              run.ID,
@@ -650,16 +680,54 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 				LatencyMS:          genResp.LatencyMS,
 			}, store.BranchUpdate{
 				Epoch:           snap.Epoch,
-				Status:          string(StatusCompleted),
+				Status:          initialStatus,
 				ActiveAccountID: acc.ID,
 				StallCount:      branch.StallCount,
 			}); err != nil {
 				return res, err
 			}
-			_ = e.Store.UpdateRunStatus(ctx, run.ID, string(StatusCompleted))
+
+			branch.HeadStepID = sid
+			branch.ActiveAccountID = acc.ID
 			res.HeadStepID = sid
-			res.Status = StatusCompleted
 			res.TurnsExecuted++
+
+			if e.Verifier != nil {
+				summary, vErr := e.Verifier.VerifyBranch(ctx, run, branch, sid)
+				if vErr != nil {
+					_ = e.Store.UpdateBranchStatus(ctx, branch.ID, string(StatusFailed), acc.ID, branch.StallCount)
+					res.Status = StatusFailed
+					return res, vErr
+				}
+				if !summary.AllPassed {
+					lastOracleError = summary.Counterexample
+					oracleNotice := compiler.LogEntry{
+						Kind:        "turn",
+						TurnIndex:   nextTurn,
+						Reasoning:   "External Verification Contract failed",
+						Action:      "oracle_verify",
+						Observation: "ORACLE FAILED:\n" + summary.Counterexample,
+					}
+					nextPending = append(nextPending, oracleNotice)
+					l2 = append(l2, nextPending...)
+					pendingDeltaAppends = nextPending
+					nextTurn++
+
+					if turn == maxTurns-1 {
+						_ = e.Store.UpdateBranchStatus(ctx, branch.ID, string(StatusFailed), acc.ID, branch.StallCount)
+						_ = e.Store.UpdateRunStatus(ctx, run.ID, string(StatusFailed))
+						res.Status = StatusFailed
+						return res, &VerificationFailedError{BranchID: branch.ID, Counterexample: summary.Counterexample}
+					}
+					_ = e.Store.UpdateBranchStatus(ctx, branch.ID, string(StatusRunning), acc.ID, branch.StallCount)
+					res.Status = StatusRunning
+					continue
+				}
+				_ = e.Store.UpdateBranchStatus(ctx, branch.ID, string(StatusCompleted), acc.ID, branch.StallCount)
+			}
+
+			_ = e.Store.UpdateRunStatus(ctx, run.ID, string(StatusCompleted))
+			res.Status = StatusCompleted
 			res.FinalSummary = genResp.FinalSummary
 			return res, nil
 		}
@@ -855,6 +923,12 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 		res.TurnsExecuted++
 	}
 
+	if lastOracleError != "" {
+		_ = e.Store.UpdateBranchStatus(ctx, branch.ID, string(StatusFailed), branch.ActiveAccountID, branch.StallCount)
+		_ = e.Store.UpdateRunStatus(ctx, run.ID, string(StatusFailed))
+		res.Status = StatusFailed
+		return res, &VerificationFailedError{BranchID: branch.ID, Counterexample: lastOracleError}
+	}
 	return res, nil
 }
 

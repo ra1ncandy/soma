@@ -15,11 +15,13 @@ import (
 
 	"github.com/ra1ncandy/soma/internal/compiler"
 	"github.com/ra1ncandy/soma/internal/dag"
+	"github.com/ra1ncandy/soma/internal/oracle"
 	"github.com/ra1ncandy/soma/internal/replay"
+	"github.com/ra1ncandy/soma/internal/sandbox"
 	"github.com/ra1ncandy/soma/internal/store"
 )
 
-const Version = "v0.1.0 (RFC-0001 v2.1 Durable Core)"
+const Version = "v0.2.0 (RFC-0001 v2.1 Security, Memory, Standards & Oracles)"
 
 type projectConfig struct {
 	Version       int    `yaml:"version"`
@@ -46,6 +48,10 @@ func NewRootCmd() *cobra.Command {
 		newReconcileCmd(),
 		newXRayCmd(),
 		newStatusCmd(),
+		newMemoryCmd(),
+		newSkillCmd(),
+		newOracleCmd(),
+		newSandboxCmd(),
 	)
 	return root
 }
@@ -152,6 +158,7 @@ func newRunCmd() *cobra.Command {
 			}
 
 			exec := dag.NewExecutor(st, prov, nil, prof)
+			exec.Verifier = oracle.NewVerifier(st, sandbox.NewManager())
 			runID, branchID, err := exec.StartRun(cmd.Context(), dag.RunRequest{
 				WorkspacePath: absDir,
 				GoalSpec:      goal,
@@ -208,6 +215,7 @@ func newResumeCmd() *cobra.Command {
 			}
 
 			exec := dag.NewExecutor(st, prov, nil, prof)
+			exec.Verifier = oracle.NewVerifier(st, sandbox.NewManager())
 			res, execErr := exec.ExecuteBranch(cmd.Context(), branch.ID, maxTurns)
 			printBranchResult(cmd.OutOrStdout(), branch.RunID, branch.ID, res)
 			return execErr

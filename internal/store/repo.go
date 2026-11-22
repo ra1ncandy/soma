@@ -842,8 +842,29 @@ func (s *Store) ReleaseRemoteLease(ctx context.Context, resourceKey, branchID st
 
 // --- Memory Graph ---
 
-// InsertMemoryNode inserts a bi-temporal rule, fact, preference, or negative_path node.
-func (s *Store) InsertMemoryNode(ctx context.Context, m MemoryNode) error {
+func scanMemoryNode(sc rowScanner) (MemoryNode, error) {
+	var m MemoryNode
+	var sig, provStep, evPage sql.NullString
+	var validTo sql.NullInt64
+	var enabled int
+	if err := sc.Scan(
+		&m.ID, &m.Scope, &m.Kind, &m.Content, &sig, &m.Status, &m.TrustTier,
+		&provStep, &evPage, &m.ValidFrom, &validTo, &m.IngestedAt, &enabled,
+	); err != nil {
+		return MemoryNode{}, err
+	}
+	m.SignatureHash = sig.String
+	m.ProvenanceStepID = provStep.String
+	m.EvidencePageID = evPage.String
+	if validTo.Valid {
+		v := validTo.Int64
+		m.ValidTo = &v
+	}
+	m.Enabled = enabled != 0
+	return m, nil
+}
+
+func insertMemoryNodeTx(ctx context.Context, conn *sql.Conn, m MemoryNode) error {
 	now := time.Now().Unix()
 	if m.ValidFrom == 0 {
 		m.ValidFrom = now
@@ -857,37 +878,24 @@ func (s *Store) InsertMemoryNode(ctx context.Context, m MemoryNode) error {
 	if m.TrustTier == "" {
 		m.TrustTier = "trusted_user"
 	}
-	return s.WithWriteTx(ctx, func(conn *sql.Conn) error {
-		_, err := conn.ExecContext(ctx, `
-			INSERT INTO memory_nodes (
-				id, scope, kind, content, signature_hash, status, trust_tier,
-				provenance_step_id, evidence_page_id, valid_from, valid_to, ingested_at, enabled
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			m.ID, m.Scope, m.Kind, m.Content, nullStr(m.SignatureHash), m.Status, m.TrustTier,
-			nullStr(m.ProvenanceStepID), nullStr(m.EvidencePageID),
-			m.ValidFrom, m.ValidTo, m.IngestedAt, boolToInt(m.Enabled),
-		)
-		return err
-	})
+	_, err := conn.ExecContext(ctx, `
+		INSERT INTO memory_nodes (
+			id, scope, kind, content, signature_hash, status, trust_tier,
+			provenance_step_id, evidence_page_id, valid_from, valid_to, ingested_at, enabled
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		m.ID, m.Scope, m.Kind, m.Content, nullStr(m.SignatureHash), m.Status, m.TrustTier,
+		nullStr(m.ProvenanceStepID), nullStr(m.EvidencePageID),
+		m.ValidFrom, m.ValidTo, m.IngestedAt, boolToInt(m.Enabled),
+	)
+	return err
 }
 
-// ListActiveMemory returns active, enabled, un-invalidated memory nodes ordered deterministically by ID.
-func (s *Store) ListActiveMemory(ctx context.Context, scope string, kinds []string) ([]MemoryNode, error) {
-	var scopes []string
-	if scope != "" {
-		scopes = []string{scope}
-	}
-	return s.ListActiveMemoryByScopes(ctx, scopes, kinds)
-}
-
-// ListActiveMemoryByScopes returns active memory nodes across multiple scopes in deterministic ID order.
-func (s *Store) ListActiveMemoryByScopes(ctx context.Context, scopes []string, kinds []string) ([]MemoryNode, error) {
+func queryMemoryRows(ctx context.Context, db *sql.DB, baseWhere string, scopes, kinds []string, baseArgs ...any) ([]MemoryNode, error) {
 	query := `
 		SELECT id, scope, kind, content, signature_hash, status, trust_tier,
 		       provenance_step_id, evidence_page_id, valid_from, valid_to, ingested_at, enabled
-		FROM memory_nodes
-		WHERE status = 'active' AND valid_to IS NULL AND enabled = 1`
-	var args []any
+		FROM memory_nodes WHERE ` + baseWhere
+	args := append([]any(nil), baseArgs...)
 
 	if len(scopes) > 0 {
 		placeholders := strings.Repeat("?,", len(scopes))
@@ -905,7 +913,7 @@ func (s *Store) ListActiveMemoryByScopes(ctx context.Context, scopes []string, k
 	}
 	query += ` ORDER BY id ASC`
 
-	rows, err := s.reader.QueryContext(ctx, query, args...)
+	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -913,25 +921,179 @@ func (s *Store) ListActiveMemoryByScopes(ctx context.Context, scopes []string, k
 
 	var out []MemoryNode
 	for rows.Next() {
-		var m MemoryNode
-		var sig, provStep, evPage sql.NullString
-		var validTo sql.NullInt64
-		var enabled int
-		if err := rows.Scan(
-			&m.ID, &m.Scope, &m.Kind, &m.Content, &sig, &m.Status, &m.TrustTier,
-			&provStep, &evPage, &m.ValidFrom, &validTo, &m.IngestedAt, &enabled,
-		); err != nil {
+		m, err := scanMemoryNode(rows)
+		if err != nil {
 			return nil, err
 		}
-		m.SignatureHash = sig.String
-		m.ProvenanceStepID = provStep.String
-		m.EvidencePageID = evPage.String
-		if validTo.Valid {
-			v := validTo.Int64
-			m.ValidTo = &v
-		}
-		m.Enabled = enabled != 0
 		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+// InsertMemoryNode inserts a bi-temporal rule, fact, preference, or negative_path node.
+func (s *Store) InsertMemoryNode(ctx context.Context, m MemoryNode) error {
+	return s.WithWriteTx(ctx, func(conn *sql.Conn) error {
+		return insertMemoryNodeTx(ctx, conn, m)
+	})
+}
+
+// GetMemoryNode fetches a MemoryNode by ID.
+func (s *Store) GetMemoryNode(ctx context.Context, id string) (MemoryNode, error) {
+	row := s.reader.QueryRowContext(ctx, `
+		SELECT id, scope, kind, content, signature_hash, status, trust_tier,
+		       provenance_step_id, evidence_page_id, valid_from, valid_to, ingested_at, enabled
+		FROM memory_nodes WHERE id = ?`, id)
+	m, err := scanMemoryNode(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return MemoryNode{}, ErrNotFound
+	}
+	return m, err
+}
+
+// SupersedeMemoryNode atomically invalidates oldID, inserts newNode, and records a SUPERSEDES edge.
+func (s *Store) SupersedeMemoryNode(ctx context.Context, oldID string, newNode MemoryNode, provenanceStepID string) error {
+	return s.MergeMemoryNodes(ctx, []string{oldID}, newNode, provenanceStepID)
+}
+
+// MergeMemoryNodes atomically supersedes oldIDs into mergedNode with SUPERSEDES (1-to-1) or MERGES (N-to-1) edges.
+func (s *Store) MergeMemoryNodes(ctx context.Context, oldIDs []string, mergedNode MemoryNode, provenanceStepID string) error {
+	if len(oldIDs) == 0 {
+		return errors.New("MergeMemoryNodes requires at least one oldID")
+	}
+	now := time.Now().Unix()
+	if mergedNode.ValidFrom == 0 {
+		mergedNode.ValidFrom = now
+	}
+	if mergedNode.IngestedAt == 0 {
+		mergedNode.IngestedAt = now
+	}
+	if mergedNode.Status == "" {
+		mergedNode.Status = "active"
+	}
+	rel := "MERGES"
+	if len(oldIDs) == 1 {
+		rel = "SUPERSEDES"
+	}
+	validTo := mergedNode.ValidFrom
+
+	return s.WithWriteTx(ctx, func(conn *sql.Conn) error {
+		if err := insertMemoryNodeTx(ctx, conn, mergedNode); err != nil {
+			return err
+		}
+		for _, oldID := range oldIDs {
+			res, err := conn.ExecContext(ctx, `
+				UPDATE memory_nodes SET status = 'superseded', valid_to = ? WHERE id = ?`,
+				validTo, oldID,
+			)
+			if err != nil {
+				return err
+			}
+			n, err := res.RowsAffected()
+			if err != nil {
+				return err
+			}
+			if n == 0 {
+				return fmt.Errorf("%w: old memory node %s", ErrNotFound, oldID)
+			}
+			if _, err := conn.ExecContext(ctx, `
+				INSERT INTO memory_edges (from_node_id, to_node_id, relation, provenance_step_id, created_at)
+				VALUES (?, ?, ?, ?, ?)`,
+				mergedNode.ID, oldID, rel, nullStr(provenanceStepID), mergedNode.IngestedAt,
+			); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// ActivateMemoryNode transitions a 'proposed' memory node to 'active'.
+func (s *Store) ActivateMemoryNode(ctx context.Context, id string) error {
+	return s.WithWriteTx(ctx, func(conn *sql.Conn) error {
+		res, err := conn.ExecContext(ctx, `UPDATE memory_nodes SET status = 'active' WHERE id = ?`, id)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return ErrNotFound
+		}
+		return nil
+	})
+}
+
+// ArchiveMemoryNode marks a memory node 'archived' at validTo.
+func (s *Store) ArchiveMemoryNode(ctx context.Context, id string, validTo int64) error {
+	if validTo == 0 {
+		validTo = time.Now().Unix()
+	}
+	return s.WithWriteTx(ctx, func(conn *sql.Conn) error {
+		res, err := conn.ExecContext(ctx, `UPDATE memory_nodes SET status = 'archived', valid_to = ? WHERE id = ?`, validTo, id)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return ErrNotFound
+		}
+		return nil
+	})
+}
+
+// ListActiveMemory returns active, enabled, un-invalidated memory nodes ordered deterministically by ID.
+func (s *Store) ListActiveMemory(ctx context.Context, scope string, kinds []string) ([]MemoryNode, error) {
+	var scopes []string
+	if scope != "" {
+		scopes = []string{scope}
+	}
+	return s.ListActiveMemoryByScopes(ctx, scopes, kinds)
+}
+
+// ListActiveMemoryByScopes returns active memory nodes across multiple scopes in deterministic ID order.
+func (s *Store) ListActiveMemoryByScopes(ctx context.Context, scopes []string, kinds []string) ([]MemoryNode, error) {
+	return queryMemoryRows(ctx, s.reader, "status = 'active' AND valid_to IS NULL AND enabled = 1", scopes, kinds)
+}
+
+// QueryMemoryAsOf returns enabled non-proposed memory nodes valid at point-in-time asOfUnix.
+func (s *Store) QueryMemoryAsOf(ctx context.Context, scopes []string, kinds []string, asOfUnix int64) ([]MemoryNode, error) {
+	return queryMemoryRows(
+		ctx,
+		s.reader,
+		"valid_from <= ? AND (valid_to IS NULL OR valid_to > ?) AND status != 'proposed' AND enabled = 1",
+		scopes,
+		kinds,
+		asOfUnix,
+		asOfUnix,
+	)
+}
+
+// ListMemoryEdges returns all edges touching nodeID.
+func (s *Store) ListMemoryEdges(ctx context.Context, nodeID string) ([]MemoryEdge, error) {
+	rows, err := s.reader.QueryContext(ctx, `
+		SELECT id, from_node_id, to_node_id, relation, provenance_step_id, created_at
+		FROM memory_edges
+		WHERE from_node_id = ? OR to_node_id = ?
+		ORDER BY id ASC`, nodeID, nodeID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []MemoryEdge
+	for rows.Next() {
+		var e MemoryEdge
+		var prov sql.NullString
+		if err := rows.Scan(&e.ID, &e.FromNodeID, &e.ToNodeID, &e.Relation, &prov, &e.CreatedAt); err != nil {
+			return nil, err
+		}
+		e.ProvenanceStepID = prov.String
+		out = append(out, e)
 	}
 	return out, rows.Err()
 }
@@ -1198,4 +1360,96 @@ func (s *Store) UpdateInboxStatus(ctx context.Context, id, status string) error 
 		}
 		return nil
 	})
+}
+
+// --- Verification Contracts ---
+
+// CreateContract persists a verification contract attached to a Run.
+func (s *Store) CreateContract(ctx context.Context, c Contract) error {
+	now := time.Now().Unix()
+	if c.CreatedAt == 0 {
+		c.CreatedAt = now
+	}
+	return s.WithWriteTx(ctx, func(conn *sql.Conn) error {
+		_, err := conn.ExecContext(ctx, `
+			INSERT INTO contracts (id, run_id, kind, spec_json, pinned_hash, required, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			c.ID, c.RunID, c.Kind, c.SpecJSON, c.PinnedHash, boolToInt(c.Required), c.CreatedAt,
+		)
+		return err
+	})
+}
+
+// ListRunContracts returns all contracts bound to runID ordered by creation time and ID.
+func (s *Store) ListRunContracts(ctx context.Context, runID string) ([]Contract, error) {
+	rows, err := s.reader.QueryContext(ctx, `
+		SELECT id, run_id, kind, spec_json, pinned_hash, required, created_at
+		FROM contracts WHERE run_id = ? ORDER BY created_at ASC, id ASC`, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []Contract
+	for rows.Next() {
+		var c Contract
+		var req int
+		if err := rows.Scan(&c.ID, &c.RunID, &c.Kind, &c.SpecJSON, &c.PinnedHash, &req, &c.CreatedAt); err != nil {
+			return nil, err
+		}
+		c.Required = req != 0
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// RecordContractRun stores an evaluation record for a contract run.
+func (s *Store) RecordContractRun(ctx context.Context, cr ContractRun) error {
+	now := time.Now().Unix()
+	if cr.CreatedAt == 0 {
+		cr.CreatedAt = now
+	}
+	return s.WithWriteTx(ctx, func(conn *sql.Conn) error {
+		_, err := conn.ExecContext(ctx, `
+			INSERT INTO contract_runs (
+				id, contract_id, branch_id, step_id, passed, output_page_id,
+				artifact_sha256, counterexample_text, duration_ms, created_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			cr.ID, cr.ContractID, cr.BranchID, cr.StepID, boolToInt(cr.Passed),
+			nullStr(cr.OutputPageID), nullStr(cr.ArtifactSHA256),
+			nullStr(cr.CounterexampleText), cr.DurationMS, cr.CreatedAt,
+		)
+		return err
+	})
+}
+
+// ListBranchContractRuns returns contract evaluation history for branchID.
+func (s *Store) ListBranchContractRuns(ctx context.Context, branchID string) ([]ContractRun, error) {
+	rows, err := s.reader.QueryContext(ctx, `
+		SELECT id, contract_id, branch_id, step_id, passed, output_page_id,
+		       artifact_sha256, counterexample_text, duration_ms, created_at
+		FROM contract_runs WHERE branch_id = ? ORDER BY created_at ASC, id ASC`, branchID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []ContractRun
+	for rows.Next() {
+		var cr ContractRun
+		var passed int
+		var outPage, sha, ce sql.NullString
+		if err := rows.Scan(
+			&cr.ID, &cr.ContractID, &cr.BranchID, &cr.StepID, &passed,
+			&outPage, &sha, &ce, &cr.DurationMS, &cr.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		cr.Passed = passed != 0
+		cr.OutputPageID = outPage.String
+		cr.ArtifactSHA256 = sha.String
+		cr.CounterexampleText = ce.String
+		out = append(out, cr)
+	}
+	return out, rows.Err()
 }

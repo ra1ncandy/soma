@@ -289,6 +289,59 @@ func TestAncestrySnapshotsJournalDeclassLeases(t *testing.T) {
 	if err != nil || len(items) != 1 || items[0].ID != "inbox_1" {
 		t.Fatalf("ListInboxItems: %+v, err=%v", items, err)
 	}
+
+	// Bi-temporal supersession, N-to-1 merge, AsOf query, and Contracts.
+	if err := st.InsertMemoryNode(ctx, MemoryNode{
+		ID: "M-010", Scope: "global", Kind: "rule", Content: "v1 rule", Status: "active", ValidFrom: 100, IngestedAt: 100, Enabled: true,
+	}); err != nil {
+		t.Fatalf("InsertMemoryNode M-010: %v", err)
+	}
+	if err := st.SupersedeMemoryNode(ctx, "M-010", MemoryNode{
+		ID: "M-011", Scope: "global", Kind: "rule", Content: "v2 rule", Status: "active", ValidFrom: 200, IngestedAt: 200, Enabled: true,
+	}, "s1"); err != nil {
+		t.Fatalf("SupersedeMemoryNode: %v", err)
+	}
+	if err := st.InsertMemoryNode(ctx, MemoryNode{
+		ID: "M-012", Scope: "global", Kind: "rule", Content: "extra rule", Status: "active", ValidFrom: 210, IngestedAt: 210, Enabled: true,
+	}); err != nil {
+		t.Fatalf("InsertMemoryNode M-012: %v", err)
+	}
+	if err := st.MergeMemoryNodes(ctx, []string{"M-011", "M-012"}, MemoryNode{
+		ID: "M-013", Scope: "global", Kind: "rule", Content: "merged rule", Status: "active", ValidFrom: 300, IngestedAt: 300, Enabled: true,
+	}, "s2"); err != nil {
+		t.Fatalf("MergeMemoryNodes: %v", err)
+	}
+
+	asOf150, err := st.QueryMemoryAsOf(ctx, []string{"global"}, []string{"rule"}, 150)
+	if err != nil {
+		t.Fatalf("QueryMemoryAsOf 150: %v", err)
+	}
+	var got150 []string
+	for _, m := range asOf150 {
+		got150 = append(got150, m.ID)
+	}
+	if len(got150) != 1 || got150[0] != "M-010" {
+		t.Fatalf("expected [M-010] at t=150, got %v", got150)
+	}
+	edges, err := st.ListMemoryEdges(ctx, "M-013")
+	if err != nil || len(edges) != 2 {
+		t.Fatalf("expected 2 MERGES edges on M-013, got %+v err=%v", edges, err)
+	}
+
+	if err := st.CreateContract(ctx, Contract{
+		ID: "ctr_1", RunID: "run_1", Kind: "command_oracle", SpecJSON: `{}`, PinnedHash: "ph1", Required: true,
+	}); err != nil {
+		t.Fatalf("CreateContract: %v", err)
+	}
+	if err := st.RecordContractRun(ctx, ContractRun{
+		ID: "crun_1", ContractID: "ctr_1", BranchID: "b_main", StepID: "s1", Passed: true, ArtifactSHA256: "abc", DurationMS: 12,
+	}); err != nil {
+		t.Fatalf("RecordContractRun: %v", err)
+	}
+	cruns, err := st.ListBranchContractRuns(ctx, "b_main")
+	if err != nil || len(cruns) != 1 || !cruns[0].Passed {
+		t.Fatalf("ListBranchContractRuns: %+v err=%v", cruns, err)
+	}
 }
 
 func TestSplitPoolConcurrencyNoSQLiteBusy(t *testing.T) {
