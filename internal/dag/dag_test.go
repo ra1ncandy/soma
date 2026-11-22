@@ -282,3 +282,142 @@ func TestCrashRecoveryIdempotentAndIrreversibleNeverAutoRetries(t *testing.T) {
 		t.Fatalf("expected total remote writes == 1, got %d", tools.remoteWrites.Load())
 	}
 }
+
+type failoverTestProvider struct {
+	primaryLimitTurn int
+	usedAccounts     []string
+}
+
+func (p *failoverTestProvider) Generate(_ context.Context, req GenerateRequest) (*GenerateResponse, error) {
+	p.usedAccounts = append(p.usedAccounts, req.AccountID)
+	if req.AccountID == "primary" && req.TurnIndex == p.primaryLimitTurn {
+		return nil, &RateLimitError{
+			AccountID:  "primary",
+			RetryAfter: 50 * time.Millisecond,
+			Err:        errors.New("429 primary window exhausted"),
+		}
+	}
+	if req.TurnIndex == 1 {
+		return &GenerateResponse{
+			Reasoning: "read repo context",
+			ToolCall: &ToolCallSpec{
+				Name:        "inspect",
+				ArgsJSON:    `{}`,
+				EffectClass: taint.EffectReadOnly,
+			},
+			StateHash: "s1",
+		}, nil
+	}
+	if req.TurnIndex == 2 {
+		if req.AccountID == "fallback" && !strings.Contains(req.Frame.Layer2, "handoff") {
+			return nil, errors.New("expected Epoch 2 handoff packet in Layer2 after failover")
+		}
+		return &GenerateResponse{
+			Reasoning: "continue on epoch 2",
+			ToolCall: &ToolCallSpec{
+				Name:        "patch",
+				ArgsJSON:    `{}`,
+				EffectClass: taint.EffectReadOnly,
+			},
+			StateHash: "s2",
+		}, nil
+	}
+	return &GenerateResponse{
+		Reasoning:    "finished cleanly",
+		Done:         true,
+		FinalSummary: "ok",
+		StateHash:    "done",
+	}, nil
+}
+
+func TestExecutor_MultiSubscriptionFailoverCleanEpoch(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), ".soma"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+
+	for _, acc := range []store.Account{
+		{ID: "primary", Provider: "openai-codex", ModelID: "gpt-6.2-sol", BillingMode: "subscription", MaxConcurrent: 2},
+		{ID: "fallback", Provider: "xai-oauth", ModelID: "grok-4.6", BillingMode: "subscription", MaxConcurrent: 2},
+	} {
+		if err := st.UpsertAccount(ctx, acc); err != nil {
+			t.Fatalf("UpsertAccount %s: %v", acc.ID, err)
+		}
+	}
+
+	ws := t.TempDir()
+	prov := &failoverTestProvider{primaryLimitTurn: 2}
+	exec := NewExecutor(st, prov, &recordingToolRunner{}, compiler.WorkerProfile())
+	exec.AllowFailover = true
+	exec.AccountIDs = []string{"primary", "fallback"}
+
+	_, b1, err := exec.StartRun(ctx, RunRequest{
+		WorkspacePath: ws,
+		GoalSpec:      "survive primary 429 cleanly",
+		AccountIDs:    []string{"primary", "fallback"},
+	})
+	if err != nil {
+		t.Fatalf("StartRun b1: %v", err)
+	}
+
+	res1, err := exec.ExecuteBranch(ctx, b1, 10)
+	if err != nil || res1.Status != StatusCompleted {
+		t.Fatalf("ExecuteBranch b1 failed: res=%+v err=%v", res1, err)
+	}
+	if res1.Rollovers < 1 {
+		t.Fatalf("expected clean epoch rollover on failover, got Rollovers=%d", res1.Rollovers)
+	}
+
+	steps1, err := st.ListBranchSteps(ctx, b1)
+	if err != nil || len(steps1) != 3 {
+		t.Fatalf("expected 3 steps on b1, got %d err=%v", len(steps1), err)
+	}
+	if steps1[0].Epoch != 1 || steps1[0].AccountID != "primary" {
+		t.Fatalf("expected step 1 on epoch 1 primary, got epoch=%d acc=%s", steps1[0].Epoch, steps1[0].AccountID)
+	}
+	if steps1[1].Epoch != 2 || steps1[1].AccountID != "fallback" {
+		t.Fatalf("expected step 2 on epoch 2 fallback, got epoch=%d acc=%s", steps1[1].Epoch, steps1[1].AccountID)
+	}
+	// Verify SHA-256 bit-for-bit frame reconstruction on the Epoch 2 failover step.
+	frame2, err := compiler.ReconstructFrame(ctx, st, steps1[1].ID, compiler.WorkerProfile())
+	if err != nil {
+		t.Fatalf("ReconstructFrame epoch 2 failover step: %v", err)
+	}
+	if !strings.Contains(frame2.Layer2, "handoff account=\"fallback\"") {
+		t.Fatalf("expected handoff packet in reconstructed Epoch 2 frame, got:\n%s", frame2.Layer2)
+	}
+
+	// Ensure AccountIDs ordering was NOT mutated and primary preference returns once cooldown expires.
+	if exec.AccountIDs[0] != "primary" {
+		t.Fatalf("AccountIDs order mutated: %v", exec.AccountIDs)
+	}
+	time.Sleep(65 * time.Millisecond)
+
+	prov2 := &failoverTestProvider{primaryLimitTurn: 99}
+	exec2 := NewExecutor(st, prov2, &recordingToolRunner{}, compiler.WorkerProfile())
+	exec2.AllowFailover = true
+	exec2.AccountIDs = []string{"primary", "fallback"}
+	_, b2, err := exec2.StartRun(ctx, RunRequest{
+		WorkspacePath: ws,
+		GoalSpec:      "primary recovers after cooldown",
+		AccountIDs:    []string{"primary", "fallback"},
+	})
+	if err != nil {
+		t.Fatalf("StartRun b2: %v", err)
+	}
+	res2, err := exec2.ExecuteBranch(ctx, b2, 10)
+	if err != nil || res2.Status != StatusCompleted {
+		t.Fatalf("ExecuteBranch b2 failed: res=%+v err=%v", res2, err)
+	}
+	steps2, err := st.ListBranchSteps(ctx, b2)
+	if err != nil || len(steps2) != 3 {
+		t.Fatalf("expected 3 steps on b2, got %d err=%v", len(steps2), err)
+	}
+	for i, s := range steps2 {
+		if s.AccountID != "primary" {
+			t.Fatalf("expected primary preference restored on step %d, got %s", i, s.AccountID)
+		}
+	}
+}

@@ -209,3 +209,15 @@ type ContractRun struct {
 	DurationMS         int64
 	CreatedAt          int64
 }
+
+// TriggerRun records a coalesced/idempotent Tier-0 daemon event firing with TTL GC.
+type TriggerRun struct {
+	IdempotencyKey   string
+	TriggerID        string
+	LastSentinelHash string
+	BranchID         string
+	Status           string // skipped | coalesced | running | done | failed
+	CostUSD          float64
+	CreatedAt        int64
+	ExpiresAt        int64
+}

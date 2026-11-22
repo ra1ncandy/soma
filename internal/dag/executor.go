@@ -182,6 +182,7 @@ type Executor struct {
 	Profile           compiler.ModelProfile
 	SystemPrompt      string
 	AccountIDs        []string
+	AllowFailover     bool
 	AfterDispatchHook func(ctx context.Context, entry store.ActionJournalEntry) error
 	seq               atomic.Uint64
 }
@@ -540,21 +541,51 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 		}
 	}
 
+	var preacquiredAcc *store.Account
+	failoverAttempts := 0
+
 	for turn := 0; turn < maxTurns; turn++ {
 		if ctx.Err() != nil {
+			if preacquiredAcc != nil {
+				_ = e.Scheduler.Release(ctx, preacquiredAcc.ID, 0)
+			}
 			return res, ctx.Err()
 		}
 
-		// Acquire sticky-epoch account lease.
-		acc, err := e.Scheduler.Acquire(ctx, branch.ActiveAccountID, e.AccountIDs)
-		if err != nil {
-			var coolErr *ErrAllAccountsCoolingDown
-			if errors.As(err, &coolErr) {
-				_ = e.Store.UpdateBranchStatus(ctx, branch.ID, string(StatusSuspendedQuota), branch.ActiveAccountID, branch.StallCount)
-				res.Status = StatusSuspendedQuota
-				return res, &SuspendedQuotaError{BranchID: branch.ID, ResumeAt: coolErr.EarliestResumeAt}
+		// Acquire sticky-epoch account lease (returning to primary preference on resume if cooldown expired).
+		var acc store.Account
+		if preacquiredAcc != nil {
+			acc = *preacquiredAcc
+			preacquiredAcc = nil
+		} else {
+			preferred := branch.ActiveAccountID
+			if turn == 0 && e.AllowFailover && len(e.AccountIDs) > 0 && preferred != "" && preferred != e.AccountIDs[0] {
+				if primaryAcc, pErr := e.Store.GetAccount(ctx, e.AccountIDs[0]); pErr == nil && primaryAcc.CooldownUntil <= time.Now().UnixMilli() {
+					preferred = primaryAcc.ID
+				}
 			}
-			return res, err
+			var acqErr error
+			acc, acqErr = e.Scheduler.Acquire(ctx, preferred, e.AccountIDs)
+			if acqErr != nil {
+				var coolErr *ErrAllAccountsCoolingDown
+				if errors.As(acqErr, &coolErr) {
+					_ = e.Store.UpdateBranchStatus(ctx, branch.ID, string(StatusSuspendedQuota), branch.ActiveAccountID, branch.StallCount)
+					res.Status = StatusSuspendedQuota
+					return res, &SuspendedQuotaError{BranchID: branch.ID, ResumeAt: coolErr.EarliestResumeAt}
+				}
+				return res, acqErr
+			}
+			if turn == 0 && e.AllowFailover && branch.ActiveAccountID != "" && acc.ID != branch.ActiveAccountID && len(l2) > 0 {
+				if nextSnap, nextSnapID, handoffL2, rollErr := e.rolloverWithHandoff(ctx, run, branch, snap, l2, nextTurn, branch.ActiveAccountID, acc.ID); rollErr == nil {
+					snap = nextSnap
+					snapID = nextSnapID
+					l2 = handoffL2
+					pendingDeltaAppends = handoffL2
+					branch.Epoch = nextSnap.Epoch
+					branch.ActiveAccountID = acc.ID
+					res.Rollovers++
+				}
+			}
 		}
 
 		tail := compiler.LiveTailState{
@@ -611,6 +642,26 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 			if errors.As(genErr, &rlErr) {
 				_ = e.Scheduler.RecordRateLimit(ctx, acc.ID, rlErr.RetryAfter, rlErr.Error())
 				_ = e.Scheduler.Release(ctx, acc.ID, 0)
+				if e.AllowFailover && failoverAttempts < len(e.AccountIDs)+1 {
+					fbAcc, fbErr := e.Scheduler.Acquire(ctx, "", e.AccountIDs)
+					if fbErr == nil {
+						failoverAttempts++
+						nextSnap, nextSnapID, handoffL2, rollErr := e.rolloverWithHandoff(ctx, run, branch, snap, l2, nextTurn, acc.ID, fbAcc.ID)
+						if rollErr == nil {
+							snap = nextSnap
+							snapID = nextSnapID
+							l2 = handoffL2
+							pendingDeltaAppends = handoffL2
+							branch.Epoch = nextSnap.Epoch
+							branch.ActiveAccountID = fbAcc.ID
+							res.Rollovers++
+							preacquiredAcc = &fbAcc
+							turn--
+							continue
+						}
+						_ = e.Scheduler.Release(ctx, fbAcc.ID, 0)
+					}
+				}
 				_ = e.Store.UpdateBranchStatus(ctx, branch.ID, string(StatusSuspendedQuota), acc.ID, branch.StallCount)
 				res.Status = StatusSuspendedQuota
 				return res, &SuspendedQuotaError{
@@ -1279,6 +1330,53 @@ func (e *Executor) persistEpochSnapshot(ctx context.Context, runID, branchID str
 		return "", err
 	}
 	return snapID, nil
+}
+
+func (e *Executor) rolloverWithHandoff(
+	ctx context.Context,
+	run store.Run,
+	branch store.Branch,
+	snap compiler.EpochSnapshot,
+	l2 []compiler.LogEntry,
+	turnIndex int,
+	fromAccountID, toAccountID string,
+) (compiler.EpochSnapshot, string, []compiler.LogEntry, error) {
+	activeMem, graveyard, err := e.loadMemoryAndGraveyard(ctx, run.ID)
+	if err != nil {
+		return compiler.EpochSnapshot{}, "", nil, err
+	}
+	baseIn := e.buildEpochInput(run, activeMem, graveyard)
+	nextSnap, skeleton := compiler.Rollover(snap, l2, activeMem, graveyard, baseIn)
+
+	contracts, _ := e.Store.ListRunContracts(ctx, run.ID)
+	pageSet := make(map[string]bool)
+	var pages []string
+	for _, entry := range l2 {
+		if entry.PageID != "" && !pageSet[entry.PageID] {
+			pageSet[entry.PageID] = true
+			pages = append(pages, "@"+entry.PageID)
+		}
+	}
+	pageSummary := "none"
+	if len(pages) > 0 {
+		pageSummary = strings.Join(pages, ",")
+	}
+	handoffSummary := fmt.Sprintf(
+		"handoff from=%s to=%s | goal=%q | contracts=%d | graveyard=%d | pages=%s",
+		fromAccountID, toAccountID, run.GoalSpec, len(contracts), len(graveyard), pageSummary,
+	)
+	skeleton = append(skeleton, compiler.LogEntry{
+		Kind:        "handoff",
+		TurnIndex:   turnIndex,
+		Name:        toAccountID,
+		Observation: handoffSummary,
+	})
+
+	nextSnapID, err := e.persistEpochSnapshot(ctx, run.ID, branch.ID, nextSnap)
+	if err != nil {
+		return compiler.EpochSnapshot{}, "", nil, err
+	}
+	return nextSnap, nextSnapID, skeleton, nil
 }
 
 func (e *Executor) loadMemoryAndGraveyard(ctx context.Context, runID string) ([]compiler.MemoryEntry, []compiler.GraveyardEntry, error) {

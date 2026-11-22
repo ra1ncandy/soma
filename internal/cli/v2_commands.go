@@ -7,6 +7,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -203,7 +204,106 @@ func newMemoryCmd() *cobra.Command {
 	auditCmd.Flags().StringVar(&auditDir, "dir", ".", "Workspace directory")
 	auditCmd.Flags().StringVar(&auditScope, "scope", "", "Filter by scope")
 
-	memCmd.AddCommand(listCmd, addCmd, supCmd, mergeCmd, auditCmd)
+	var graphDir string
+	graphCmd := &cobra.Command{
+		Use:   "graph <node_id>",
+		Short: "Display SUPERSEDES / MERGES / CONTRADICTS edges touching node_id",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			absDir, err := filepath.Abs(graphDir)
+			if err != nil {
+				return err
+			}
+			st, err := openStore(absDir)
+			if err != nil {
+				return err
+			}
+			defer func() { _ = st.Close() }()
+
+			node, err := st.GetMemoryNode(cmd.Context(), args[0])
+			if err != nil {
+				return err
+			}
+			edges, err := st.ListMemoryEdges(cmd.Context(), node.ID)
+			if err != nil {
+				return err
+			}
+			out := cmd.OutOrStdout()
+			fmt.Fprintf(out, "Node %s [%s] (%s/%s): %s\n", node.ID, node.Status, node.Scope, node.Kind, node.Content)
+			fmt.Fprintf(out, "Edges (%d):\n", len(edges))
+			for _, e := range edges {
+				fmt.Fprintf(out, "  %s --[%s]--> %s (step=%s)\n", e.FromNodeID, e.Relation, e.ToNodeID, e.ProvenanceStepID)
+			}
+			return nil
+		},
+	}
+	graphCmd.Flags().StringVar(&graphDir, "dir", ".", "Workspace directory")
+
+	var editDir, editContent string
+	editCmd := &cobra.Command{
+		Use:   "edit <node_id>",
+		Short: "Edit a memory node directly via --content or $EDITOR",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			absDir, err := filepath.Abs(editDir)
+			if err != nil {
+				return err
+			}
+			st, err := openStore(absDir)
+			if err != nil {
+				return err
+			}
+			defer func() { _ = st.Close() }()
+
+			node, err := st.GetMemoryNode(cmd.Context(), args[0])
+			if err != nil {
+				return err
+			}
+			newText := strings.TrimSpace(editContent)
+			if newText == "" {
+				tmp, err := os.CreateTemp("", "soma-mem-edit-*.md")
+				if err != nil {
+					return err
+				}
+				tmpPath := tmp.Name()
+				defer func() { _ = os.Remove(tmpPath) }()
+				_, _ = tmp.WriteString(node.Content + "\n")
+				_ = tmp.Close()
+
+				editor := os.Getenv("VISUAL")
+				if editor == "" {
+					editor = os.Getenv("EDITOR")
+				}
+				if editor == "" {
+					editor = "vi"
+				}
+				edCmd := exec.CommandContext(cmd.Context(), editor, tmpPath)
+				edCmd.Stdin = os.Stdin
+				edCmd.Stdout = os.Stdout
+				edCmd.Stderr = os.Stderr
+				if err := edCmd.Run(); err != nil {
+					return err
+				}
+				editedBytes, err := os.ReadFile(tmpPath)
+				if err != nil {
+					return err
+				}
+				newText = strings.TrimSpace(string(editedBytes))
+				if newText == "" {
+					return errors.New("aborted: edited memory content is empty")
+				}
+			}
+			if err := st.UpdateMemoryContent(cmd.Context(), node.ID, newText); err != nil {
+				return err
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "Updated memory node %s\n", node.ID)
+			return nil
+		},
+	}
+	editCmd.Flags().StringVar(&editDir, "dir", ".", "Workspace directory")
+	editCmd.Flags().StringVar(&editContent, "content", "", "New memory content (opens $EDITOR when omitted)")
+
+	memCmd.AddCommand(listCmd, addCmd, supCmd, mergeCmd, auditCmd, graphCmd, editCmd)
 	return memCmd
 }
 

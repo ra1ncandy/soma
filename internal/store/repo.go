@@ -1453,3 +1453,344 @@ func (s *Store) ListBranchContractRuns(ctx context.Context, branchID string) ([]
 	}
 	return out, rows.Err()
 }
+
+// --- Trigger Runs (Tier-0 Event Daemon) ---
+
+func scanTriggerRun(sc rowScanner) (TriggerRun, error) {
+	var tr TriggerRun
+	var hash, brID sql.NullString
+	if err := sc.Scan(
+		&tr.IdempotencyKey, &tr.TriggerID, &hash, &brID,
+		&tr.Status, &tr.CostUSD, &tr.CreatedAt, &tr.ExpiresAt,
+	); err != nil {
+		return TriggerRun{}, err
+	}
+	tr.LastSentinelHash = hash.String
+	tr.BranchID = brID.String
+	return tr, nil
+}
+
+// TryClaimTriggerRun atomically claims idempotency_key if unseen; returns (true, tr, nil) on claim,
+// or (false, existing, nil) if already recorded.
+func (s *Store) TryClaimTriggerRun(ctx context.Context, tr TriggerRun) (bool, TriggerRun, error) {
+	now := time.Now().Unix()
+	if tr.CreatedAt == 0 {
+		tr.CreatedAt = now
+	}
+	if tr.ExpiresAt == 0 {
+		tr.ExpiresAt = tr.CreatedAt + 7*24*3600
+	}
+	if tr.Status == "" {
+		tr.Status = "running"
+	}
+
+	var claimed bool
+	var out TriggerRun
+	err := s.WithWriteTx(ctx, func(conn *sql.Conn) error {
+		res, err := conn.ExecContext(ctx, `
+			INSERT OR IGNORE INTO trigger_runs (
+				idempotency_key, trigger_id, last_sentinel_hash, branch_id,
+				status, cost_usd, created_at, expires_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			tr.IdempotencyKey, tr.TriggerID, nullStr(tr.LastSentinelHash), nullStr(tr.BranchID),
+			tr.Status, tr.CostUSD, tr.CreatedAt, tr.ExpiresAt,
+		)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n == 1 {
+			claimed = true
+			out = tr
+			return nil
+		}
+		row := conn.QueryRowContext(ctx, `
+			SELECT idempotency_key, trigger_id, last_sentinel_hash, branch_id,
+			       status, cost_usd, created_at, expires_at
+			FROM trigger_runs WHERE idempotency_key = ?`, tr.IdempotencyKey)
+		existing, err := scanTriggerRun(row)
+		if err != nil {
+			return err
+		}
+		out = existing
+		return nil
+	})
+	return claimed, out, err
+}
+
+// UpdateTriggerRun updates status, branch link, sentinel hash, and metered cost for a trigger_runs entry.
+func (s *Store) UpdateTriggerRun(ctx context.Context, idempotencyKey, status, branchID, sentinelHash string, costUSD float64) error {
+	return s.WithWriteTx(ctx, func(conn *sql.Conn) error {
+		res, err := conn.ExecContext(ctx, `
+			UPDATE trigger_runs
+			SET status = ?,
+			    branch_id = COALESCE(?, branch_id),
+			    last_sentinel_hash = COALESCE(?, last_sentinel_hash),
+			    cost_usd = ?
+			WHERE idempotency_key = ?`,
+			status, nullStr(branchID), nullStr(sentinelHash), costUSD, idempotencyKey,
+		)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return ErrNotFound
+		}
+		return nil
+	})
+}
+
+// GetLatestTriggerHash returns the most recent non-empty sentinel output hash for triggerID.
+func (s *Store) GetLatestTriggerHash(ctx context.Context, triggerID string) (string, error) {
+	var h sql.NullString
+	err := s.reader.QueryRowContext(ctx, `
+		SELECT last_sentinel_hash
+		FROM trigger_runs
+		WHERE trigger_id = ? AND last_sentinel_hash IS NOT NULL AND last_sentinel_hash != ''
+		ORDER BY created_at DESC, rowid DESC
+		LIMIT 1`, triggerID,
+	).Scan(&h)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return h.String, nil
+}
+
+// ListTriggerRuns lists recent trigger_runs entries optionally filtered by triggerID.
+func (s *Store) ListTriggerRuns(ctx context.Context, triggerID string, limit int) ([]TriggerRun, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	query := `
+		SELECT idempotency_key, trigger_id, last_sentinel_hash, branch_id,
+		       status, cost_usd, created_at, expires_at
+		FROM trigger_runs`
+	var args []any
+	if triggerID != "" {
+		query += ` WHERE trigger_id = ?`
+		args = append(args, triggerID)
+	}
+	query += ` ORDER BY created_at DESC, idempotency_key ASC LIMIT ?`
+	args = append(args, limit)
+
+	rows, err := s.reader.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []TriggerRun
+	for rows.Next() {
+		tr, err := scanTriggerRun(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, tr)
+	}
+	return out, rows.Err()
+}
+
+// PurgeExpiredTriggerRuns garbage-collects trigger_runs whose expires_at <= nowUnix.
+func (s *Store) PurgeExpiredTriggerRuns(ctx context.Context, nowUnix int64) (int64, error) {
+	var deleted int64
+	err := s.WithWriteTx(ctx, func(conn *sql.Conn) error {
+		res, err := conn.ExecContext(ctx, `DELETE FROM trigger_runs WHERE expires_at <= ?`, nowUnix)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		deleted = n
+		return nil
+	})
+	return deleted, err
+}
+
+// --- Memory, Account, Page & Inbox Helpers (v0.3) ---
+
+// ListAllMemoryNodes returns memory nodes across all lifecycle statuses ordered by priority/recency.
+func (s *Store) ListAllMemoryNodes(ctx context.Context, scope string) ([]MemoryNode, error) {
+	query := `
+		SELECT id, scope, kind, content, signature_hash, status, trust_tier,
+		       provenance_step_id, evidence_page_id, valid_from, valid_to, ingested_at, enabled
+		FROM memory_nodes`
+	var args []any
+	if scope != "" {
+		query += ` WHERE scope = ?`
+		args = append(args, scope)
+	}
+	query += `
+		ORDER BY CASE status WHEN 'proposed' THEN 0 WHEN 'active' THEN 1 ELSE 2 END,
+		         ingested_at DESC, id ASC`
+
+	rows, err := s.reader.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []MemoryNode
+	for rows.Next() {
+		m, err := scanMemoryNode(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+// SetMemoryEnabled toggles whether a memory node is injected into new epochs.
+func (s *Store) SetMemoryEnabled(ctx context.Context, id string, enabled bool) error {
+	return s.WithWriteTx(ctx, func(conn *sql.Conn) error {
+		res, err := conn.ExecContext(ctx, `UPDATE memory_nodes SET enabled = ? WHERE id = ?`, boolToInt(enabled), id)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return ErrNotFound
+		}
+		return nil
+	})
+}
+
+// UpdateMemoryContent updates the textual content of a memory node.
+func (s *Store) UpdateMemoryContent(ctx context.Context, id, content string) error {
+	return s.WithWriteTx(ctx, func(conn *sql.Conn) error {
+		res, err := conn.ExecContext(ctx, `UPDATE memory_nodes SET content = ? WHERE id = ?`, content, id)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return ErrNotFound
+		}
+		return nil
+	})
+}
+
+// ResetCooldown clears an account's rate-limit cooldown timer and error text.
+func (s *Store) ResetCooldown(ctx context.Context, id string) error {
+	nowSec := time.Now().Unix()
+	return s.WithWriteTx(ctx, func(conn *sql.Conn) error {
+		res, err := conn.ExecContext(ctx, `
+			UPDATE accounts
+			SET cooldown_until = 0, last_error = NULL, updated_at = ?
+			WHERE id = ?`, nowSec, id)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return ErrNotFound
+		}
+		return nil
+	})
+}
+
+// TotalDailyMeteredSpend returns the aggregate daily spend across metered accounts.
+func (s *Store) TotalDailyMeteredSpend(ctx context.Context) (float64, error) {
+	var total float64
+	err := s.reader.QueryRowContext(ctx, `
+		SELECT COALESCE(SUM(daily_spent_usd), 0.0)
+		FROM accounts WHERE billing_mode = 'metered'`,
+	).Scan(&total)
+	return total, err
+}
+
+// ListRunPages lists spilled @page entries for runID newest-first.
+func (s *Store) ListRunPages(ctx context.Context, runID string, limit int) ([]Page, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	query := `
+		SELECT id, run_id, content_hash, blob_path, content_type, trust_tier,
+		       declassified, declassified_by, byte_size, line_count, preview_text,
+		       last_accessed_at, created_at
+		FROM pages`
+	var args []any
+	if runID != "" {
+		query += ` WHERE run_id = ?`
+		args = append(args, runID)
+	}
+	query += ` ORDER BY created_at DESC, id ASC LIMIT ?`
+	args = append(args, limit)
+
+	rows, err := s.reader.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []Page
+	for rows.Next() {
+		var p Page
+		var declass int
+		var declassBy sql.NullString
+		if err := rows.Scan(
+			&p.ID, &p.RunID, &p.ContentHash, &p.BlobPath, &p.ContentType, &p.TrustTier,
+			&declass, &declassBy, &p.ByteSize, &p.LineCount, &p.PreviewText,
+			&p.LastAccessedAt, &p.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		p.Declassified = declass != 0
+		p.DeclassifiedBy = declassBy.String
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// GetInboxItem retrieves a single InboxItem by ID.
+func (s *Store) GetInboxItem(ctx context.Context, id string) (InboxItem, error) {
+	var it InboxItem
+	var runID, branchID, trigID, artRef sql.NullString
+	err := s.reader.QueryRowContext(ctx, `
+		SELECT id, run_id, branch_id, trigger_id, item_kind, title, summary,
+		       artifact_ref, urgency, status, created_at
+		FROM inbox_items WHERE id = ?`, id,
+	).Scan(
+		&it.ID, &runID, &branchID, &trigID, &it.ItemKind, &it.Title,
+		&it.Summary, &artRef, &it.Urgency, &it.Status, &it.CreatedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return InboxItem{}, ErrNotFound
+	}
+	if err != nil {
+		return InboxItem{}, err
+	}
+	it.RunID = runID.String
+	it.BranchID = branchID.String
+	it.TriggerID = trigID.String
+	it.ArtifactRef = artRef.String
+	return it, nil
+}
+
+// CountPendingInbox returns the number of inbox items currently in 'pending' status.
+func (s *Store) CountPendingInbox(ctx context.Context) (int, error) {
+	var count int
+	err := s.reader.QueryRowContext(ctx, `SELECT COUNT(*) FROM inbox_items WHERE status = 'pending'`).Scan(&count)
+	return count, err
+}

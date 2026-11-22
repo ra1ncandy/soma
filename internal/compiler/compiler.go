@@ -332,6 +332,8 @@ func formatLogEntry(e LogEntry) string {
 		return fmt.Sprintf("[t%d:rule_notice id=%q] %s", e.TurnIndex, e.Name, strings.TrimSpace(e.Observation))
 	case "graveyard_notice":
 		return fmt.Sprintf("[t%d:graveyard_notice id=%q] %s", e.TurnIndex, e.Name, strings.TrimSpace(e.Observation))
+	case "handoff":
+		return fmt.Sprintf("[t%d:handoff account=%q]\n%s", e.TurnIndex, e.Name, strings.TrimSpace(e.Observation))
 	case "slice_result":
 		if e.Masked {
 			return fmt.Sprintf("[t%d:slice_masked page=%s]", e.TurnIndex, e.PageID)

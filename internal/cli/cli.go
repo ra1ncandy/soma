@@ -21,7 +21,7 @@ import (
 	"github.com/ra1ncandy/soma/internal/store"
 )
 
-const Version = "v0.2.0 (RFC-0001 v2.1 Security, Memory, Standards & Oracles)"
+const Version = "v0.3.0 (RFC-0001 v2.1 TUI, Tier-0 Daemon, Bridges & Quotas)"
 
 type projectConfig struct {
 	Version       int    `yaml:"version"`
@@ -52,6 +52,12 @@ func NewRootCmd() *cobra.Command {
 		newSkillCmd(),
 		newOracleCmd(),
 		newSandboxCmd(),
+		newUICmd(),
+		newDaemonCmd(),
+		newBridgeCmd(),
+		newAccountCmd(),
+		newInboxCmd(),
+		newConsolidateCmd(),
 	)
 	return root
 }

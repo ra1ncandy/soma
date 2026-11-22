@@ -482,3 +482,136 @@ func TestSplitPoolConcurrencyNoSQLiteBusy(t *testing.T) {
 		t.Fatalf("lease after release: %v", err)
 	}
 }
+
+func TestV3StoreExtensions(t *testing.T) {
+	ctx := context.Background()
+	st := openTestStore(t)
+
+	// TriggerRun claim + duplicate rejection + latest hash + TTL GC.
+	now := time.Now().Unix()
+	claimed, gotTR, err := st.TryClaimTriggerRun(ctx, TriggerRun{
+		IdempotencyKey:   "idem_1",
+		TriggerID:        "sentinel_1",
+		LastSentinelHash: "hash_a",
+		Status:           "running",
+		CreatedAt:        now - 10,
+		ExpiresAt:        now + 300,
+	})
+	if err != nil || !claimed || gotTR.IdempotencyKey != "idem_1" {
+		t.Fatalf("expected claim=true, got (%v, %+v, %v)", claimed, gotTR, err)
+	}
+	claimed2, existing, err := st.TryClaimTriggerRun(ctx, TriggerRun{
+		IdempotencyKey: "idem_1",
+		TriggerID:      "sentinel_1",
+		Status:         "running",
+	})
+	if err != nil || claimed2 || existing.LastSentinelHash != "hash_a" {
+		t.Fatalf("expected duplicate rejection, got (%v, %+v, %v)", claimed2, existing, err)
+	}
+	if err := st.UpdateTriggerRun(ctx, "idem_1", "done", "", "hash_b", 0.01); err != nil {
+		t.Fatalf("UpdateTriggerRun: %v", err)
+	}
+	h, err := st.GetLatestTriggerHash(ctx, "sentinel_1")
+	if err != nil || h != "hash_b" {
+		t.Fatalf("GetLatestTriggerHash: want hash_b, got %q err=%v", h, err)
+	}
+	if _, _, err := st.TryClaimTriggerRun(ctx, TriggerRun{
+		IdempotencyKey:   "idem_old",
+		TriggerID:        "sentinel_1",
+		LastSentinelHash: "hash_old",
+		Status:           "skipped",
+		CreatedAt:        now - 200,
+		ExpiresAt:        now - 50,
+	}); err != nil {
+		t.Fatalf("TryClaimTriggerRun expired: %v", err)
+	}
+	purged, err := st.PurgeExpiredTriggerRuns(ctx, now)
+	if err != nil || purged != 1 {
+		t.Fatalf("PurgeExpiredTriggerRuns: want 1, got %d err=%v", purged, err)
+	}
+	runsList, err := st.ListTriggerRuns(ctx, "sentinel_1", 10)
+	if err != nil || len(runsList) != 1 || runsList[0].IdempotencyKey != "idem_1" {
+		t.Fatalf("ListTriggerRuns: %+v err=%v", runsList, err)
+	}
+
+	// Memory helpers: ListAllMemoryNodes (proposed first), SetMemoryEnabled, UpdateMemoryContent.
+	for _, m := range []MemoryNode{
+		{ID: "M-act", Scope: "global", Kind: "rule", Content: "active rule", Status: "active", Enabled: true, ValidFrom: 10, IngestedAt: 10},
+		{ID: "M-prop", Scope: "global", Kind: "rule", Content: "proposed rule", Status: "proposed", Enabled: true, ValidFrom: 5, IngestedAt: 5},
+	} {
+		if err := st.InsertMemoryNode(ctx, m); err != nil {
+			t.Fatalf("InsertMemoryNode %s: %v", m.ID, err)
+		}
+	}
+	allMem, err := st.ListAllMemoryNodes(ctx, "global")
+	if err != nil || len(allMem) != 2 || allMem[0].ID != "M-prop" {
+		t.Fatalf("ListAllMemoryNodes ordering: %+v err=%v", allMem, err)
+	}
+	if err := st.SetMemoryEnabled(ctx, "M-act", false); err != nil {
+		t.Fatalf("SetMemoryEnabled: %v", err)
+	}
+	if err := st.UpdateMemoryContent(ctx, "M-act", "updated active rule"); err != nil {
+		t.Fatalf("UpdateMemoryContent: %v", err)
+	}
+	updated, err := st.GetMemoryNode(ctx, "M-act")
+	if err != nil || updated.Enabled || updated.Content != "updated active rule" {
+		t.Fatalf("unexpected updated memory node: %+v err=%v", updated, err)
+	}
+
+	// Account helpers: ResetCooldown, TotalDailyMeteredSpend.
+	if err := st.UpsertAccount(ctx, Account{
+		ID:            "met1",
+		Provider:      "openai",
+		ModelID:       "gpt-6.2",
+		BillingMode:   "metered",
+		MaxConcurrent: 1,
+		DailySpentUSD: 1.25,
+	}); err != nil {
+		t.Fatalf("UpsertAccount met1: %v", err)
+	}
+	if err := st.SetCooldown(ctx, "met1", time.Now().Add(time.Minute).UnixMilli(), "429"); err != nil {
+		t.Fatalf("SetCooldown: %v", err)
+	}
+	if err := st.ResetCooldown(ctx, "met1"); err != nil {
+		t.Fatalf("ResetCooldown: %v", err)
+	}
+	acc, err := st.GetAccount(ctx, "met1")
+	if err != nil || acc.CooldownUntil != 0 || acc.LastError != "" {
+		t.Fatalf("ResetCooldown did not clear cooldown: %+v err=%v", acc, err)
+	}
+	if err := st.ReleaseLease(ctx, "met1", 0.50); err != nil {
+		t.Fatalf("ReleaseLease spend: %v", err)
+	}
+	totalSpend, err := st.TotalDailyMeteredSpend(ctx)
+	if err != nil || totalSpend < 1.74 {
+		t.Fatalf("TotalDailyMeteredSpend: want >=1.75, got %v err=%v", totalSpend, err)
+	}
+
+	// Pages & Inbox helpers.
+	if err := st.CreateRun(ctx, Run{ID: "run_p", Title: "pages", WorkspacePath: "/tmp", GoalSpec: "test"}); err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+	if err := st.PutPage(ctx, Page{
+		ID: "pg_1", RunID: "run_p", ContentHash: "ch1", BlobPath: "blobs/ch1.zst",
+		ContentType: "log", TrustTier: "trusted_repo", ByteSize: 100, LineCount: 4, PreviewText: "preview",
+	}); err != nil {
+		t.Fatalf("PutPage: %v", err)
+	}
+	pages, err := st.ListRunPages(ctx, "run_p", 10)
+	if err != nil || len(pages) != 1 || pages[0].ID != "pg_1" {
+		t.Fatalf("ListRunPages: %+v err=%v", pages, err)
+	}
+	if err := st.InsertInboxItem(ctx, InboxItem{
+		ID: "inb_v3", ItemKind: "skill_patch", Title: "Review patch", Summary: "diff", ArtifactRef: "sk",
+	}); err != nil {
+		t.Fatalf("InsertInboxItem: %v", err)
+	}
+	gotInb, err := st.GetInboxItem(ctx, "inb_v3")
+	if err != nil || gotInb.Title != "Review patch" {
+		t.Fatalf("GetInboxItem: %+v err=%v", gotInb, err)
+	}
+	cnt, err := st.CountPendingInbox(ctx)
+	if err != nil || cnt != 1 {
+		t.Fatalf("CountPendingInbox: want 1, got %d err=%v", cnt, err)
+	}
+}
