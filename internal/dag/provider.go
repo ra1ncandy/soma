@@ -232,6 +232,21 @@ func canonicalOpenAITools() []map[string]any {
 				},
 			},
 		},
+		{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "publish_finding",
+				"description": "Broadcast a discovered fact, contract, or @page handle to concurrent sibling agents over the Blackboard.",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"page_id": map[string]any{"type": "string", "description": "Optional @page handle ID with supporting evidence"},
+						"summary": map[string]any{"type": "string", "description": "Concise finding summary to deliver to sibling agents"},
+					},
+					"required": []string{"summary"},
+				},
+			},
+		},
 	}
 }
 
@@ -472,7 +487,7 @@ func (p *OpenAICompatProvider) Generate(ctx context.Context, req GenerateRequest
 
 func inferToolEffectClass(toolName string) taint.EffectClass {
 	switch toolName {
-	case "fs_read", "fs_list", "page_slice", "page_grep", "page_search", "memory_search":
+	case "fs_read", "fs_list", "page_slice", "page_grep", "page_search", "memory_search", "publish_finding":
 		return taint.EffectReadOnly
 	case "fs_write", "fs_patch", "exec":
 		return taint.EffectWorkspaceWrite

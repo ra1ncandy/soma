@@ -84,6 +84,9 @@ func (e *SuspendedApprovalError) Error() string {
 type ToolCall struct {
 	ActionID          string
 	IdempotencyKey    string
+	RunID             string
+	BranchID          string
+	BranchLabel       string
 	Name              string
 	ArgsJSON          string
 	EffectClass       taint.EffectClass
@@ -195,6 +198,7 @@ type Executor struct {
 	Store               *store.Store
 	VM                  *vmem.Manager
 	Memory              *memory.Service
+	Blackboard          *Blackboard
 	Workspace           *workspace.Manager
 	Scheduler           *QuotaScheduler
 	Provider            ModelProvider
@@ -219,8 +223,13 @@ func NewExecutor(
 	prof compiler.ModelProfile,
 ) *Executor {
 	vm := vmem.NewManager(st)
+	bb := NewBlackboard()
 	if tools == nil {
-		tools = NewLocalToolRunner(vm)
+		lt := NewLocalToolRunner(vm)
+		lt.Blackboard = bb
+		tools = lt
+	} else if lt, ok := tools.(*LocalToolRunner); ok && lt.Blackboard == nil {
+		lt.Blackboard = bb
 	}
 	if prof.Name == "" {
 		prof = compiler.WorkerProfile()
@@ -229,6 +238,7 @@ func NewExecutor(
 		Store:             st,
 		VM:                vm,
 		Memory:            memory.NewService(st),
+		Blackboard:        bb,
 		Workspace:         workspace.NewManager(st.SomaDir()),
 		Scheduler:         NewQuotaScheduler(st),
 		Provider:          provider,
@@ -387,7 +397,22 @@ func (e *Executor) AbandonBranch(ctx context.Context, branchID, reason, evidence
 		EvidencePageID:   evidencePageID,
 		Enabled:          true,
 	}
-	return e.Store.InsertMemoryNode(ctx, node)
+	if err := e.Store.InsertMemoryNode(ctx, node); err != nil {
+		return err
+	}
+	if e.Blackboard != nil {
+		_, _ = e.Blackboard.Publish(ctx, e.Store, PeerFinding{
+			ID:              node.ID,
+			RunID:           branch.RunID,
+			FromBranch:      branch.ID,
+			FromLabel:       branch.Label,
+			Kind:            "graveyard_notice",
+			Summary:         node.Content,
+			PageID:          evidencePageID,
+			PersistToMemory: false,
+		})
+	}
+	return nil
 }
 
 // ReconcileAction manually resolves an 'ambiguous' action_journal entry and unblocks the branch.
@@ -637,6 +662,17 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 			AccountQuotaSummary: fmt.Sprintf("%s:%s", acc.ID, acc.ModelID),
 			StallCount:          branch.StallCount,
 			MaxStalls:           e.Profile.MaxStalls,
+		}
+
+		// Drain any pending cross-agent Blackboard findings/graveyard notices into Layer 2 (keeping Layer 0+1 frozen).
+		if e.Blackboard != nil {
+			if lt, ok := e.Tools.(*LocalToolRunner); ok && lt.Blackboard == nil {
+				lt.Blackboard = e.Blackboard
+			}
+			if notices := e.Blackboard.DrainForBranch(run.ID, branch.ID, nextTurn); len(notices) > 0 {
+				l2 = append(l2, notices...)
+				pendingDeltaAppends = append(pendingDeltaAppends, notices...)
+			}
 		}
 
 		// Compile current frame; check Hybrid Epoch Rollover if ceiling crossed.
@@ -949,6 +985,9 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 				out, execErr := e.Tools.Execute(ctx, ToolCall{
 					ActionID:          pc.actionID,
 					IdempotencyKey:    pc.idemKey,
+					RunID:             run.ID,
+					BranchID:          branch.ID,
+					BranchLabel:       branch.Label,
 					Name:              tc.Name,
 					ArgsJSON:          tc.ArgsJSON,
 					EffectClass:       tc.EffectClass,
@@ -1571,10 +1610,11 @@ func detectWorkspaceKind(wsPath string) string {
 	return "generic"
 }
 
-// LocalToolRunner executes safe workspace-scoped operations (fs_list, fs_read, fs_write, exec, page_slice, page_grep).
+// LocalToolRunner executes safe workspace-scoped operations (fs_list, fs_read, fs_write, exec, page_slice, page_grep, page_search, memory_search, publish_finding).
 type LocalToolRunner struct {
-	vm      *vmem.Manager
-	Sandbox *sandbox.Manager
+	vm         *vmem.Manager
+	Sandbox    *sandbox.Manager
+	Blackboard *Blackboard
 }
 
 // NewLocalToolRunner constructs a workspace-scoped tool runner.
@@ -1728,11 +1768,44 @@ func (r *LocalToolRunner) Execute(ctx context.Context, call ToolCall) (ToolOutpu
 		}
 		query, _ := args["query"].(string)
 		pid, _ := args["page_id"].(string)
-		out, err := r.vm.Search(ctx, "", query, pid, 5)
+		out, err := r.vm.Search(ctx, call.RunID, query, pid, 5)
 		if err != nil {
 			return ToolOutput{}, err
 		}
 		return ToolOutput{NameHint: "page_search.txt", Content: []byte(out), TrustTier: "trusted_repo"}, nil
+
+	case "publish_finding":
+		summary, _ := args["summary"].(string)
+		if strings.TrimSpace(summary) == "" {
+			return ToolOutput{}, errors.New("publish_finding requires non-empty summary")
+		}
+		pid, _ := args["page_id"].(string)
+		bb := r.Blackboard
+		if bb == nil {
+			bb = NewBlackboard()
+			r.Blackboard = bb
+		}
+		var st *store.Store
+		if r.vm != nil {
+			st = r.vm.Store()
+		}
+		f, err := bb.Publish(ctx, st, PeerFinding{
+			RunID:           call.RunID,
+			FromBranch:      call.BranchID,
+			FromLabel:       call.BranchLabel,
+			Kind:            "rule_notice",
+			Summary:         summary,
+			PageID:          pid,
+			PersistToMemory: true,
+		})
+		if err != nil {
+			return ToolOutput{}, err
+		}
+		return ToolOutput{
+			NameHint:  "publish_finding.txt",
+			Content:   []byte(fmt.Sprintf("published finding %s to blackboard for sibling agents", f.ID)),
+			TrustTier: "trusted_repo",
+		}, nil
 
 	case "memory_search":
 		if r.vm == nil || r.vm.Store() == nil {

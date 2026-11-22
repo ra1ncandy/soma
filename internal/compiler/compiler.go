@@ -174,6 +174,7 @@ func DefaultCoreSyscalls() []SyscallDef {
 		{Name: "page_grep", Signature: "page_grep(page_id, pattern)"},
 		{Name: "page_search", Signature: "page_search(query, page_id?)"},
 		{Name: "page_slice", Signature: "page_slice(page_id, start_line, end_line)"},
+		{Name: "publish_finding", Signature: "publish_finding(summary, page_id?)"},
 		{Name: "tool_search", Signature: "tool_search(query)"},
 	}
 }

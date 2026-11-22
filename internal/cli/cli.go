@@ -61,6 +61,7 @@ func NewRootCmd() *cobra.Command {
 		newConsolidateCmd(),
 		newShadowCmd(),
 		newSearchCmd(),
+		newSwarmCmd(),
 	)
 	return root
 }

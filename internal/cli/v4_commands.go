@@ -15,6 +15,7 @@ import (
 	"github.com/ra1ncandy/soma/internal/oracle"
 	"github.com/ra1ncandy/soma/internal/sandbox"
 	"github.com/ra1ncandy/soma/internal/shadow"
+	"github.com/ra1ncandy/soma/internal/store"
 	"github.com/ra1ncandy/soma/internal/vmem"
 )
 
@@ -218,5 +219,120 @@ func newSearchCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&useMock, "mock", false, "Use deterministic local simulation provider")
 	cmd.Flags().IntVar(&maxBranches, "max-branches", 4, "Maximum branches to explore")
 	cmd.Flags().IntVar(&maxTurns, "max-turns", 8, "Maximum turns per branch")
+	return cmd
+}
+
+func newSwarmCmd() *cobra.Command {
+	var dir, goal, profileName, modeStr string
+	var subGoals []string
+	var useMock bool
+	var maxTurns int
+
+	cmd := &cobra.Command{
+		Use:   "swarm",
+		Short: "Execute concurrent multi-agent cooperative or competitive swarm with Blackboard & 3-way worktree merge",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if strings.TrimSpace(goal) == "" {
+				return errors.New("--goal is required")
+			}
+			absDir, err := filepath.Abs(dir)
+			if err != nil {
+				return err
+			}
+			st, err := openStore(absDir)
+			if err != nil {
+				return err
+			}
+			defer func() { _ = st.Close() }()
+
+			prof := selectProfile(profileName)
+			prov, modelID, err := selectProvider(absDir, useMock)
+			if err != nil {
+				return err
+			}
+			accID, err := ensureModelAccount(cmd.Context(), st, modelID, !useMock)
+			if err != nil {
+				return err
+			}
+			// Allow concurrent worker leases on the active account for swarm parallelism.
+			_ = st.UpsertAccount(cmd.Context(), store.Account{
+				ID:            accID,
+				Provider:      "swarm",
+				ModelID:       modelID,
+				BillingMode:   "subscription",
+				MaxConcurrent: 8,
+			})
+
+			var tasks []dag.SwarmTask
+			if len(subGoals) == 0 {
+				tasks = []dag.SwarmTask{
+					{Label: "worker-1", SubGoal: goal, MaxTurns: maxTurns},
+					{Label: "worker-2", SubGoal: goal, MaxTurns: maxTurns},
+				}
+			} else {
+				for i, raw := range subGoals {
+					label := fmt.Sprintf("worker-%d", i+1)
+					sg := raw
+					if k, v, ok := strings.Cut(raw, ":"); ok && strings.TrimSpace(k) != "" && strings.TrimSpace(v) != "" {
+						label = strings.TrimSpace(k)
+						sg = strings.TrimSpace(v)
+					}
+					tasks = append(tasks, dag.SwarmTask{
+						Label:    label,
+						SubGoal:  sg,
+						MaxTurns: maxTurns,
+					})
+				}
+			}
+
+			mode := dag.SwarmModeCooperative
+			if strings.EqualFold(modeStr, "competitive") {
+				mode = dag.SwarmModeCompetitive
+			}
+
+			sbx := sandbox.NewManager()
+			vm := vmem.NewManager(st)
+			tools := dag.NewSandboxedToolRunner(vm, sbx)
+			exec := dag.NewExecutor(st, prov, tools, prof)
+			exec.VM = vm
+			configureEmbedderFromEnv(exec)
+			exec.AccountIDs = []string{accID}
+			exec.Verifier = oracle.NewVerifier(st, sbx)
+
+			coord := dag.NewSwarmCoordinator(exec)
+			res, runErr := coord.Run(cmd.Context(), dag.SwarmRequest{
+				RunRequest: dag.RunRequest{
+					WorkspacePath: absDir,
+					GoalSpec:      goal,
+					Profile:       prof,
+					AccountIDs:    []string{accID},
+				},
+				Mode:             mode,
+				Tasks:            tasks,
+				DefaultMaxTurns:  maxTurns,
+				CancelOnFirstWin: mode == dag.SwarmModeCompetitive,
+			})
+
+			out := cmd.OutOrStdout()
+			fmt.Fprintf(out, "Swarm Run=%s Mode=%s Completed=%v Winner=%s Blackboard=%d Graveyard=%d Turns=%d\n",
+				res.RunID, res.Mode, res.Completed, res.WinningBranchID, res.BlackboardNotices, res.GraveyardCount, res.TotalTurns)
+			for _, w := range res.Workers {
+				fmt.Fprintf(out, "  - %-14s branch=%s status=%s turns=%d passed=%v\n",
+					w.Label, w.BranchID, w.Status, w.Turns, w.Passed)
+			}
+			if len(res.MergeReport.AddedFiles) > 0 || len(res.MergeReport.ModifiedFiles) > 0 || len(res.MergeReport.ThreeWayMerged) > 0 {
+				fmt.Fprintf(out, "  Merged: added=%v modified=%v three_way=%v\n",
+					res.MergeReport.AddedFiles, res.MergeReport.ModifiedFiles, res.MergeReport.ThreeWayMerged)
+			}
+			return runErr
+		},
+	}
+	cmd.Flags().StringVar(&dir, "dir", ".", "Workspace directory")
+	cmd.Flags().StringVar(&goal, "goal", "", "Overall swarm goal specification")
+	cmd.Flags().StringSliceVar(&subGoals, "subgoal", nil, "Worker sub-goal (format 'label:sub-goal text', repeatable)")
+	cmd.Flags().StringVar(&modeStr, "mode", "cooperative", "Swarm mode (cooperative|competitive)")
+	cmd.Flags().StringVar(&profileName, "profile", "worker", "Model profile (worker|frontier)")
+	cmd.Flags().BoolVar(&useMock, "mock", false, "Use deterministic local simulation provider")
+	cmd.Flags().IntVar(&maxTurns, "max-turns", 8, "Maximum turns per worker")
 	return cmd
 }
