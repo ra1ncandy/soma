@@ -86,29 +86,43 @@ func (s *SSHBroker) Name() string { return "ssh" }
 
 var forbiddenShellMeta = []string{";", "&&", "||", "|", "`", "$(", "\n", "\r", ">", "<"}
 
-func (s *SSHBroker) Execute(ctx context.Context, req BrokerRequest) (BrokerResponse, error) {
+// Validate enforces host allowlisting, shell metacharacter rejection, and command prefix allowlists.
+func (s *SSHBroker) Validate(req BrokerRequest) error {
+	_, _, err := s.validateAndParse(req)
+	return err
+}
+
+func (s *SSHBroker) validateAndParse(req BrokerRequest) (HostPolicy, string, error) {
 	pol, ok := s.Policies[req.Target]
 	if !ok {
-		return BrokerResponse{}, fmt.Errorf("%w: ssh host alias %q not allowlisted", ErrPolicyDenied, req.Target)
+		return HostPolicy{}, "", fmt.Errorf("%w: ssh host alias %q not allowlisted", ErrPolicyDenied, req.Target)
 	}
 
 	var params struct {
 		Command string `json:"command"`
 	}
 	if err := json.Unmarshal([]byte(req.ParamsJSON), &params); err != nil {
-		return BrokerResponse{}, fmt.Errorf("ssh broker parse params: %w", err)
+		return HostPolicy{}, "", fmt.Errorf("ssh broker parse params: %w", err)
 	}
 	cmdStr := strings.TrimSpace(params.Command)
 	if cmdStr == "" {
-		return BrokerResponse{}, fmt.Errorf("%w: empty ssh command", ErrPolicyDenied)
+		return HostPolicy{}, "", fmt.Errorf("%w: empty ssh command", ErrPolicyDenied)
 	}
 	for _, meta := range forbiddenShellMeta {
 		if strings.Contains(cmdStr, meta) {
-			return BrokerResponse{}, fmt.Errorf("%w: disallowed shell metacharacter %q in ssh command", ErrPolicyDenied, meta)
+			return HostPolicy{}, "", fmt.Errorf("%w: disallowed shell metacharacter %q in ssh command", ErrPolicyDenied, meta)
 		}
 	}
 	if !matchesAnyPrefix(cmdStr, pol.AllowedCommandPrefixes) {
-		return BrokerResponse{}, fmt.Errorf("%w: ssh command %q not allowed on %s", ErrPolicyDenied, cmdStr, pol.Alias)
+		return HostPolicy{}, "", fmt.Errorf("%w: ssh command %q not allowed on %s", ErrPolicyDenied, cmdStr, pol.Alias)
+	}
+	return pol, cmdStr, nil
+}
+
+func (s *SSHBroker) Execute(ctx context.Context, req BrokerRequest) (BrokerResponse, error) {
+	pol, cmdStr, err := s.validateAndParse(req)
+	if err != nil {
+		return BrokerResponse{}, err
 	}
 
 	var remoteNS string

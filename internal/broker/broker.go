@@ -8,6 +8,7 @@ import (
 	"github.com/ra1ncandy/soma/internal/policy"
 	"github.com/ra1ncandy/soma/internal/store"
 	"github.com/ra1ncandy/soma/internal/taint"
+	"github.com/ra1ncandy/soma/internal/vmem"
 )
 
 var (
@@ -40,6 +41,7 @@ type BrokerResponse struct {
 	Body        []byte
 	ContentType string
 	TrustTier   string
+	PageID      string
 	Headers     map[string]string
 }
 
@@ -47,6 +49,13 @@ type BrokerResponse struct {
 type Broker interface {
 	Name() string
 	Execute(ctx context.Context, req BrokerRequest) (BrokerResponse, error)
+}
+
+// RequestValidator is optionally implemented by a Broker to enforce hard policy deny rules
+// (command prefix/metacharacter checks, domain/path allowlists, or filesystem root containment)
+// BEFORE taint approval checks so deny > ask > allow precedence holds everywhere.
+type RequestValidator interface {
+	Validate(req BrokerRequest) error
 }
 
 // Router enforces Policy (deny > ask > allow) and Taint Provenance before dispatching to any Broker.
@@ -84,6 +93,19 @@ func (r *Router) Call(ctx context.Context, req BrokerRequest) (BrokerResponse, e
 	if polDec == taint.DecisionDeny {
 		return BrokerResponse{}, fmt.Errorf("%w: %s", ErrPolicyDenied, polReason)
 	}
+
+	b, ok := r.Brokers[req.Broker]
+	if !ok {
+		return BrokerResponse{}, fmt.Errorf("%w: %s", ErrBrokerNotFound, req.Broker)
+	}
+	// Hard broker-level policy denies (shell metacharacters, unallowlisted domains/commands, path traversal)
+	// take precedence over taint/policy approval prompts (deny > ask > allow).
+	if v, ok := b.(RequestValidator); ok {
+		if err := v.Validate(req); err != nil {
+			return BrokerResponse{}, err
+		}
+	}
+
 	if polDec == taint.DecisionAsk {
 		return BrokerResponse{}, fmt.Errorf("%w: %s", ErrApprovalRequired, polReason)
 	}
@@ -97,11 +119,24 @@ func (r *Router) Call(ctx context.Context, req BrokerRequest) (BrokerResponse, e
 		scope = req.Broker + ":" + req.Target
 	}
 
+	// Enforce the run-wide taint rule inside capability brokers: any non-local broker action
+	// automatically inherits all untrusted_external pages observed by the run, even if the
+	// caller did not pass them in ReferencedPageIDs.
+	refs := req.ReferencedPageIDs
+	if eff != taint.EffectReadOnly && eff != taint.EffectWorkspaceWrite && r.Store != nil && req.RunID != "" {
+		implied, err := r.Store.ListUntrustedPageIDs(ctx, req.RunID)
+		if err != nil {
+			return BrokerResponse{}, fmt.Errorf("broker load run taint provenance: %w", err)
+		}
+		refs = mergeBrokerPageRefs(refs, implied)
+		req.ReferencedPageIDs = refs
+	}
+
 	taintDec, taintReason, err := taint.EvaluateAction(ctx, r.Store, taint.ActionPolicyInput{
 		ToolName:          req.Broker + ":" + req.Op,
 		CapabilityScope:   scope,
 		EffectClass:       eff,
-		ReferencedPageIDs: req.ReferencedPageIDs,
+		ReferencedPageIDs: refs,
 	})
 	if err != nil {
 		return BrokerResponse{}, err
@@ -113,9 +148,37 @@ func (r *Router) Call(ctx context.Context, req BrokerRequest) (BrokerResponse, e
 		return BrokerResponse{}, fmt.Errorf("%w: %s", ErrApprovalRequired, taintReason)
 	}
 
-	b, ok := r.Brokers[req.Broker]
-	if !ok {
-		return BrokerResponse{}, fmt.Errorf("%w: %s", ErrBrokerNotFound, req.Broker)
+	resp, err := b.Execute(ctx, req)
+	if err != nil {
+		return resp, err
 	}
-	return b.Execute(ctx, req)
+	if eff == taint.EffectReadOnly && resp.TrustTier == "untrusted_external" && len(resp.Body) > 0 && r.Store != nil && req.RunID != "" {
+		pid, pErr := vmem.NewManager(r.Store).RecordProvenance(ctx, vmem.ObserveRequest{
+			RunID:     req.RunID,
+			NameHint:  req.Broker + "_" + req.Op + ".out",
+			Content:   resp.Body,
+			TrustTier: resp.TrustTier,
+		})
+		if pErr != nil {
+			return BrokerResponse{}, fmt.Errorf("broker record untrusted provenance: %w", pErr)
+		}
+		resp.PageID = pid
+	}
+	return resp, nil
+}
+
+func mergeBrokerPageRefs(declared, implied []string) []string {
+	if len(implied) == 0 {
+		return declared
+	}
+	seen := make(map[string]bool, len(declared)+len(implied))
+	out := make([]string, 0, len(declared)+len(implied))
+	for _, id := range append(append([]string(nil), declared...), implied...) {
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	return out
 }

@@ -4,6 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"net/netip"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,7 +16,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ra1ncandy/soma/internal/broker"
 	"github.com/ra1ncandy/soma/internal/compiler"
+	"github.com/ra1ncandy/soma/internal/policy"
 	"github.com/ra1ncandy/soma/internal/sandbox"
 	"github.com/ra1ncandy/soma/internal/store"
 	"github.com/ra1ncandy/soma/internal/taint"
@@ -256,4 +262,156 @@ func TestUntrustedObservationTaintsLaterExternalAction(t *testing.T) {
 			t.Fatalf("expected approved external tool to run exactly once, calls=%v", tools.calls)
 		}
 	})
+}
+
+func TestWebExtractAndWebSearch_SSRFGuard(t *testing.T) {
+	ctx := context.Background()
+
+	blockedTargets := []string{
+		"http://127.0.0.1:8080/admin",
+		"http://localhost:9000/internal",
+		"http://[::1]:8080/secret",
+		"http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+		"http://100.100.100.200/latest/meta-data/",
+		"http://[fd00:ec2::254]/latest/meta-data/",
+		"http://metadata.google.internal/computeMetadata/v1/",
+		"http://10.0.0.1/secret",
+		"http://172.16.0.1/secret",
+		"http://192.168.1.1/secret",
+		"http://100.64.0.1/cgnat",
+		"http://service.internal/config",
+	}
+
+	for _, target := range blockedTargets {
+		if _, err := ExecuteWebExtract(ctx, nil, target); !errors.Is(err, ErrSSRFBlocked) {
+			t.Fatalf("ExecuteWebExtract(%q) with nil client: want ErrSSRFBlocked, got %v", target, err)
+		}
+		if _, err := ExecuteWebSearch(ctx, nil, target, "query", 5); !errors.Is(err, ErrSSRFBlocked) {
+			t.Fatalf("ExecuteWebSearch(%q) with nil client: want ErrSSRFBlocked, got %v", target, err)
+		}
+	}
+
+	// Cloud metadata endpoints must remain blocked even when a custom HTTPClient is injected.
+	customClient := &http.Client{Timeout: 2 * time.Second}
+	for _, metaTarget := range []string{
+		"http://169.254.169.254/latest/meta-data/",
+		"http://100.100.100.200/latest/meta-data/",
+		"http://[fd00:ec2::254]/latest/meta-data/",
+		"http://metadata.google.internal/computeMetadata/v1/",
+	} {
+		if _, err := ExecuteWebExtract(ctx, customClient, metaTarget); !errors.Is(err, ErrSSRFBlocked) {
+			t.Fatalf("ExecuteWebExtract(%q) with customClient: want ErrSSRFBlocked, got %v", metaTarget, err)
+		}
+	}
+
+	// Public IPs pass IsBlockedSSRFAddr; private/loopback/CGNAT/IMDS fail.
+	if IsBlockedSSRFAddr(netip.MustParseAddr("1.1.1.1")) || IsBlockedSSRFAddr(netip.MustParseAddr("2606:4700:4700::1111")) {
+		t.Fatal("expected public Cloudflare DNS IPs to be allowed by IsBlockedSSRFAddr")
+	}
+	if !IsBlockedSSRFAddr(netip.MustParseAddr("::ffff:127.0.0.1")) || !IsBlockedSSRFAddr(netip.MustParseAddr("::ffff:169.254.169.254")) {
+		t.Fatal("expected IPv4-mapped IPv6 loopback and IMDS addresses to be blocked")
+	}
+}
+
+func TestLocalToolRunner_BrokerCallToolSearchAndBranchFork(t *testing.T) {
+	ctx := context.Background()
+	ws := t.TempDir()
+	st, err := store.Open(filepath.Join(ws, ".soma"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+	setupAccount(t, st, "acc_sys")
+
+	ex := NewExecutor(st, &MockProvider{ModelName: "sys"}, nil, compiler.WorkerProfile())
+	runID, branchID, err := ex.StartRun(ctx, RunRequest{
+		WorkspacePath: ws,
+		GoalSpec:      "test tool_search, branch_fork, and broker_call",
+		AccountIDs:    []string{"acc_sys"},
+	})
+	if err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+
+	lt, ok := ex.Tools.(*LocalToolRunner)
+	if !ok || lt.Sandbox == nil {
+		t.Fatalf("expected NewExecutor(tools=nil) to attach a sandboxed LocalToolRunner, got %T (sandbox=%v)", ex.Tools, lt.Sandbox)
+	}
+
+	// 1. tool_search discovers core syscalls.
+	tsOut, err := lt.Execute(ctx, ToolCall{
+		RunID:        runID,
+		BranchID:     branchID,
+		Name:         "tool_search",
+		ArgsJSON:     `{"query":"page_"}`,
+		WorkspaceDir: ws,
+	})
+	if err != nil || !strings.Contains(string(tsOut.Content), "page_grep") || !strings.Contains(string(tsOut.Content), "page_search") {
+		t.Fatalf("tool_search failed: %s err=%v", string(tsOut.Content), err)
+	}
+
+	// 2. branch_fork forks a sibling branch with its own isolated workspace.
+	forkOut, err := lt.Execute(ctx, ToolCall{
+		RunID:        runID,
+		BranchID:     branchID,
+		Name:         "branch_fork",
+		ArgsJSON:     `{"label":"alt-hypothesis","reason":"explore lock-free ring buffer"}`,
+		WorkspaceDir: ws,
+	})
+	if err != nil || !strings.Contains(string(forkOut.Content), "forked sibling branch") {
+		t.Fatalf("branch_fork failed: %s err=%v", string(forkOut.Content), err)
+	}
+
+	// 3. broker_call dispatches through attached broker.Router and enforces run-wide taint.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+	hb := broker.NewHTTPBroker(broker.EndpointPolicy{
+		Domain:         u.Host,
+		Scheme:         "http",
+		PathPrefixes:   []string{"/api/"},
+		AllowedMethods: []string{"GET", "POST"},
+	})
+	pol := policy.NewEngine(
+		policy.Rule{ID: "allow-api", Effect: taint.DecisionAllow, Capability: "http", OpPattern: "*", TargetPattern: "*/api/*"},
+	)
+	lt.Broker = broker.NewRouter(st, pol, hb)
+
+	bOut, err := lt.Execute(ctx, ToolCall{
+		RunID:        runID,
+		BranchID:     branchID,
+		Name:         "broker_call",
+		ArgsJSON:     `{"capability":"http","op":"GET","target":"` + srv.URL + `/api/status"}`,
+		WorkspaceDir: ws,
+	})
+	if err != nil || bOut.TrustTier != "untrusted_external" || !strings.Contains(string(bOut.Content), `"ok":true`) {
+		t.Fatalf("broker_call GET failed: %+v err=%v", bOut, err)
+	}
+
+	// Because the GET returned untrusted_external, broker.Router recorded provenance on runID.
+	// A subsequent broker_call POST in the same run (even with no ReferencedPageIDs) must be held for approval.
+	_, err = lt.Execute(ctx, ToolCall{
+		RunID:        runID,
+		BranchID:     branchID,
+		Name:         "broker_call",
+		ArgsJSON:     `{"capability":"http","op":"POST","target":"` + srv.URL + `/api/deploy","params_json":"{\"env\":\"staging\"}"}`,
+		WorkspaceDir: ws,
+	})
+	if !errors.Is(err, broker.ErrApprovalRequired) {
+		t.Fatalf("expected broker_call POST after untrusted GET to require approval, got %v", err)
+	}
+
+	// 4. Unknown tool fails closed with ErrUnknownTool.
+	if _, err := lt.Execute(ctx, ToolCall{
+		RunID:        runID,
+		BranchID:     branchID,
+		Name:         "nonexistent_syscall",
+		ArgsJSON:     `{}`,
+		WorkspaceDir: ws,
+	}); !errors.Is(err, ErrUnknownTool) {
+		t.Fatalf("expected ErrUnknownTool for unknown tool, got %v", err)
+	}
 }

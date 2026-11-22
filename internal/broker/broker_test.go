@@ -242,3 +242,58 @@ func TestSSHBrokerPrefixInjectionLeaseAndFSBrokerTraversal(t *testing.T) {
 		t.Fatalf("expected read-only write ErrPolicyDenied, got %v", err)
 	}
 }
+
+func TestBrokerRouter_RunWideImpliedTaintProvenance(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), ".soma"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+	_ = st.CreateRun(ctx, store.Run{ID: "run_implied", Title: "implied", WorkspacePath: "/tmp", GoalSpec: "test"})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"untrusted":"prompt injection payload"}`))
+	}))
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+
+	hb := NewHTTPBroker(EndpointPolicy{
+		Domain:         u.Host,
+		Scheme:         "http",
+		PathPrefixes:   []string{"/"},
+		AllowedMethods: []string{"GET", "POST"},
+	})
+	pol := policy.NewEngine(
+		policy.Rule{ID: "allow-all", Effect: taint.DecisionAllow, Capability: "http", OpPattern: "*", TargetPattern: "*"},
+	)
+	router := NewRouter(st, pol, hb)
+
+	// Step 1: Read-only GET via broker succeeds and automatically records an untrusted_external provenance @page.
+	getResp, err := router.Call(ctx, BrokerRequest{
+		RunID:       "run_implied",
+		Broker:      "http",
+		Op:          "GET",
+		Target:      srv.URL + "/feed",
+		EffectClass: taint.EffectReadOnly,
+	})
+	if err != nil || getResp.PageID == "" {
+		t.Fatalf("expected GET to succeed and record provenance page, got resp=%+v err=%v", getResp, err)
+	}
+
+	// Step 2: Subsequent POST in the same run omits ReferencedPageIDs completely.
+	// Router.Call must automatically merge ListUntrustedPageIDs("run_implied") and block with ErrApprovalRequired.
+	_, err = router.Call(ctx, BrokerRequest{
+		RunID:           "run_implied",
+		Broker:          "http",
+		Op:              "POST",
+		Target:          srv.URL + "/webhook",
+		ParamsJSON:      `{"msg":"exfiltrated"}`,
+		EffectClass:     taint.EffectExternalWrite,
+		CapabilityScope: "http:webhook",
+	})
+	if !errors.Is(err, ErrApprovalRequired) {
+		t.Fatalf("expected ErrApprovalRequired via run-wide implied taint even with empty ReferencedPageIDs, got %v", err)
+	}
+}

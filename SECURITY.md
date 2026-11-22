@@ -8,9 +8,11 @@
    - **Linux**: Uses `bubblewrap` (`bwrap --unshare-net --unshare-pid --unshare-ipc --unshare-uts --new-session --cap-drop ALL --die-with-parent --clearenv`) for both `exec` and `bg_exec`. With no usable backend, shell tools return an error instead of running on the host. Landlock ABI availability is probed and reported by `soma init`, but Landlock is **not** an enforcement backend yet: without `bwrap`, Linux has no sandbox and shell tools are refused. Pinned verification oracle files are bind-mounted read-only (`EROFS`) inside the sandbox so the agent cannot weaken tests to pass checks.
    - **macOS**: Generates deterministic Seatbelt SBPL profiles (`(deny network*)` by default, workspace-confined writes).
    - **Container & Remote Isolation**: Supports ephemeral rootless Docker (`--network=none`, `:ro` pinned oracle mounts) and non-interactive remote SSH (`BatchMode=yes`, `env -i`) with secret-scrubbed environments (`sandbox.ScrubEnv`).
-2. **Secretless Capability Brokers (`internal/broker`)**:
+2. **Secretless Capability Brokers (`internal/broker`) & Outbound SSRF Guard (`internal/dag`)**:
    - Sandboxed tool executions receive **zero raw API keys, cloud tokens, or SSH private keys**.
    - Privileged external operations (`HTTPBroker`, `SSHBroker`, `FSBroker`) are invoked over host-validated requests where the host enforces domain/path allowlists, command prefix allowlists, remote mutual-exclusion leases (`remote_leases`), and JSON field constraints (such as forcing `{"draft": true}` on GitHub PR creations) before injecting credentials on the host side.
+   - `broker.Router` enforces the exact same run-wide untrusted provenance rule as `dag.Executor`: any non-local broker action (`EffectClass != EffectReadOnly && EffectClass != EffectWorkspaceWrite`) automatically unions all `untrusted_external` pages observed by the run into its provenance check, and any `EffectReadOnly` broker response tagged `untrusted_external` is persisted as a provenance `@page`.
+   - `web_extract` and `web_search` enforce dial-time and redirect-time SSRF protection (`NewSSRFSafeHTTPClient`, `ValidateSSRFSafeURL`, `IsBlockedSSRFAddr`), blocking loopback (`127.0.0.0/8`, `::1`), RFC-1918 private networks, link-local / cloud metadata (`169.254.169.254`, `100.100.100.200`, `fd00:ec2::254`, `metadata.google.internal`), Carrier-Grade NAT (`100.64.0.0/10`), and DNS-rebound internal addresses.
 3. **Data/Action-Level Provenance Taint (`internal/taint`)**:
    - Grounded in *CaMeL* and *MCPTox* defenses against indirect prompt injection and Confused Deputy attacks.
    - Every content-addressed `@page_XXXX` virtual memory blob carries an explicit `trust_tier` (`trusted_user`, `trusted_repo`, or `untrusted_external` for web search, web extraction, and MCP responses).
@@ -23,7 +25,6 @@
 - **No seccomp filter or resource limits** on the `bwrap` sandbox yet, and no user-namespace remap: a kernel exploit or a fork bomb inside the sandbox is out of scope today.
 - **Taint is tracked per run, not per file.** Untrusted content written into the workspace in one run is read back as `trusted_repo` by a later run.
 - **macOS Seatbelt profile is allow-by-default** with targeted denies, which is weaker than the Linux mount-namespace model.
-- **Capability brokers take provenance from their caller.** `broker.Router` checks only the page IDs it is handed; it does not yet apply the run-wide rule above.
 
 ## 3. Reporting a Vulnerability
 

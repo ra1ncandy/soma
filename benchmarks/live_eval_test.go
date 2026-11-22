@@ -76,7 +76,8 @@ func (m abRunMetrics) Format() string {
 		m.Compactions, m.Branches, m.GraveyardNodes, m.ReplayVerified, m.WallMS, m.PassDetail)
 }
 
-// extractAssistantText returns choices[0].message.content from a chat-completions response.
+// extractAssistantText returns choices[0].message.content from a chat-completions response,
+// falling back to reasoning_content if a reasoning model leaves content empty.
 func extractAssistantText(out map[string]any) string {
 	choices, _ := out["choices"].([]any)
 	if len(choices) == 0 {
@@ -84,8 +85,13 @@ func extractAssistantText(out map[string]any) string {
 	}
 	c0, _ := choices[0].(map[string]any)
 	msg, _ := c0["message"].(map[string]any)
-	content, _ := msg["content"].(string)
-	return strings.TrimSpace(content)
+	if content, _ := msg["content"].(string); strings.TrimSpace(content) != "" {
+		return strings.TrimSpace(content)
+	}
+	if rc, _ := msg["reasoning_content"].(string); strings.TrimSpace(rc) != "" {
+		return strings.TrimSpace(rc)
+	}
+	return ""
 }
 
 // liveTrial is one raw A/B trial, appended as a JSON line to SOMA_LIVE_OUT when that is set.
@@ -230,24 +236,66 @@ func runLinearBaseline(ctx context.Context, cfg liveConfig, wsDir, systemPrompt,
 			payload["tool_choice"] = "auto"
 		}
 		raw, _ := json.Marshal(payload)
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.BaseURL+"/chat/completions", bytes.NewReader(raw))
-		if err != nil {
-			return nil, 0, 0, 0, err
+
+		const maxAttempts = 3
+		var body []byte
+		var statusCode int
+		for attempt := 1; attempt <= maxAttempts; attempt++ {
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.BaseURL+"/chat/completions", bytes.NewReader(raw))
+			if err != nil {
+				return nil, 0, 0, 0, err
+			}
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
+			req.Header.Set("User-Agent", "soma-linear-eval/0.4")
+			if strings.Contains(strings.ToLower(cfg.BaseURL), "opencode.ai") {
+				req.Header.Set("x-opencode-session", sessID)
+			}
+			httpResp, err := client.Do(req)
+			if err != nil {
+				if attempt < maxAttempts && ctx.Err() == nil {
+					t := time.NewTimer(time.Duration(attempt) * 300 * time.Millisecond)
+					select {
+					case <-ctx.Done():
+						t.Stop()
+						return nil, 0, 0, 0, ctx.Err()
+					case <-t.C:
+					}
+					continue
+				}
+				return nil, 0, 0, 0, err
+			}
+			b, readErr := io.ReadAll(io.LimitReader(httpResp.Body, 4<<20))
+			_ = httpResp.Body.Close()
+			if readErr != nil {
+				if attempt < maxAttempts && ctx.Err() == nil {
+					t := time.NewTimer(time.Duration(attempt) * 300 * time.Millisecond)
+					select {
+					case <-ctx.Done():
+						t.Stop()
+						return nil, 0, 0, 0, ctx.Err()
+					case <-t.C:
+					}
+					continue
+				}
+				return nil, 0, 0, 0, readErr
+			}
+			body = b
+			statusCode = httpResp.StatusCode
+			if statusCode >= 500 && attempt < maxAttempts && ctx.Err() == nil {
+				t := time.NewTimer(time.Duration(attempt) * 300 * time.Millisecond)
+				select {
+				case <-ctx.Done():
+					t.Stop()
+					return nil, 0, 0, 0, ctx.Err()
+				case <-t.C:
+				}
+				continue
+			}
+			break
 		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
-		req.Header.Set("User-Agent", "soma-linear-eval/0.4")
-		if strings.Contains(strings.ToLower(cfg.BaseURL), "opencode.ai") {
-			req.Header.Set("x-opencode-session", sessID)
-		}
-		httpResp, err := client.Do(req)
-		if err != nil {
-			return nil, 0, 0, 0, err
-		}
-		defer func() { _ = httpResp.Body.Close() }()
-		body, _ := io.ReadAll(io.LimitReader(httpResp.Body, 4<<20))
-		if httpResp.StatusCode >= 300 {
-			return nil, 0, 0, 0, fmt.Errorf("HTTP %d: %s", httpResp.StatusCode, string(body))
+		if statusCode >= 300 {
+			return nil, 0, 0, 0, fmt.Errorf("HTTP %d: %s", statusCode, string(body))
 		}
 		var out map[string]any
 		if err := json.Unmarshal(body, &out); err != nil {

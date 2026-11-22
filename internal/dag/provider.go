@@ -21,6 +21,7 @@ import (
 
 // ToolCallSpec describes a tool/syscall invocation requested by a model turn.
 type ToolCallSpec struct {
+	CallID            string            `json:"call_id,omitempty"`
 	Name              string            `json:"name"`
 	ArgsJSON          string            `json:"args_json"`
 	EffectClass       taint.EffectClass `json:"effect_class"`
@@ -42,6 +43,7 @@ type GenerateRequest struct {
 // GenerateResponse represents the normalized model emission for one turn.
 type GenerateResponse struct {
 	Reasoning        string               `json:"reasoning"`
+	AssistantContent string               `json:"assistant_content,omitempty"`
 	Done             bool                 `json:"done"`
 	FinalSummary     string               `json:"final_summary,omitempty"`
 	ToolCall         *ToolCallSpec        `json:"tool_call,omitempty"`
@@ -365,6 +367,127 @@ func sleepWithContext(ctx context.Context, d time.Duration) error {
 	}
 }
 
+func appendUserMessage(msgs []map[string]any, text string) []map[string]any {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return msgs
+	}
+	if n := len(msgs); n > 0 && msgs[n-1]["role"] == "user" {
+		prev, _ := msgs[n-1]["content"].(string)
+		if prev == "" {
+			msgs[n-1]["content"] = text
+		} else {
+			msgs[n-1]["content"] = prev + "\n\n" + text
+		}
+		return msgs
+	}
+	return append(msgs, map[string]any{
+		"role":    "user",
+		"content": text,
+	})
+}
+
+func buildOpenAIMessages(frame compiler.CompiledFrame) []map[string]any {
+	if !frame.Structured {
+		return []map[string]any{
+			{"role": "system", "content": frame.Layer0 + "\n" + frame.Layer1},
+			{"role": "user", "content": frame.Layer2 + "\n" + frame.Layer3},
+		}
+	}
+
+	msgs := []map[string]any{
+		{"role": "system", "content": frame.Layer0 + "\n" + frame.Layer1},
+		{"role": "user", "content": "Execute the task_goal in Layer 0 using the available tools. When a large tool output spills to an @page handle, use page_grep or page_slice to inspect it before acting."},
+	}
+
+	entries := frame.Layer2Entries
+	for i := 0; i < len(entries); {
+		e := entries[i]
+		if e.Kind == "turn" && !e.Masked && e.ToolName != "" {
+			j := i + 1
+			for j < len(entries) && entries[j].Kind == "turn" && !entries[j].Masked && entries[j].ToolName != "" && entries[j].TurnIndex == e.TurnIndex {
+				j++
+			}
+			type toolResp struct {
+				callID  string
+				content string
+			}
+			var asstContent string
+			toolCalls := make([]map[string]any, 0, j-i)
+			toolResps := make([]toolResp, 0, j-i)
+			for k := i; k < j; k++ {
+				ent := entries[k]
+				callID := strings.TrimSpace(ent.ToolCallID)
+				if callID == "" {
+					callID = fmt.Sprintf("call_e%d_t%d_%d", frame.Epoch, ent.TurnIndex, k-i)
+				}
+				argsJSON := strings.TrimSpace(ent.ArgsJSON)
+				if argsJSON == "" {
+					argsJSON = "{}"
+				}
+				if asstContent == "" {
+					asstContent = ent.AssistantContent
+				}
+				toolCalls = append(toolCalls, map[string]any{
+					"id":   callID,
+					"type": "function",
+					"function": map[string]any{
+						"name":      ent.ToolName,
+						"arguments": argsJSON,
+					},
+				})
+				obs := strings.TrimSpace(ent.Observation)
+				if obs == "" {
+					obs = "(empty)"
+				}
+				toolResps = append(toolResps, toolResp{callID: callID, content: obs})
+			}
+			msgs = append(msgs, map[string]any{
+				"role":       "assistant",
+				"content":    asstContent,
+				"tool_calls": toolCalls,
+			})
+			for _, tr := range toolResps {
+				msgs = append(msgs, map[string]any{
+					"role":         "tool",
+					"tool_call_id": tr.callID,
+					"content":      tr.content,
+				})
+			}
+			i = j
+			continue
+		}
+
+		if e.Kind == "turn" && !e.Masked && e.Action == "done" {
+			txt := strings.TrimSpace(e.Observation)
+			if txt == "" {
+				txt = strings.TrimSpace(e.Reasoning)
+			}
+			if txt == "" {
+				txt = "Done."
+			}
+			msgs = append(msgs, map[string]any{
+				"role":    "assistant",
+				"content": txt,
+			})
+			i++
+			continue
+		}
+
+		msgs = appendUserMessage(msgs, compiler.FormatLogEntry(e))
+		i++
+	}
+
+	lastRole, _ := msgs[len(msgs)-1]["role"].(string)
+	if lastRole != "user" && (frame.Tail.StallCount > 0 || (frame.Tail.StepBudgetRemaining > 0 && frame.Tail.StepBudgetRemaining <= 2) || frame.Tail.GitDiffStat != "") {
+		msgs = append(msgs, map[string]any{
+			"role":    "user",
+			"content": frame.Layer3,
+		})
+	}
+	return msgs
+}
+
 func (p *OpenAICompatProvider) Generate(ctx context.Context, req GenerateRequest) (*GenerateResponse, error) {
 	if p.BaseURL == "" {
 		return nil, errors.New("openai-compat provider: empty BaseURL")
@@ -375,11 +498,8 @@ func (p *OpenAICompatProvider) Generate(ctx context.Context, req GenerateRequest
 	}
 
 	payload := map[string]any{
-		"model": req.ModelID,
-		"messages": []map[string]string{
-			{"role": "system", "content": req.Frame.Layer0 + "\n" + req.Frame.Layer1},
-			{"role": "user", "content": req.Frame.Layer2 + "\n" + req.Frame.Layer3},
-		},
+		"model":       req.ModelID,
+		"messages":    buildOpenAIMessages(req.Frame),
 		"temperature": 0.0,
 		"max_tokens":  maxToks,
 	}
@@ -537,6 +657,7 @@ func (p *OpenAICompatProvider) Generate(ctx context.Context, req GenerateRequest
 
 	msg := parsed.Choices[0].Message
 	content := strings.TrimSpace(msg.Content)
+	gen.AssistantContent = content
 	reasoning := content
 	if reasoning == "" {
 		reasoning = strings.TrimSpace(msg.ReasoningContent)
@@ -549,8 +670,12 @@ func (p *OpenAICompatProvider) Generate(ctx context.Context, req GenerateRequest
 		var specs []ToolCallSpec
 		var hashParts []string
 		var names []string
-		for _, rawTC := range msg.ToolCalls {
+		for idx, rawTC := range msg.ToolCalls {
 			fn := rawTC.Function
+			callID := strings.TrimSpace(rawTC.ID)
+			if callID == "" {
+				callID = fmt.Sprintf("call_e%d_t%d_%d", req.Frame.Epoch, req.TurnIndex, idx)
+			}
 			argsJSON := strings.TrimSpace(fn.Arguments)
 			if argsJSON == "" {
 				argsJSON = "{}"
@@ -563,6 +688,7 @@ func (p *OpenAICompatProvider) Generate(ctx context.Context, req GenerateRequest
 				}
 			}
 			specs = append(specs, ToolCallSpec{
+				CallID:            callID,
 				Name:              fn.Name,
 				ArgsJSON:          argsJSON,
 				EffectClass:       inferToolEffectClass(fn.Name),
@@ -594,9 +720,9 @@ func (p *OpenAICompatProvider) Generate(ctx context.Context, req GenerateRequest
 // the sandbox, so it is subject to taint checks instead of being waved through as read-only.
 func inferToolEffectClass(toolName string) taint.EffectClass {
 	switch toolName {
-	case "fs_read", "fs_list", "page_slice", "page_grep", "page_search", "memory_search", "publish_finding", "bg_poll", "web_search", "web_extract", "vision_analyze":
+	case "fs_read", "fs_list", "page_slice", "page_grep", "page_search", "memory_search", "publish_finding", "bg_poll", "web_search", "web_extract", "vision_analyze", "tool_search":
 		return taint.EffectReadOnly
-	case "fs_write", "fs_patch", "exec", "bg_exec", "bg_kill":
+	case "fs_write", "fs_patch", "exec", "bg_exec", "bg_kill", "branch_fork":
 		return taint.EffectWorkspaceWrite
 	default:
 		return taint.EffectExternalWrite

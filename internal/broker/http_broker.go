@@ -46,14 +46,20 @@ func NewHTTPBroker(policies ...EndpointPolicy) *HTTPBroker {
 
 func (h *HTTPBroker) Name() string { return "http" }
 
-func (h *HTTPBroker) Execute(ctx context.Context, req BrokerRequest) (BrokerResponse, error) {
+// Validate enforces domain, method, and path prefix allowlists before taint approval prompts.
+func (h *HTTPBroker) Validate(req BrokerRequest) error {
+	_, _, _, err := h.validateAndParse(req)
+	return err
+}
+
+func (h *HTTPBroker) validateAndParse(req BrokerRequest) (*url.URL, EndpointPolicy, string, error) {
 	targetStr := strings.TrimSpace(req.Target)
 	if !strings.Contains(targetStr, "://") {
 		targetStr = "https://" + targetStr
 	}
 	u, err := url.Parse(targetStr)
 	if err != nil {
-		return BrokerResponse{}, fmt.Errorf("http broker invalid target %q: %w", req.Target, err)
+		return nil, EndpointPolicy{}, "", fmt.Errorf("http broker invalid target %q: %w", req.Target, err)
 	}
 
 	pol, ok := h.Policies[strings.ToLower(u.Host)]
@@ -61,7 +67,7 @@ func (h *HTTPBroker) Execute(ctx context.Context, req BrokerRequest) (BrokerResp
 		pol, ok = h.Policies[strings.ToLower(u.Hostname())]
 	}
 	if !ok {
-		return BrokerResponse{}, fmt.Errorf("%w: domain %q not allowlisted", ErrPolicyDenied, u.Host)
+		return nil, EndpointPolicy{}, "", fmt.Errorf("%w: domain %q not allowlisted", ErrPolicyDenied, u.Host)
 	}
 
 	scheme := pol.Scheme
@@ -75,10 +81,18 @@ func (h *HTTPBroker) Execute(ctx context.Context, req BrokerRequest) (BrokerResp
 		method = http.MethodGet
 	}
 	if !containsFold(pol.AllowedMethods, method) {
-		return BrokerResponse{}, fmt.Errorf("%w: method %s not allowed for %s", ErrPolicyDenied, method, pol.Domain)
+		return nil, EndpointPolicy{}, "", fmt.Errorf("%w: method %s not allowed for %s", ErrPolicyDenied, method, pol.Domain)
 	}
 	if len(pol.PathPrefixes) > 0 && !matchesAnyPrefix(u.Path, pol.PathPrefixes) {
-		return BrokerResponse{}, fmt.Errorf("%w: path %q outside allowlisted prefixes for %s", ErrPolicyDenied, u.Path, pol.Domain)
+		return nil, EndpointPolicy{}, "", fmt.Errorf("%w: path %q outside allowlisted prefixes for %s", ErrPolicyDenied, u.Path, pol.Domain)
+	}
+	return u, pol, method, nil
+}
+
+func (h *HTTPBroker) Execute(ctx context.Context, req BrokerRequest) (BrokerResponse, error) {
+	u, pol, method, err := h.validateAndParse(req)
+	if err != nil {
+		return BrokerResponse{}, err
 	}
 
 	var bodyReader io.Reader

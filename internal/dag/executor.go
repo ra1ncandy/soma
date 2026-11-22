@@ -17,8 +17,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ra1ncandy/soma/internal/broker"
 	"github.com/ra1ncandy/soma/internal/compiler"
 	"github.com/ra1ncandy/soma/internal/embed"
+	"github.com/ra1ncandy/soma/internal/mcp"
 	"github.com/ra1ncandy/soma/internal/memory"
 	"github.com/ra1ncandy/soma/internal/sandbox"
 	"github.com/ra1ncandy/soma/internal/store"
@@ -226,7 +228,7 @@ func NewExecutor(
 	vm := vmem.NewManager(st)
 	bb := NewBlackboard()
 	if tools == nil {
-		lt := NewLocalToolRunner(vm)
+		lt := NewSandboxedToolRunner(vm, sandbox.NewManager())
 		lt.Blackboard = bb
 		tools = lt
 	} else if lt, ok := tools.(*LocalToolRunner); ok && lt.Blackboard == nil {
@@ -235,7 +237,7 @@ func NewExecutor(
 	if prof.Name == "" {
 		prof = compiler.WorkerProfile()
 	}
-	return &Executor{
+	ex := &Executor{
 		Store:             st,
 		VM:                vm,
 		Memory:            memory.NewService(st),
@@ -247,6 +249,47 @@ func NewExecutor(
 		Profile:           prof,
 		MaxLayer1Memories: 25,
 	}
+	if lt, ok := ex.Tools.(*LocalToolRunner); ok && lt.ForkBranchFunc == nil {
+		lt.ForkBranchFunc = ex.forkBranchFromCurrentHead
+	}
+	return ex
+}
+
+func (e *Executor) forkBranchFromCurrentHead(ctx context.Context, runID, fromBranchID, label, reason string) (string, error) {
+	if e.Store == nil {
+		return "", errors.New("branch_fork: store not initialized")
+	}
+	br, err := e.Store.GetBranch(ctx, fromBranchID)
+	if err != nil {
+		return "", err
+	}
+	if br.HeadStepID != "" {
+		return e.ForkBranch(ctx, runID, br.HeadStepID, label)
+	}
+	run, err := e.Store.GetRun(ctx, runID)
+	if err != nil {
+		return "", err
+	}
+	branchID := fmt.Sprintf("br_%x_%04d", time.Now().UnixNano(), e.seq.Add(1))
+	if label == "" {
+		label = "fork-" + fromBranchID
+	}
+	newBr := store.Branch{
+		ID:              branchID,
+		RunID:           runID,
+		ParentBranchID:  fromBranchID,
+		Label:           label,
+		Epoch:           br.Epoch,
+		Status:          string(StatusQueued),
+		ActiveAccountID: br.ActiveAccountID,
+	}
+	if err := e.Store.CreateBranch(ctx, newBr); err != nil {
+		return "", err
+	}
+	if _, _, err := e.Workspace.PrepareBranchWorkspace(ctx, e.Store, run, newBr); err != nil {
+		return "", fmt.Errorf("prepare forked workspace: %w", err)
+	}
+	return branchID, nil
 }
 
 // SetEmbedder configures a custom local or remote Matryoshka int8 Embedder for both memory and @page retrieval.
@@ -487,6 +530,9 @@ func (e *Executor) ReconcileAction(ctx context.Context, actionID string, outcome
 		ResultingLogEntries: []compiler.LogEntry{{
 			Kind:        "turn",
 			TurnIndex:   nextTurn,
+			ToolCallID:  "call_rec_" + entry.ActionID,
+			ToolName:    entry.ToolName,
+			ArgsJSON:    entry.ArgsJSON,
 			Reasoning:   msg,
 			Action:      fmt.Sprintf("%s(%s)", entry.ToolName, entry.ArgsJSON),
 			Observation: msg,
@@ -1041,16 +1087,27 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 			}
 
 			entryReasoning := genResp.Reasoning
-			if idx > 0 {
+			asstContent := ""
+			if idx == 0 {
+				asstContent = genResp.AssistantContent
+			} else {
 				entryReasoning = fmt.Sprintf("batched tool call (%d/%d)", idx+1, len(planned))
 			}
+			callID := strings.TrimSpace(tc.CallID)
+			if callID == "" {
+				callID = fmt.Sprintf("call_e%d_t%d_%d", snap.Epoch, nextTurn, idx)
+			}
 			turnEntries = append(turnEntries, compiler.LogEntry{
-				Kind:        "turn",
-				TurnIndex:   nextTurn,
-				Reasoning:   entryReasoning,
-				Action:      fmt.Sprintf("%s(%s)", tc.Name, tc.ArgsJSON),
-				Observation: obsText,
-				PageID:      obsPageID,
+				Kind:             "turn",
+				TurnIndex:        nextTurn,
+				ToolCallID:       callID,
+				ToolName:         tc.Name,
+				ArgsJSON:         tc.ArgsJSON,
+				AssistantContent: asstContent,
+				Reasoning:        entryReasoning,
+				Action:           fmt.Sprintf("%s(%s)", tc.Name, tc.ArgsJSON),
+				Observation:      obsText,
+				PageID:           obsPageID,
 			})
 		}
 
@@ -1354,6 +1411,9 @@ func (e *Executor) commitRecoveredAction(
 	logEntry := compiler.LogEntry{
 		Kind:        "turn",
 		TurnIndex:   *nextTurn,
+		ToolCallID:  "call_rec_" + entry.ActionID,
+		ToolName:    entry.ToolName,
+		ArgsJSON:    entry.ArgsJSON,
 		Reasoning:   fmt.Sprintf("Recovered dispatched action %s via idempotency_key", entry.ActionID),
 		Action:      fmt.Sprintf("%s(%s)", entry.ToolName, entry.ArgsJSON),
 		Observation: obsText,
@@ -1660,10 +1720,16 @@ func detectWorkspaceKind(wsPath string) string {
 	return "generic"
 }
 
-// LocalToolRunner executes safe workspace-scoped operations (fs_list, fs_read, fs_write, fs_patch, exec, bg_exec, bg_poll, bg_kill, page_slice, page_grep, page_search, memory_search, publish_finding, web_search, web_extract, vision_analyze).
+// ErrUnknownTool is returned by LocalToolRunner when a tool name does not match any registered syscall.
+var ErrUnknownTool = errors.New("dag: unknown tool")
+
+// LocalToolRunner executes safe workspace-scoped operations (fs_list, fs_read, fs_write, fs_patch, exec, bg_exec, bg_poll, bg_kill, page_slice, page_grep, page_search, memory_search, publish_finding, web_search, web_extract, vision_analyze, broker_call, tool_search, branch_fork).
 type LocalToolRunner struct {
 	vm             *vmem.Manager
 	Sandbox        *sandbox.Manager
+	Broker         *broker.Router
+	MCPCatalog     *mcp.EpochCatalog
+	ForkBranchFunc func(ctx context.Context, runID, fromBranchID, label, reason string) (string, error)
 	Blackboard     *Blackboard
 	BgProcs        *BgProcessManager
 	HTTPClient     *http.Client
@@ -2024,12 +2090,113 @@ func (r *LocalToolRunner) Execute(ctx context.Context, call ToolCall) (ToolOutpu
 			TrustTier: "trusted_repo",
 		}, nil
 
-	default:
+	case "broker_call":
+		if r.Broker == nil {
+			return ToolOutput{}, errors.New("broker_call: no capability broker router configured")
+		}
+		capName, _ := args["capability"].(string)
+		if capName == "" {
+			capName, _ = args["broker"].(string)
+		}
+		op, _ := args["op"].(string)
+		target, _ := args["target"].(string)
+		paramsJSON, _ := args["params_json"].(string)
+		if paramsJSON == "" {
+			if rawParams, ok := args["params"]; ok && rawParams != nil {
+				if b, err := json.Marshal(rawParams); err == nil {
+					paramsJSON = string(b)
+				}
+			}
+		}
+		eff := call.EffectClass
+		if effStr, ok := args["effect_class"].(string); ok && strings.TrimSpace(effStr) != "" {
+			eff = taint.EffectClass(strings.TrimSpace(effStr))
+		}
+		if eff == "" {
+			if strings.EqualFold(op, "GET") || strings.EqualFold(op, "read") {
+				eff = taint.EffectReadOnly
+			} else {
+				eff = taint.EffectExternalWrite
+			}
+		}
+		resp, err := r.Broker.Call(ctx, broker.BrokerRequest{
+			RunID:             call.RunID,
+			BranchID:          call.BranchID,
+			ActionID:          call.ActionID,
+			IdempotencyKey:    call.IdempotencyKey,
+			Broker:            strings.TrimSpace(capName),
+			Op:                strings.TrimSpace(op),
+			Target:            strings.TrimSpace(target),
+			ParamsJSON:        paramsJSON,
+			EffectClass:       eff,
+			CapabilityScope:   call.CapabilityScope,
+			ReferencedPageIDs: call.ReferencedPageIDs,
+		})
+		if err != nil {
+			return ToolOutput{}, err
+		}
+		tier := resp.TrustTier
+		if tier == "" {
+			tier = "untrusted_external"
+		}
 		return ToolOutput{
-			NameHint:  call.Name + ".log",
-			Content:   []byte(fmt.Sprintf("executed %s(%s)", call.Name, call.ArgsJSON)),
+			NameHint:  fmt.Sprintf("broker_%s_%s.txt", capName, op),
+			Content:   resp.Body,
+			TrustTier: tier,
+		}, nil
+
+	case "tool_search":
+		query, _ := args["query"].(string)
+		q := strings.ToLower(strings.TrimSpace(query))
+		var sb strings.Builder
+		var matches int
+		for _, sc := range compiler.DefaultCoreSyscalls() {
+			if q == "" || strings.Contains(strings.ToLower(sc.Name), q) || strings.Contains(strings.ToLower(sc.Signature), q) {
+				fmt.Fprintf(&sb, "- [core] %s: %s\n", sc.Name, sc.Signature)
+				matches++
+			}
+		}
+		if r.MCPCatalog != nil {
+			for _, ts := range r.MCPCatalog.Search(query) {
+				fmt.Fprintf(&sb, "- [mcp] %s: %s\n", ts.Name, ts.JSONSchema)
+				matches++
+			}
+		}
+		if matches == 0 {
+			return ToolOutput{
+				NameHint:  "tool_search.txt",
+				Content:   []byte(fmt.Sprintf("tool_search: 0 matches for %q", query)),
+				TrustTier: "trusted_repo",
+			}, nil
+		}
+		header := fmt.Sprintf("tool_search: %d match(es) for %q:\n", matches, query)
+		return ToolOutput{
+			NameHint:  "tool_search.txt",
+			Content:   []byte(header + strings.TrimRight(sb.String(), "\n")),
 			TrustTier: "trusted_repo",
 		}, nil
+
+	case "branch_fork":
+		label, _ := args["label"].(string)
+		reason, _ := args["reason"].(string)
+		if strings.TrimSpace(label) == "" && strings.TrimSpace(reason) == "" {
+			return ToolOutput{}, errors.New("branch_fork requires label or reason")
+		}
+		if r.ForkBranchFunc == nil {
+			return ToolOutput{}, errors.New("branch_fork: no branch forker attached to tool runner")
+		}
+		forkID, err := r.ForkBranchFunc(ctx, call.RunID, call.BranchID, strings.TrimSpace(label), strings.TrimSpace(reason))
+		if err != nil {
+			return ToolOutput{}, err
+		}
+		return ToolOutput{
+			NameHint:  "branch_fork.txt",
+			Content:   []byte(fmt.Sprintf("forked sibling branch %s (label=%q reason=%q)", forkID, label, reason)),
+			TrustTier: "trusted_repo",
+		}, nil
+
+	default:
+		return ToolOutput{}, fmt.Errorf("%w: %q (use tool_search to inspect available syscalls)", ErrUnknownTool, call.Name)
 	}
 }
 

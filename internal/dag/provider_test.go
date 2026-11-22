@@ -19,6 +19,7 @@ import (
 	"github.com/ra1ncandy/soma/internal/compiler"
 	"github.com/ra1ncandy/soma/internal/dag"
 	"github.com/ra1ncandy/soma/internal/memory"
+	"github.com/ra1ncandy/soma/internal/replay"
 	"github.com/ra1ncandy/soma/internal/store"
 	"github.com/ra1ncandy/soma/internal/taint"
 	"github.com/ra1ncandy/soma/internal/vmem"
@@ -355,8 +356,8 @@ func TestOpenAICompatProvider_MultiToolBatchAndTransientRetry(t *testing.T) {
 	if attempts != 3 {
 		t.Fatalf("expected 3 HTTP requests (1 transient 502 + 2 successful turns), got %d", attempts)
 	}
-	if len(capturedMsgs) != 2 {
-		t.Fatalf("expected 2 monotonic messages (system L0+L1, user L2+L3), got %d messages", len(capturedMsgs))
+	if len(capturedMsgs) != 5 {
+		t.Fatalf("expected 5 multi-turn messages (system, user, assistant[2 tool_calls], tool[a], tool[b]), got %d messages", len(capturedMsgs))
 	}
 
 	br, err := st.GetBranch(ctx, brID)
@@ -616,4 +617,172 @@ func TestFSPatchBgProcsAndWebMultimodalTools(t *testing.T) {
 func mustJSONQuote(s string) string {
 	b, _ := json.Marshal(s)
 	return string(b)
+}
+
+func TestOpenAICompatProvider_MultiTurnPrefixMonotonicity(t *testing.T) {
+	ctx := context.Background()
+	ws := t.TempDir()
+	st, err := store.Open(filepath.Join(ws, ".soma"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+
+	if err := os.WriteFile(filepath.Join(ws, "a.txt"), []byte("alpha_content\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ws, "b.txt"), []byte("beta_content\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertAccount(ctx, store.Account{
+		ID: "acc_mono", Provider: "openai", ModelID: "gpt-mono", BillingMode: "subscription", MaxConcurrent: 2,
+	}); err != nil {
+		t.Fatalf("UpsertAccount: %v", err)
+	}
+
+	var ex *dag.Executor
+	var branchID string
+	var recorded [][]json.RawMessage
+	var turnNum int
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Messages []json.RawMessage `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		recorded = append(recorded, body.Messages)
+		turnNum++
+
+		switch turnNum {
+		case 1:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"choices": []map[string]any{{
+					"message": map[string]any{
+						"content": "",
+						"tool_calls": []map[string]any{{
+							"id":   "call_t1_0",
+							"type": "function",
+							"function": map[string]any{
+								"name":      "fs_list",
+								"arguments": `{}`,
+							},
+						}},
+					},
+				}},
+			})
+		case 2:
+			// Inject a non-tool blackboard rule_notice so Turn 3 tests non-tool user message alignment too.
+			_, _ = ex.Blackboard.Publish(context.Background(), st, dag.PeerFinding{
+				ID:         "notice_t2",
+				RunID:      "run_mono",
+				FromBranch: "coordinator",
+				FromLabel:  "coord",
+				TargetBranch: branchID,
+				Kind:       "rule_notice",
+				Summary:    "Check both alpha and beta contents",
+			})
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"choices": []map[string]any{{
+					"message": map[string]any{
+						"content": "Reading a.txt and b.txt in parallel.",
+						"tool_calls": []map[string]any{
+							{
+								"id":   "call_t2_a",
+								"type": "function",
+								"function": map[string]any{
+									"name":      "fs_read",
+									"arguments": `{"path":"a.txt"}`,
+								},
+							},
+							{
+								"id":   "call_t2_b",
+								"type": "function",
+								"function": map[string]any{
+									"name":      "fs_read",
+									"arguments": `{"path":"b.txt"}`,
+								},
+							},
+						},
+					},
+				}},
+			})
+		default:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"choices": []map[string]any{{
+					"message": map[string]any{
+						"content": "Verified alpha_content and beta_content.",
+					},
+				}},
+			})
+		}
+	}))
+	defer srv.Close()
+
+	prov := dag.NewOpenAICompatProvider(srv.URL+"/v1", "test-key")
+	ex = dag.NewExecutor(st, prov, nil, compiler.WorkerProfile())
+	ex.AccountIDs = []string{"acc_mono"}
+
+	runID, brID, err := ex.StartRun(ctx, dag.RunRequest{
+		RunID:         "run_mono",
+		WorkspacePath: ws,
+		GoalSpec:      "Verify multi-turn wire prefix monotonicity",
+		AccountIDs:    []string{"acc_mono"},
+	})
+	if err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+	branchID = brID
+
+	res, err := ex.ExecuteBranch(ctx, branchID, 6)
+	if err != nil || res.Status != dag.StatusCompleted {
+		t.Fatalf("ExecuteBranch failed: res=%+v err=%v", res, err)
+	}
+	if len(recorded) != 3 {
+		t.Fatalf("expected 3 HTTP turns, got %d", len(recorded))
+	}
+
+	extractRole := func(raw json.RawMessage) string {
+		var m map[string]any
+		_ = json.Unmarshal(raw, &m)
+		r, _ := m["role"].(string)
+		return r
+	}
+
+	// Assert message counts, roles, and zero consecutive user messages on every turn.
+	if len(recorded[0]) != 2 || extractRole(recorded[0][0]) != "system" || extractRole(recorded[0][1]) != "user" {
+		t.Fatalf("turn 1 unexpected roles: len=%d", len(recorded[0]))
+	}
+	if len(recorded[1]) != 4 {
+		t.Fatalf("turn 2 expected 4 messages (system, user, assistant, tool), got %d", len(recorded[1]))
+	}
+	if len(recorded[2]) != 8 {
+		t.Fatalf("turn 3 expected 8 messages (system, user, asst, tool, asst, tool, tool, user notice), got %d", len(recorded[2]))
+	}
+	for tIdx, msgs := range recorded {
+		for i := 1; i < len(msgs); i++ {
+			if extractRole(msgs[i-1]) == "user" && extractRole(msgs[i]) == "user" {
+				t.Fatalf("turn %d produced consecutive user messages at indices %d,%d", tIdx+1, i-1, i)
+			}
+		}
+	}
+
+	// Assert exact byte-for-byte prefix monotonicity across turns.
+	for i := 0; i < len(recorded[0]); i++ {
+		if !bytes.Equal(recorded[0][i], recorded[1][i]) {
+			t.Fatalf("turn 2 mutated message[%d] prefix:\nt1=%s\nt2=%s", i, recorded[0][i], recorded[1][i])
+		}
+	}
+	for i := 0; i < len(recorded[1]); i++ {
+		if !bytes.Equal(recorded[1][i], recorded[2][i]) {
+			t.Fatalf("turn 3 mutated message[%d] prefix:\nt2=%s\nt3=%s", i, recorded[1][i], recorded[2][i])
+		}
+	}
+
+	// Verify ModeExact replay still passes 100% after structured wire fields.
+	rep, err := replay.NewReplayer(st).Replay(ctx, branchID, replay.ReplayOptions{Mode: replay.ModeExact})
+	if err != nil || rep.Diverged || rep.StepsChecked == 0 || rep.HashVerifiedCount != rep.StepsChecked {
+		t.Fatalf("ModeExact replay failed on run %s branch %s: rep=%+v err=%v", runID, branchID, rep, err)
+	}
 }

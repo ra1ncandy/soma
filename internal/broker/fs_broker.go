@@ -39,17 +39,23 @@ func NewFSBroker(roots ...FSRootPolicy) *FSBroker {
 
 func (f *FSBroker) Name() string { return "fs" }
 
-func (f *FSBroker) Execute(_ context.Context, req BrokerRequest) (BrokerResponse, error) {
+// Validate enforces external filesystem root containment and read-only constraints before taint approval prompts.
+func (f *FSBroker) Validate(req BrokerRequest) error {
+	_, _, err := f.validateAndResolve(req)
+	return err
+}
+
+func (f *FSBroker) validateAndResolve(req BrokerRequest) (string, *FSRootPolicy, error) {
 	if req.Target == "" {
-		return BrokerResponse{}, fmt.Errorf("%w: empty fs target", ErrPolicyDenied)
+		return "", nil, fmt.Errorf("%w: empty fs target", ErrPolicyDenied)
 	}
 	absTarget, err := filepath.Abs(req.Target)
 	if err != nil {
-		return BrokerResponse{}, err
+		return "", nil, err
 	}
 	resolved, err := resolveWithParentSymlinks(absTarget)
 	if err != nil {
-		return BrokerResponse{}, fmt.Errorf("%w: %v", ErrPolicyDenied, err)
+		return "", nil, fmt.Errorf("%w: %v", ErrPolicyDenied, err)
 	}
 
 	var matched *FSRootPolicy
@@ -61,7 +67,18 @@ func (f *FSBroker) Execute(_ context.Context, req BrokerRequest) (BrokerResponse
 		}
 	}
 	if matched == nil {
-		return BrokerResponse{}, fmt.Errorf("%w: path %q outside allowlisted external roots", ErrPolicyDenied, resolved)
+		return "", nil, fmt.Errorf("%w: path %q outside allowlisted external roots", ErrPolicyDenied, resolved)
+	}
+	if strings.EqualFold(req.Op, "write") && matched.ReadOnly {
+		return "", nil, fmt.Errorf("%w: fs root %q is read-only", ErrPolicyDenied, matched.RootPath)
+	}
+	return resolved, matched, nil
+}
+
+func (f *FSBroker) Execute(_ context.Context, req BrokerRequest) (BrokerResponse, error) {
+	resolved, matched, err := f.validateAndResolve(req)
+	if err != nil {
+		return BrokerResponse{}, err
 	}
 
 	switch strings.ToLower(req.Op) {

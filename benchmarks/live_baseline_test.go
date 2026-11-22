@@ -76,3 +76,31 @@ func TestLinearBaseline_CompactionKeepsItsSummary(t *testing.T) {
 		t.Error("the turn after compaction did not receive the summarizer's own text")
 	}
 }
+
+func TestExtractAssistantText_ReasoningFallback(t *testing.T) {
+	// Normal content wins over reasoning_content.
+	outContent := map[string]any{
+		"choices": []any{map[string]any{
+			"message": map[string]any{
+				"content":           "  final summary  ",
+				"reasoning_content": "scratchpad",
+			},
+		}},
+	}
+	if got := extractAssistantText(outContent); got != "final summary" {
+		t.Fatalf("want %q, got %q", "final summary", got)
+	}
+
+	// Empty content falls back to reasoning_content.
+	outReasoning := map[string]any{
+		"choices": []any{map[string]any{
+			"message": map[string]any{
+				"content":           "",
+				"reasoning_content": "  compact summary from reasoning  ",
+			},
+		}},
+	}
+	if got := extractAssistantText(outReasoning); got != "compact summary from reasoning" {
+		t.Fatalf("want %q, got %q", "compact summary from reasoning", got)
+	}
+}

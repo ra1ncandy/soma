@@ -13,7 +13,9 @@ import (
 	_ "image/jpeg"
 	_ "image/png"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -21,6 +23,127 @@ import (
 	"strings"
 	"time"
 )
+
+// ErrSSRFBlocked is returned when web_extract or web_search targets a loopback, RFC-1918 private,
+// link-local, Carrier-Grade NAT, or cloud instance metadata host/IP.
+var ErrSSRFBlocked = errors.New("web: target host or IP is blocked by SSRF policy (loopback, private, link-local, or cloud metadata)")
+
+var (
+	cgnatPrefix       = netip.MustParsePrefix("100.64.0.0/10")
+	awsIMDSv6Addr     = netip.MustParseAddr("fd00:ec2::254")
+	alibabaMetaIPv4   = netip.MustParseAddr("100.100.100.200")
+	cloudMetaIPv4     = netip.MustParseAddr("169.254.169.254")
+	blockedMetaDomSet = map[string]bool{
+		"metadata.google.internal": true,
+		"metadata.goog":            true,
+		"metadata":                 true,
+		"instance-data":            true,
+	}
+)
+
+// IsBlockedSSRFAddr reports whether addr is a non-public IP address (loopback, RFC-1918 private,
+// link-local/IMDS 169.254.0.0/16 & fe80::/10, CGNAT 100.64.0.0/10, AWS IMDSv6 fd00:ec2::254,
+// multicast, or unspecified).
+func IsBlockedSSRFAddr(addr netip.Addr) bool {
+	if !addr.IsValid() {
+		return true
+	}
+	addr = addr.Unmap()
+	if addr.IsLoopback() ||
+		addr.IsPrivate() ||
+		addr.IsLinkLocalUnicast() ||
+		addr.IsLinkLocalMulticast() ||
+		addr.IsMulticast() ||
+		addr.IsUnspecified() {
+		return true
+	}
+	if cgnatPrefix.Contains(addr) || addr == awsIMDSv6Addr {
+		return true
+	}
+	return false
+}
+
+// ValidateSSRFSafeURL checks scheme, host, cloud metadata endpoints, and (when blockPrivate is true)
+// localhost/internal domains and literal private/loopback IP addresses.
+func ValidateSSRFSafeURL(rawURL string, blockPrivate bool) (*url.URL, error) {
+	rawURL = strings.TrimSpace(rawURL)
+	parsed, err := url.Parse(rawURL)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+		return nil, fmt.Errorf("web request requires valid http/https URL, got %q", rawURL)
+	}
+	host := strings.ToLower(strings.TrimSuffix(parsed.Hostname(), "."))
+	if host == "" {
+		return nil, fmt.Errorf("web request requires non-empty hostname in %q", rawURL)
+	}
+	if blockedMetaDomSet[host] {
+		return nil, fmt.Errorf("%w: %s", ErrSSRFBlocked, host)
+	}
+	if ip, err := netip.ParseAddr(host); err == nil {
+		unmapped := ip.Unmap()
+		if unmapped == cloudMetaIPv4 || unmapped == alibabaMetaIPv4 || unmapped == awsIMDSv6Addr || unmapped.IsLinkLocalUnicast() {
+			return nil, fmt.Errorf("%w: %s", ErrSSRFBlocked, host)
+		}
+		if blockPrivate && IsBlockedSSRFAddr(unmapped) {
+			return nil, fmt.Errorf("%w: %s", ErrSSRFBlocked, host)
+		}
+	} else if blockPrivate {
+		if host == "localhost" || strings.HasSuffix(host, ".localhost") || strings.HasSuffix(host, ".local") || strings.HasSuffix(host, ".internal") {
+			return nil, fmt.Errorf("%w: %s", ErrSSRFBlocked, host)
+		}
+	}
+	return parsed, nil
+}
+
+// NewSSRFSafeHTTPClient returns an *http.Client that resolves DNS at dial time, rejects any
+// non-public IP (defeating DNS rebinding and HTTP redirects into internal networks), and caps redirects.
+func NewSSRFSafeHTTPClient(timeout time.Duration) *http.Client {
+	if timeout <= 0 {
+		timeout = 15 * time.Second
+	}
+	dialer := &net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 15 * time.Second,
+	}
+	transport := &http.Transport{
+		Proxy: nil, // Do not allow environment HTTP_PROXY to bounce into internal networks.
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+			cleanHost := strings.ToLower(strings.TrimSuffix(host, "."))
+			if blockedMetaDomSet[cleanHost] || cleanHost == "localhost" || strings.HasSuffix(cleanHost, ".localhost") || strings.HasSuffix(cleanHost, ".local") || strings.HasSuffix(cleanHost, ".internal") {
+				return nil, fmt.Errorf("%w: %s", ErrSSRFBlocked, host)
+			}
+			ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+			if err != nil {
+				return nil, err
+			}
+			if len(ips) == 0 {
+				return nil, fmt.Errorf("no IP addresses resolved for %s", host)
+			}
+			for _, ip := range ips {
+				if IsBlockedSSRFAddr(ip) {
+					return nil, fmt.Errorf("%w: %s resolved to %s", ErrSSRFBlocked, host, ip.Unmap().String())
+				}
+			}
+			// Dial the validated literal IP directly so DNS rebinding cannot switch the address between lookup and connect.
+			targetAddr := net.JoinHostPort(ips[0].Unmap().String(), port)
+			return dialer.DialContext(ctx, network, targetAddr)
+		},
+	}
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return errors.New("web: stopped after 5 redirects")
+			}
+			_, err := ValidateSSRFSafeURL(req.URL.String(), true)
+			return err
+		},
+	}
+}
 
 var (
 	scriptStyleRe = regexp.MustCompile(`(?is)<(script|style|noscript|svg|head)[^>]*>.*?</(script|style|noscript|svg|head)>`)
@@ -54,12 +177,12 @@ func CleanHTMLToText(raw []byte) string {
 // so any spilled @page is tracked by soma's provenance taint engine.
 func ExecuteWebExtract(ctx context.Context, client *http.Client, targetURL string) (ToolOutput, error) {
 	targetURL = strings.TrimSpace(targetURL)
-	parsed, err := url.Parse(targetURL)
-	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
-		return ToolOutput{}, fmt.Errorf("web_extract requires valid http/https URL, got %q", targetURL)
+	enforcePrivateBlock := client == nil
+	if _, err := ValidateSSRFSafeURL(targetURL, enforcePrivateBlock); err != nil {
+		return ToolOutput{}, fmt.Errorf("web_extract: %w", err)
 	}
 	if client == nil {
-		client = &http.Client{Timeout: 15 * time.Second}
+		client = NewSSRFSafeHTTPClient(15 * time.Second)
 	}
 
 	reqCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
@@ -113,8 +236,9 @@ func ExecuteWebSearch(ctx context.Context, client *http.Client, searchEndpoint, 
 	if maxResults > 15 {
 		maxResults = 15
 	}
+	enforcePrivateBlock := client == nil
 	if client == nil {
-		client = &http.Client{Timeout: 15 * time.Second}
+		client = NewSSRFSafeHTTPClient(15 * time.Second)
 	}
 	if searchEndpoint == "" {
 		searchEndpoint = strings.TrimSpace(os.Getenv("SOMA_SEARCH_URL"))
@@ -126,9 +250,9 @@ func ExecuteWebSearch(ctx context.Context, client *http.Client, searchEndpoint, 
 	reqCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
-	u, err := url.Parse(searchEndpoint)
+	u, err := ValidateSSRFSafeURL(searchEndpoint, enforcePrivateBlock)
 	if err != nil {
-		return ToolOutput{}, err
+		return ToolOutput{}, fmt.Errorf("web_search: %w", err)
 	}
 	q := u.Query()
 	q.Set("q", query)

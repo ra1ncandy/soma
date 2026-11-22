@@ -86,14 +86,18 @@ type EpochSnapshot struct {
 // LogEntry represents an append-only item in Layer 2 (Working Log).
 // Mid-epoch skill activations, deferred MCP schemas, and notices MUST append here, never to Layer 1.
 type LogEntry struct {
-	Kind        string `json:"kind"` // turn | dynamic_skill | dynamic_mcp | rule_notice | graveyard_notice | slice_result
-	TurnIndex   int    `json:"turn_index"`
-	Name        string `json:"name,omitempty"`
-	Action      string `json:"action,omitempty"`
-	Reasoning   string `json:"reasoning,omitempty"`
-	Observation string `json:"observation,omitempty"`
-	PageID      string `json:"page_id,omitempty"`
-	Masked      bool   `json:"masked,omitempty"`
+	Kind             string `json:"kind"` // turn | dynamic_skill | dynamic_mcp | rule_notice | graveyard_notice | slice_result
+	TurnIndex        int    `json:"turn_index"`
+	Name             string `json:"name,omitempty"`
+	ToolCallID       string `json:"tool_call_id,omitempty"`
+	ToolName         string `json:"tool_name,omitempty"`
+	ArgsJSON         string `json:"args_json,omitempty"`
+	AssistantContent string `json:"assistant_content,omitempty"`
+	Action           string `json:"action,omitempty"`
+	Reasoning        string `json:"reasoning,omitempty"`
+	Observation      string `json:"observation,omitempty"`
+	PageID           string `json:"page_id,omitempty"`
+	Masked           bool   `json:"masked,omitempty"`
 }
 
 // LiveTailState represents uncached Layer 3 telemetry rebuilt every turn.
@@ -137,6 +141,9 @@ type CompiledFrame struct {
 	L2Tokens          int               `json:"-"`
 	L3Tokens          int               `json:"-"`
 	TotalTokens       int               `json:"-"`
+	Structured        bool              `json:"-"`
+	Layer2Entries     []LogEntry        `json:"-"`
+	Tail              LiveTailState     `json:"-"`
 }
 
 type canonicalWireFrame struct {
@@ -171,8 +178,10 @@ func DefaultCoreSyscalls() []SyscallDef {
 		{Name: "branch_fork", Signature: "branch_fork(label, reason)"},
 		{Name: "broker_call", Signature: "broker_call(capability, op, params_json)"},
 		{Name: "exec", Signature: "exec(cmd, args_json)"},
+		{Name: "fs_list", Signature: "fs_list(path?)"},
 		{Name: "fs_patch", Signature: "fs_patch(path, patch)"},
 		{Name: "fs_read", Signature: "fs_read(path)"},
+		{Name: "fs_write", Signature: "fs_write(path, content)"},
 		{Name: "memory_search", Signature: "memory_search(query, scope?)"},
 		{Name: "page_grep", Signature: "page_grep(page_id, pattern)"},
 		{Name: "page_search", Signature: "page_search(query, page_id?)"},
@@ -325,10 +334,18 @@ func Compile(snap EpochSnapshot, l2 []LogEntry, tail LiveTailState, profile Mode
 		L1Tokens:       EstimateTokens(l1),
 		L2Tokens:       EstimateTokens(l2Str),
 		L3Tokens:       EstimateTokens(l3Str),
+		Structured:     true,
+		Layer2Entries:  append([]LogEntry(nil), l2...),
+		Tail:           tail,
 	}
 	frame.TotalTokens = frame.L0Tokens + frame.L1Tokens + frame.L2Tokens + frame.L3Tokens
 	frame.CompiledFrameHash = sha256Hex(frame.WireBytes())
 	return frame
+}
+
+// FormatLogEntry renders a single Layer 2 log entry as deterministic text for plain-text frames and notices.
+func FormatLogEntry(e LogEntry) string {
+	return formatLogEntry(e)
 }
 
 func formatLogEntry(e LogEntry) string {

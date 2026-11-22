@@ -215,12 +215,22 @@ func TestB4_SandboxContainmentAndConfusedDeputyDefense(t *testing.T) {
 		t.Fatalf("expected host auth injection + draft:true enforcement, got auth=%q body=%s", receivedAuth, receivedBody)
 	}
 
-	// 4. SSH broker rejects injection and enforces remote lease exclusivity.
+	// 4. SSH broker rejects injection (deny > ask precedence) and enforces capability-scoped taint + remote lease exclusivity.
 	if _, err := router.Call(ctx, broker.BrokerRequest{
 		RunID: "run_b4", BranchID: "b4_1", Broker: "ssh", Op: "exec", Target: "gpu-node-01",
 		ParamsJSON: `{"command":"nvidia-smi && cat ~/.ssh/id_rsa"}`, EffectClass: taint.EffectExternalWrite,
 	}); !errors.Is(err, broker.ErrPolicyDenied) {
-		t.Fatalf("expected SSH injection rejected, got %v", err)
+		t.Fatalf("expected SSH injection rejected with ErrPolicyDenied (deny > ask), got %v", err)
+	}
+	// Declassification for http:github:draft_pr must NOT unlock ssh:gpu-node-01 in tainted run_b4.
+	if _, err := router.Call(ctx, broker.BrokerRequest{
+		RunID: "run_b4", BranchID: "b4_1", Broker: "ssh", Op: "exec", Target: "gpu-node-01",
+		ParamsJSON: `{"command":"nvidia-smi"}`, EffectClass: taint.EffectExternalWrite,
+	}); !errors.Is(err, broker.ErrApprovalRequired) {
+		t.Fatalf("expected cross-capability SSH call in tainted run_b4 to require approval for ssh:gpu-node-01, got %v", err)
+	}
+	if err := taint.ApproveDeclassification(ctx, st, pageRes.PageID, "ssh:gpu-node-01", "operator"); err != nil {
+		t.Fatalf("ApproveDeclassification ssh:gpu-node-01: %v", err)
 	}
 
 	var wg sync.WaitGroup
