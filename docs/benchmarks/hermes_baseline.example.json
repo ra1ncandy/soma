@@ -1,0 +1,11 @@
+{
+  "source_label": "Hermes Multi-Host Production Audit (Nov 2026) - operator-supplied, raw logs not in this repository",
+  "sessions": 324,
+  "compactions": 567,
+  "rate_limit_deaths": 417,
+  "rate_limit_total": 781,
+  "orphan_reaps": 739,
+  "orphan_total": 1662,
+  "curator_mutations": 150,
+  "blocked_unattended_calls": 547
+}

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -60,6 +61,7 @@ type abRunMetrics struct {
 	OutputTokens    int
 	CacheHitPct     float64
 	Compactions     int
+	SummaryFailures int
 	Branches        int
 	GraveyardNodes  int
 	ReplayVerified  bool
@@ -74,7 +76,76 @@ func (m abRunMetrics) Format() string {
 		m.Compactions, m.Branches, m.GraveyardNodes, m.ReplayVerified, m.WallMS, m.PassDetail)
 }
 
+// extractAssistantText returns choices[0].message.content from a chat-completions response.
+func extractAssistantText(out map[string]any) string {
+	choices, _ := out["choices"].([]any)
+	if len(choices) == 0 {
+		return ""
+	}
+	c0, _ := choices[0].(map[string]any)
+	msg, _ := c0["message"].(map[string]any)
+	content, _ := msg["content"].(string)
+	return strings.TrimSpace(content)
+}
+
+// liveTrial is one raw A/B trial, appended as a JSON line to SOMA_LIVE_OUT when that is set.
+type liveTrial struct {
+	Experiment string       `json:"experiment"`
+	Trial      int          `json:"trial"`
+	Model      string       `json:"model"`
+	At         string       `json:"at"`
+	Linear     abRunMetrics `json:"linear"`
+	Soma       abRunMetrics `json:"soma"`
+}
+
+func liveRepeats() int {
+	if n, err := strconv.Atoi(strings.TrimSpace(os.Getenv("SOMA_LIVE_REPEATS"))); err == nil && n > 0 {
+		return n
+	}
+	return 1
+}
+
+// runTrials runs one experiment SOMA_LIVE_REPEATS times, logs every trial, appends raw results to
+// SOMA_LIVE_OUT, and reports pass counts. A single trial is an anecdote, not a pass rate.
+func runTrials(t *testing.T, cfg liveConfig, name string, trial func(t *testing.T) (abRunMetrics, abRunMetrics)) {
+	t.Run(name, func(t *testing.T) {
+		n := liveRepeats()
+		linPass, somaPass := 0, 0
+		for i := 1; i <= n; i++ {
+			var lin, soma abRunMetrics
+			t.Run(fmt.Sprintf("trial_%02d", i), func(t *testing.T) {
+				lin, soma = trial(t)
+			})
+			if lin.Passed {
+				linPass++
+			}
+			if soma.Passed {
+				somaPass++
+			}
+			if outPath := strings.TrimSpace(os.Getenv("SOMA_LIVE_OUT")); outPath != "" {
+				line, _ := json.Marshal(liveTrial{
+					Experiment: name, Trial: i, Model: cfg.ModelID,
+					At: time.Now().UTC().Format(time.RFC3339), Linear: lin, Soma: soma,
+				})
+				if f, err := os.OpenFile(outPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
+					_, _ = f.Write(append(line, '\n'))
+					_ = f.Close()
+				} else {
+					t.Logf("could not append to SOMA_LIVE_OUT: %v", err)
+				}
+			}
+		}
+		t.Logf("[%s] model=%s trials=%d linear_pass=%d/%d soma_pass=%d/%d", name, cfg.ModelID, n, linPass, n, somaPass, n)
+	})
+}
+
 // --- Linear Chat Baseline Runner (append-only transcript + lossy LLM compaction + self-grading) ---
+//
+// What this baseline is: a minimal append-only tool loop written for this test, with LLM
+// summarization once the transcript passes compactCharThreshold. It is NOT Hermes or any other
+// real harness, and results against it say nothing about those. It also has no external verifier,
+// so Exp2 and Exp3 measure "verifier feedback vs none" as much as anything else: soma's oracle
+// feeds the failing assertion text back to the model.
 
 func runLinearBaseline(ctx context.Context, cfg liveConfig, wsDir, systemPrompt, goal string, maxTurns int, compactCharThreshold int) abRunMetrics {
 	start := time.Now()
@@ -215,23 +286,27 @@ func runLinearBaseline(ctx context.Context, cfg liveConfig, wsDir, systemPrompt,
 		if compactCharThreshold > 0 && msgCharCount(messages) > compactCharThreshold && len(messages) > 3 {
 			// Lossy LLM text compaction over older history (mirrors Hermes autocompact).
 			res.Compactions++
-			histBytes, _ := json.Marshal(messages[1 : len(messages)-1])
+			// Summarize everything after the system prompt, including the most recent tool result.
+			histBytes, _ := json.Marshal(messages[1:])
 			truncHist := string(histBytes)
 			if len(truncHist) > 48000 {
 				// Hard pre-compaction window slice if tool dumps blew past ceiling.
 				truncHist = truncHist[:16000] + "\n...[truncated middle log output]...\n" + truncHist[len(truncHist)-16000:]
 			}
 			sumMsgs := []map[string]any{
-				{"role": "system", "content": "Summarize the prior engineering transcript concisely in <= 250 words, preserving paths and outcomes."},
+				{"role": "system", "content": "Summarize the prior engineering transcript in <= 400 words for an agent that will continue the task. Preserve exact file paths, identifiers, error codes, numeric values, what has been done, and what remains."},
 				{"role": "user", "content": truncHist},
 			}
-			_, sPT, sCached, sCT, sErr := callModel(sumMsgs, false)
+			sumOut, sPT, sCached, sCT, sErr := callModel(sumMsgs, false)
 			res.PromptTokens += sPT
 			res.CachedTokens += sCached
 			res.OutputTokens += sCT
-			summaryText := "Prior session compacted due to context overflow."
-			if sErr == nil {
-				summaryText = "Compacted session state (some earlier verbose log details dropped)."
+			// The baseline keeps whatever its own summarizer preserved. Only if the summary call
+			// fails or comes back empty does it fall back to a bare marker, and that is counted.
+			summaryText := extractAssistantText(sumOut)
+			if sErr != nil || summaryText == "" {
+				res.SummaryFailures++
+				summaryText = "Prior session compacted due to context overflow; summary unavailable."
 			}
 			messages = []map[string]any{
 				messages[0],
@@ -341,9 +416,10 @@ func TestLiveEvaluation_HypothesisAB(t *testing.T) {
 	cfg := loadLiveConfig(t)
 	ctx := context.Background()
 
-	t.Logf("Running LIVE A/B Hypothesis Evaluation on base=%s model=%s", cfg.BaseURL, cfg.ModelID)
+	t.Logf("Running LIVE A/B Hypothesis Evaluation on base=%s model=%s repeats=%d (set SOMA_LIVE_REPEATS / SOMA_LIVE_OUT)",
+		cfg.BaseURL, cfg.ModelID, liveRepeats())
 
-	t.Run("Exp1_LogStormNeedleAndKVCache", func(t *testing.T) {
+	runTrials(t, cfg, "Exp1_LogStormNeedleAndKVCache", func(t *testing.T) (abRunMetrics, abRunMetrics) {
 		seedLogWS := func(dir string) {
 			_ = os.MkdirAll(filepath.Join(dir, "logs"), 0o755)
 			_ = os.MkdirAll(filepath.Join(dir, "config"), 0o755)
@@ -386,7 +462,7 @@ func TestLiveEvaluation_HypothesisAB(t *testing.T) {
 		seedLogWS(linWS)
 		linMetrics := runLinearBaseline(ctx, cfg, linWS,
 			"You are a coding agent with exec, fs_list, fs_read, and fs_write tools.",
-			goal, 10, 64000)
+			goal, 12, 64000) // same turn budget as soma below
 		linPass, linDetail := validateExp1(linWS)
 		linMetrics.Passed = linPass
 		linMetrics.PassDetail = linDetail
@@ -439,9 +515,10 @@ func TestLiveEvaluation_HypothesisAB(t *testing.T) {
 				}
 			}
 		}
+		return linMetrics, somaMetrics
 	})
 
-	t.Run("Exp2_ExternalOracleVsSelfGrade", func(t *testing.T) {
+	runTrials(t, cfg, "Exp2_ExternalOracleVsSelfGrade", func(t *testing.T) (abRunMetrics, abRunMetrics) {
 		buggyCalc := `def eval_expr(expr: str) -> float:
     """Buggy evaluator: does left-to-right only, breaks unary minus and nested parens."""
     tokens = expr.strip().split()
@@ -500,7 +577,7 @@ print("HELD_OUT_ORACLE_OK")
 		seedCalcWS(linWS)
 		linMetrics := runLinearBaseline(ctx, cfg, linWS,
 			"You are a coding agent with fs_read, fs_write, exec, and fs_list.",
-			goal, 8, 64000)
+			goal, 10, 64000) // same turn budget as soma below
 		linPass, linDetail := validateExp2(linWS)
 		linMetrics.Passed = linPass
 		linMetrics.PassDetail = linDetail
@@ -555,9 +632,10 @@ print("HELD_OUT_ORACLE_OK")
 
 		t.Logf("[Exp2] %s", linMetrics.Format())
 		t.Logf("[Exp2] %s", somaMetrics.Format())
+		return linMetrics, somaMetrics
 	})
 
-	t.Run("Exp3_DeceptiveLocalOptimumBranching", func(t *testing.T) {
+	runTrials(t, cfg, "Exp3_DeceptiveLocalOptimumBranching", func(t *testing.T) (abRunMetrics, abRunMetrics) {
 		evalPy := `import base64, json, os
 with open("candidate.json") as f:
     c = json.load(f)
@@ -619,7 +697,7 @@ Select the best model configuration maximizing dev quality without violating dep
 		seedMLWS(linWS)
 		linMetrics := runLinearBaseline(ctx, cfg, linWS,
 			"You are an ML research agent with fs_read, fs_write, exec, and fs_list.",
-			goal, 10, 64000)
+			goal, 30, 64000) // same total budget as soma's 3 branches x 10 turns
 		linPass, linDetail := validateExp3(linWS)
 		linMetrics.Passed = linPass
 		linMetrics.PassDetail = linDetail
@@ -720,5 +798,6 @@ Select the best model configuration maximizing dev quality without violating dep
 				}
 			}
 		}
+		return linMetrics, somaMetrics
 	})
 }

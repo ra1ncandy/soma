@@ -8,16 +8,16 @@
 
 Instead of treating an autonomous agent as an append-only chat array that dumps raw tool outputs into context, compacts history via lossy LLM summaries, and self-grades its own work, `soma` executes every run as a **durable, content-addressed Merkle execution DAG** featuring:
 
-- **4-Layer Monotonic Prompt Compiler (`Layer 0`–`Layer 3`)** engineered for **85%–98.6% KV-cache reuse** and zero mid-epoch prefix invalidation.
+- **4-Layer Monotonic Prompt Compiler (`Layer 0`–`Layer 3`)** engineered to keep the prompt prefix byte-stable within an epoch (zero mid-epoch prefix invalidation), so provider-side KV caches can be reused.
 - **Content-Addressed Virtual Memory (`@page_XXXX`)** with zstd blob spilling, structural previewers, `page_grep`, `page_slice`, and **Matryoshka `int8` + BM25 Hybrid RRF `page_search`**.
 - **Bi-Temporal Provenance Memory Graph** with point-in-time `QueryAsOf`, *MINJA* untrusted quarantine, semantic conflict detection, and **Epoch-Pinned Top-$K$ Hybrid Retrieval**.
 - **External Verification Oracles (`CommandOracle`, `ArtifactOracle`, Zero-History `AdvisoryReviewer`)** with kernel `EROFS` read-only test pinning that eliminate self-graded completion lies.
 - **Speculative Branching (`soma search`) & Concurrent Multi-Agent Swarms (`soma swarm`)** with isolated per-branch Git worktrees, a cache-safe **`Layer 2` Blackboard bus**, **3-way `git merge-file` workspace merging**, and a cross-branch **Graveyard (`negative_path`)**.
-- **Fail-Closed OS Sandboxing (`bwrap` / Landlock / Seatbelt / Docker / Remote SSH)** paired with **Secretless Capability Brokers** and **Data/Action-Level Provenance Taint Tracking**.
+- **Fail-Closed OS Sandboxing (`bwrap` / Seatbelt / Docker / Remote SSH; Landlock is probed but not yet an enforcement backend)** paired with **Secretless Capability Brokers** and **Data/Action-Level Provenance Taint Tracking**.
 - **Oracle-Verified SFT & Contrastive DPO/GRPO Trajectory Export (`soma export-trajectories`)** pairing verified winning branches against Graveyard-abandoned sibling branches from their exact shared fork ancestor.
 
 > - Architecture Specification: [RFC-0001 (`soma` v2.1 Architecture)](docs/rfcs/0001-soma-v2-architecture.md)
-> - Reproducible Shadow Gauntlet Scorecard: [Benchmark Report (Suite B6)](docs/benchmarks/BENCHMARK_REPORT.md)
+> - Deterministic Kernel Conformance & Ablation Report: [Suite B6](docs/benchmarks/BENCHMARK_REPORT.md)
 > - Security & Threat Model: [SECURITY.md](SECURITY.md)
 
 ---
@@ -62,7 +62,7 @@ Instead of treating an autonomous agent as an append-only chat array that dumps 
 ┌───────────────────▼────────────────────┐  ┌─────────────────▼─────────────────┐
 │   FAIL-CLOSED SANDBOX & TAINT ENGINE   │  │    TIER-0 PROACTIVITY DAEMON      │
 │  • Linux bwrap (--unshare-net/pid)     │  │  • 0-Token Shell/SQL Sentinels    │
-│  • Linux Landlock v4 / macOS Seatbelt  │  │  • fsnotify + HMAC-SHA256 Webhooks│
+│  • macOS Seatbelt (Landlock probe only) │  │  • fsnotify + HMAC-SHA256 Webhooks│
 │  • Ephemeral Docker & Remote SSH       │  │  • 30s Debounce Coalescer         │
 │  • Secretless HTTP/SSH/FS Brokers      │  │  • 4 Hard Circuit Brakes & TTL GC │
 │  • Data/Action Provenance Taint        │  │                                   │
@@ -71,34 +71,41 @@ Instead of treating an autonomous agent as an append-only chat array that dumps 
 
 ---
 
-## 2. Empirical Benchmark Results
+## 2. Verification & Evaluation
 
-### A. Live LLM A/B Evaluation (`soma` vs. Linear Chat Baseline)
+There are two different kinds of evidence here. Please do not read one as the other.
 
-Executed live via `benchmarks/live_eval_test.go` (`TestLiveEvaluation_HypothesisAB`) against real tool-calling models (`beam-free` and `hy4-flash-free`):
-- **Overall Live Pass Rate**: **`soma` passed `5/5` (`100%`)** across both models vs. **`2/5` (`40%`)** for the Hermes-style append-only Linear Chat Baseline.
-- **Controlled Warm Turn KV-Cache Probe**: **`98.6%` real server-side KV cache hit (`2,816 / 2,856 cached_tokens`)** in `711 ms`.
+### A. Offline Conformance Suites (`benchmarks/` — Suites B1–B6)
 
-| Experiment (`beam-free`) | System | Passed | Turns | Prompt Tokens | Uncached Input Tokens | Cached Tokens (Hit %) | Compactions | Exact SHA-256 Replay | Wall Time | Outcome / Verification Detail |
-| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :--- |
-| **Exp1: 280 KB Log Storm & Needle** | `Linear` | `false` | 10 | `140,152` | `137,272` | `2,880` (`2.1%`) | 9 | `false` | `17,389 ms` | Compaction thrash wiped needle (`missing diagnosis.json`) |
-| **Exp1: 280 KB Log Storm & Needle** | **`soma`** | **`true`** | **6** | **`12,485` (-91.1%)** | **`7,109` (-94.8%)** | **`5,376` (`43.1%`)** | **0** | **`true`** | **`5,144 ms` (3.4x faster)** | `yaml_4250=true error_code="SOMA_CRC_7741" timeout_ms=4250` |
-| **Exp2: Held-Out Oracle vs Self-Grade** | `Linear` | `false` | 3 | `1,036` | `140` | `896` (`86.5%`) | 0 | `false` | `11,497 ms` | Self-graded completion lie (`AssertionError: precedence failed`) |
-| **Exp2: Held-Out Oracle vs Self-Grade** | **`soma`** | **`true`** | **7** | **`12,502`** | **`6,230`** | **`6,272` (`50.2%`)** | **0** | **`true`** | **`17,358 ms`** | `HELD_OUT_ORACLE_OK (oracle_runs=1 status=completed)` |
-| **Exp3: Deceptive ML Local Optimum** | `Linear` | `true` | 9 | `28,792` | `10,872` | `17,920` (`62.2%`) | 0 | `false` | `32,894 ms` | `mode=causal_multiscale dev=0.9812 d3=0.9580 causal=2.1e-07` |
-| **Exp3: Deceptive ML Local Optimum** | **`soma`** | **`true`** | **9** | **`18,698` (-35.1%)** | **`10,314`** | **`8,384` (`44.8%`)** | **0** | **`true`** | **`37,159 ms`** | `mode=causal_multiscale dev=0.9812 d3=0.9580 causal=2.1e-07` |
-
-### B. Offline Verification Suites (`benchmarks/` — Suites B1–B6)
+These run in CI with **scripted providers and no LLM**. They show that each kernel mechanism does what the RFC specifies. They are not model-quality or harness-versus-harness benchmarks, and token or cache figures in them come from a simulated provider that assumes any byte-stable prefix is cached.
 
 | Suite | What It Verifies | Key Acceptance Gate |
 |---|---|---|
-| **B1** (`b1_log_storm_test.go`) | 50 turns, five 200 KB logs, mid-epoch skill & MCP loads | `0` compactions, **`94.7%` cache hit**, `< 24k` peak tokens, **`88.3%` token savings**, **`13.3%` (`7.5x` smaller) delta storage**, `100%` SHA-256 frame reconstruction |
+| **B1** (`b1_log_storm_test.go`) | 50 turns, five 200 KB logs, mid-epoch skill & MCP loads | `0` compactions, `100%` SHA-256 frame reconstruction, prefix stays byte-stable (simulated cache hit `>= 94%`), `>= 40%` fewer prompt tokens than the same run with outputs inlined, delta storage under `15%` of full-frame storage |
 | **B2** (`b2_chaos_durability_test.go`) | 20 concurrent chaos tasks + 429 storms + crashes between dispatch and commit | `20/20` completion, `0` lost steps, `0` `SQLITE_BUSY`, `0` duplicate `irreversible_write` executions |
 | **B2/v0.3** (`b2_v3_surface_test.go`) | Multi-sub 429 failover, 100 unchanged sentinel ticks + 20 burst webhooks, Discord/Telegram Unix IPC bridge & concurrent 4-tab TUI | `0` tokens on unchanged sentinels, `20 -> 1` burst coalescing, clean Epoch 2 Handoff Packet + primary recovery, concurrent TUI/IPC zero `SQLITE_BUSY` |
 | **B3** (`b3_memory_antipoison_test.go`) | 30 sequential rule updates (`SUPERSEDES`/`MERGES`) + *MINJA* injection + skill immutability | `100%` current & point-in-time recall, `0%` untrusted rule activation, `0` silent `SKILL.md` mutations |
 | **B4** (`b4_sandbox_confused_deputy_test.go`) | Real `bwrap` isolation + poisoned `SKILL.md` + `MCP 2026-07-28` Confused Deputy + SSH injection/leases | `0` leaked bytes/network, `100%` Confused Deputy `POST` blocked until deterministic `DeclassifyStructured`, SSH injection rejected |
 | **B5** (`b5_oracles_reward_hacking_test.go`) | *ImpossibleBench* pinned test tampering + stale checksum (`p181`/`p183`) & Track D collapse | `100%` premature `Done` rejected until fresh verified artifact passes |
-| **B6** (`b6_branching_shadow_gauntlet_test.go`) | Non-git ML deceptive local optimum (`Lala-l1.1` Track D/E trap) + 4-domain Shadow Gauntlet vs. Hermes/linear | `BranchSearcher` escapes via Graveyard backtracking; **`100%` completion (`4.0x` linear)**, `0` compactions, `100%` `ModeExact` SHA-256 replay |
+| **B6** (`b6_branching_shadow_gauntlet_test.go`) | Scripted deceptive-local-optimum search + the 4-scenario [conformance gauntlet](docs/benchmarks/BENCHMARK_REPORT.md): each scenario replays one script with its kernel mechanism enabled and disabled, and checks ground truth both times | `BranchSearcher` escapes via Graveyard backtracking; `4/4` scenarios verified with the mechanism on and `0/4` with it off; `100%` `ModeExact` SHA-256 replay |
+
+### B. Live LLM A/B Evaluation (`benchmarks/live_eval_test.go`)
+
+`TestLiveEvaluation_HypothesisAB` runs three tasks against a real tool-calling model, once through `soma` and once through a minimal append-only chat loop with LLM summarization that is written for this test. It is skipped unless `SOMA_LIVE_API_KEY` is set.
+
+```bash
+SOMA_LIVE_API_KEY=... SOMA_LIVE_BASE_URL=... SOMA_LIVE_MODEL=... \
+SOMA_LIVE_REPEATS=10 SOMA_LIVE_OUT=live_results.jsonl \
+go test -count=1 -v -run TestLiveEvaluation_HypothesisAB ./benchmarks/
+```
+
+**No headline numbers are published here yet.** Earlier versions of this README reported `5/5` vs. `2/5` and a `98.6%` cache hit. Those figures were withdrawn because the baseline was not a fair one: it discarded its own summary at every compaction, never showed the summarizer the latest tool result, and was given fewer turns than `soma`. All three are fixed (and pinned by `live_baseline_test.go`), but the evaluation has not been re-run since.
+
+When reading results from this test, keep in mind:
+
+- The baseline is a simple loop written for this repository. It is **not** Hermes, OpenClaw, or any other real harness.
+- Exp2 and Exp3 give `soma` an external oracle that feeds failing assertions back to the model, and give the baseline no verifier. They measure the value of verifier feedback, not of the rest of the kernel.
+- Three tasks is a small sample. Use `SOMA_LIVE_REPEATS` and report pass counts per model, with the raw `SOMA_LIVE_OUT` log.
 
 ---
 
@@ -106,7 +113,7 @@ Executed live via `benchmarks/live_eval_test.go` (`TestLiveEvaluation_Hypothesis
 
 - **16 Canonical Workspace, Virtual Memory, Blackboard & Multimodal Tools (`internal/dag`)**:
   - **Filesystem & Forgiving Patching**: `fs_list`, `fs_read`, `fs_write`, and multi-hunk `fs_patch` (supporting `<<<<<<< SEARCH ... ======= ... >>>>>>> REPLACE`, JSON `search`/`replace`, and unified diffs with 3-tier exact/trimmed/indentation-fuzzy matching and atomic rollback).
-  - **Sandboxed Execution & `@page` Background Jobs**: Synchronous `exec` (`bwrap --unshare-net --unshare-pid`) plus asynchronous `bg_exec`, `bg_poll`, and `bg_kill` whose live output streams automatically spill to `@page_XXXX` handles.
+  - **Sandboxed Execution & `@page` Background Jobs**: Synchronous `exec` and asynchronous `bg_exec` both run inside the same fail-closed sandbox (`bwrap --unshare-net --unshare-pid`), with `bg_poll` and `bg_kill`, whose live output streams automatically spill to `@page_XXXX` handles.
   - **Virtual Memory & Hybrid RRF Retrieval**: `page_grep`, `page_slice`, `page_search` (40-line chunked Hybrid BM25 + 256-dim Matryoshka `int8` Vector RRF), and `memory_search`.
   - **Multi-Agent Blackboard**: `publish_finding(summary, page_id?)` broadcasts discoveries and `@page` handles to sibling agents into `Layer 2` without invalidating `Layer 0 + Layer 1` KV cache.
   - **Provenance-Tainted Web & Vision**: `web_search`, `web_extract` (both tagged `TrustTier: "untrusted_external"`), and `vision_analyze`.
@@ -153,7 +160,7 @@ SOMA_MODEL="gpt-4.1" \
 ./bin/soma export-trajectories --dir /tmp/demo --format sft --verified-only --out sft.jsonl
 ./bin/soma export-trajectories --dir /tmp/demo --format dpo --verified-only --out dpo.jsonl
 
-# 7. Launch the 4-tab Bubble Tea v2 interactive TUI or run the Shadow Gauntlet
+# 7. Launch the 4-tab Bubble Tea v2 interactive TUI or regenerate the conformance report
 ./bin/soma ui --dir /tmp/demo
 make shadow
 ```

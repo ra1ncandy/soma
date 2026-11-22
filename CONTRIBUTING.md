@@ -26,6 +26,12 @@ go test -count=1 -race ./...
 # 3. Build stripped static binaries
 make build
 
-# 4. Run reproducible Shadow Gauntlet scorecard
+# 4. Regenerate the Suite B6 conformance report (scripted provider, no LLM)
 make shadow
 ```
+
+## 3. Benchmark Claims
+
+- Numbers in the README or reports must be produced by code in this repository and reproducible from it. Do not hardcode a competitor's or baseline's outcome; run it.
+- Conformance suites (scripted providers) and live-model evaluations are different kinds of evidence. Label which one a number comes from.
+- A baseline must be given the same turn budget and the same information as `soma`, or the difference must be stated next to the result.

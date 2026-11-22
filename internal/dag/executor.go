@@ -880,7 +880,17 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 		var allRefs []string
 		for idx, tc := range calls {
 			if tc.EffectClass == "" {
-				tc.EffectClass = taint.EffectReadOnly
+				tc.EffectClass = inferToolEffectClass(tc.Name)
+			}
+			// The model only declares the pages it chooses to cite. For anything leaving the
+			// sandbox, every untrusted page this run has observed is implied provenance: the
+			// model may have retyped that content into the arguments.
+			if tc.EffectClass != taint.EffectReadOnly && tc.EffectClass != taint.EffectWorkspaceWrite {
+				implied, err := e.Store.ListUntrustedPageIDs(ctx, run.ID)
+				if err != nil {
+					return res, fmt.Errorf("load run taint provenance: %w", err)
+				}
+				tc.ReferencedPageIDs = mergePageRefs(tc.ReferencedPageIDs, implied)
 			}
 			provJSONBytes, _ := json.Marshal(tc.ReferencedPageIDs)
 			provJSON := string(provJSONBytes)
@@ -1013,6 +1023,9 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 					})
 					if obsErr != nil {
 						return res, obsErr
+					}
+					if err := e.recordUntrustedInline(ctx, run.ID, out, obsRes); err != nil {
+						return res, err
 					}
 					if obsRes.Paged {
 						obsText = obsRes.Manifest
@@ -1258,6 +1271,39 @@ func (e *Executor) recoverPendingActions(
 	return extraL2, nil
 }
 
+// recordUntrustedInline gives an untrusted observation that was small enough to stay inline its own
+// @page record. Without it, only spilled (large) untrusted outputs would ever taint the run.
+func (e *Executor) recordUntrustedInline(ctx context.Context, runID string, out ToolOutput, obs vmem.ObserveResult) error {
+	if out.TrustTier != "untrusted_external" || obs.Paged || len(out.Content) == 0 {
+		return nil
+	}
+	if _, err := e.VM.RecordProvenance(ctx, vmem.ObserveRequest{
+		RunID:     runID,
+		NameHint:  out.NameHint,
+		Content:   out.Content,
+		TrustTier: out.TrustTier,
+	}); err != nil {
+		return fmt.Errorf("record untrusted provenance: %w", err)
+	}
+	return nil
+}
+
+func mergePageRefs(declared, implied []string) []string {
+	if len(implied) == 0 {
+		return declared
+	}
+	seen := make(map[string]bool, len(declared)+len(implied))
+	out := make([]string, 0, len(declared)+len(implied))
+	for _, id := range append(append([]string(nil), declared...), implied...) {
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	return out
+}
+
 func (e *Executor) commitRecoveredAction(
 	ctx context.Context,
 	run store.Run,
@@ -1277,6 +1323,9 @@ func (e *Executor) commitRecoveredAction(
 		InlineThresholdBytes: e.Profile.InlineThresholdBytes,
 	})
 	if err != nil {
+		return nil, err
+	}
+	if err := e.recordUntrustedInline(ctx, run.ID, out, obsRes); err != nil {
 		return nil, err
 	}
 	obsText := obsRes.InlineText
@@ -1620,9 +1669,13 @@ type LocalToolRunner struct {
 	HTTPClient     *http.Client
 	SearchEndpoint string
 	VisionBaseURL  string
+	// AllowUnsandboxedExec lets exec/bg_exec run a bare host shell when Sandbox is nil.
+	// It is off by default (fail-closed) and must never be enabled for model-driven runs.
+	AllowUnsandboxedExec bool
 }
 
-// NewLocalToolRunner constructs a workspace-scoped tool runner.
+// NewLocalToolRunner constructs a workspace-scoped tool runner with no OS sandbox. Its exec and
+// bg_exec tools fail closed with ErrUnsandboxedExec; filesystem, @page and memory tools work.
 func NewLocalToolRunner(vm *vmem.Manager) *LocalToolRunner {
 	return &LocalToolRunner{
 		vm:      vm,
@@ -1630,8 +1683,20 @@ func NewLocalToolRunner(vm *vmem.Manager) *LocalToolRunner {
 	}
 }
 
+// NewUnsandboxedToolRunner constructs a tool runner whose exec/bg_exec run directly on the host
+// with only a scrubbed environment. For tests and fully trusted input only.
+func NewUnsandboxedToolRunner(vm *vmem.Manager) *LocalToolRunner {
+	r := NewLocalToolRunner(vm)
+	r.AllowUnsandboxedExec = true
+	return r
+}
+
 // NewSandboxedToolRunner constructs a workspace-scoped tool runner executing shell commands inside sbx.
+// A nil sbx selects the default fail-closed sandbox.Manager rather than disabling isolation.
 func NewSandboxedToolRunner(vm *vmem.Manager, sbx *sandbox.Manager) *LocalToolRunner {
+	if sbx == nil {
+		sbx = sandbox.NewManager()
+	}
 	return &LocalToolRunner{
 		vm:      vm,
 		Sandbox: sbx,
@@ -1755,7 +1820,14 @@ func (r *LocalToolRunner) Execute(ctx context.Context, call ToolCall) (ToolOutpu
 		if r.BgProcs == nil {
 			r.BgProcs = NewBgProcessManager()
 		}
-		jobID, err := r.BgProcs.Start(call.RunID, call.WorkspaceDir, command, label)
+		jobID, err := r.BgProcs.Start(BgStartSpec{
+			RunID:            call.RunID,
+			WorkspaceDir:     call.WorkspaceDir,
+			Command:          command,
+			Label:            label,
+			Sandbox:          r.Sandbox,
+			AllowUnsandboxed: r.AllowUnsandboxedExec,
+		})
 		if err != nil {
 			return ToolOutput{}, err
 		}
@@ -1829,6 +1901,9 @@ func (r *LocalToolRunner) Execute(ctx context.Context, call ToolCall) (ToolOutpu
 			}
 			body := fmt.Sprintf("exit_code=%d\n%s", res.ExitCode, string(res.Combined))
 			return ToolOutput{NameHint: "exec.log", Content: []byte(body), TrustTier: "trusted_repo"}, nil
+		}
+		if !r.AllowUnsandboxedExec {
+			return ToolOutput{}, ErrUnsandboxedExec
 		}
 		runCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 		defer cancel()

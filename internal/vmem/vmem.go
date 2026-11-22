@@ -79,9 +79,43 @@ func (m *Manager) Observe(ctx context.Context, req ObserveRequest) (ObserveResul
 		}, nil
 	}
 
+	page, err := m.spill(ctx, req)
+	if err != nil {
+		return ObserveResult{}, err
+	}
+	pageID, hash, ct, preview := page.ID, page.ContentHash, ContentType(page.ContentType), page.PreviewText
+
+	manifest := fmt.Sprintf(
+		"@%s [%s | %s | %d bytes | %d lines | sha256:%s]\n%s\n(Use page_grep(%q, pattern) or page_slice(%q, start, end) to inspect raw lines.)",
+		pageID, ct, req.TrustTier, page.ByteSize, page.LineCount, hash[:12], preview, pageID, pageID,
+	)
+
+	return ObserveResult{
+		Paged:    true,
+		PageID:   pageID,
+		Manifest: manifest,
+		Page:     page,
+	}, nil
+}
+
+// RecordProvenance stores content as an @page regardless of size and returns its page ID, without
+// producing a manifest. The executor uses it to give small inline untrusted observations a
+// provenance record, so taint tracking cannot be dodged by keeping payloads under the inline threshold.
+func (m *Manager) RecordProvenance(ctx context.Context, req ObserveRequest) (string, error) {
+	if req.TrustTier == "" {
+		req.TrustTier = "trusted_repo"
+	}
+	page, err := m.spill(ctx, req)
+	if err != nil {
+		return "", err
+	}
+	return page.ID, nil
+}
+
+func (m *Manager) spill(ctx context.Context, req ObserveRequest) (store.Page, error) {
 	hash, relPath, err := m.store.Blobs().Put(req.Content)
 	if err != nil {
-		return ObserveResult{}, fmt.Errorf("vmem spill blob: %w", err)
+		return store.Page{}, fmt.Errorf("vmem spill blob: %w", err)
 	}
 
 	ct := DetectContentType(req.NameHint, req.Content)
@@ -102,20 +136,9 @@ func (m *Manager) Observe(ctx context.Context, req ObserveRequest) (ObserveResul
 		PreviewText: preview,
 	}
 	if err := m.store.PutPage(ctx, page); err != nil {
-		return ObserveResult{}, fmt.Errorf("vmem index page: %w", err)
+		return store.Page{}, fmt.Errorf("vmem index page: %w", err)
 	}
-
-	manifest := fmt.Sprintf(
-		"@%s [%s | %s | %d bytes | %d lines | sha256:%s]\n%s\n(Use page_grep(%q, pattern) or page_slice(%q, start, end) to inspect raw lines.)",
-		pageID, ct, req.TrustTier, page.ByteSize, page.LineCount, hash[:12], preview, pageID, pageID,
-	)
-
-	return ObserveResult{
-		Paged:    true,
-		PageID:   pageID,
-		Manifest: manifest,
-		Page:     page,
-	}, nil
+	return page, nil
 }
 
 // Slice returns 1-indexed inclusive lines [startLine, endLine] capped at MaxSliceLines.

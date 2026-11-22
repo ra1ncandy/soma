@@ -32,7 +32,7 @@ func TestB6_BranchingSearchAndShadowGauntlet(t *testing.T) {
 		t.Fatalf("UpsertAccount: %v", err)
 	}
 
-	// Part 1: Non-git ML R&D deceptive local optimum (linear trap vs BranchSearcher + Graveyard backtracking).
+	// Part 1: Non-git ML R&D deceptive local optimum, scripted provider (single branch vs BranchSearcher + Graveyard backtracking).
 	stalePath := filepath.Join(t.TempDir(), "stale_lala.json")
 	_ = os.WriteFile(stalePath, []byte(`{"model":"stale_prev"}`), 0o644)
 	staleSHA, _ := oracle.HashFileSHA256(stalePath)
@@ -113,27 +113,24 @@ func TestB6_BranchingSearchAndShadowGauntlet(t *testing.T) {
 		}
 	}
 
-	// Part 2: Full 4-domain reproducible Shadow Gauntlet (Coding, SSH Ops, Non-Git ML R&D, Multi-Sub Quotas).
+	// Part 2: 4-scenario conformance gauntlet. Each scenario replays one script with its kernel
+	// mechanism enabled and disabled, and both outcomes are checked against ground truth.
 	runner := shadow.NewRunner(st, sandbox.NewManager(), "v0.4.0")
-	rep, err := runner.RunGauntlet(ctx, shadow.DefaultHermesBaseline())
+	rep, err := runner.RunGauntlet(ctx, nil)
 	if err != nil {
 		t.Fatalf("RunGauntlet: %v", err)
 	}
-	if !rep.Scorecard.GatePassed {
-		t.Fatalf("Suite B6 scorecard gate failed: %+v", rep.Scorecard)
+	sc := rep.Scorecard
+	if !sc.GatePassed {
+		t.Fatalf("Suite B6 scorecard gate failed: %+v", sc)
 	}
-	if rep.Scorecard.SomaCompletionRate != 1.0 || rep.Scorecard.CompletionRatio < 2.0 {
-		t.Fatalf("unexpected completion metrics: %+v", rep.Scorecard)
-	}
-	if rep.Scorecard.ExactReplayPassRate != 100.0 || rep.Scorecard.TotalCompactions != 0 {
-		t.Fatalf("unexpected exact replay / compaction metrics: %+v", rep.Scorecard)
+	if sc.KernelVerified != sc.Tasks || sc.MechanismsLoadBearing != sc.Tasks || sc.ExactReplayPassRate != 100.0 {
+		t.Fatalf("unexpected conformance metrics: %+v", sc)
 	}
 
 	t.Logf("=== SUITE B6: BRANCHING SEARCH & SHADOW GAUNTLET PASSED ===")
 	t.Logf("Part 1 Lala-l1.1 Trap: Linear=%s vs BranchSearcher=%v (branches=%d, graveyard=%d)",
 		linRes.Status, sRes.Completed, len(sRes.Attempts), sRes.GraveyardCount)
-	t.Logf("Part 2 Shadow Scorecard: soma=%.0f%% linear=%.0f%% ratio=%.2fx cache=%.2f%% exact_replay=%.0f%% compactions=%d",
-		rep.Scorecard.SomaCompletionRate*100.0, rep.Scorecard.LinearCompletionRate*100.0,
-		rep.Scorecard.CompletionRatio, rep.Scorecard.AvgCacheHitRate,
-		rep.Scorecard.ExactReplayPassRate, rep.Scorecard.TotalCompactions)
+	t.Logf("Part 2 Conformance: kernel_verified=%d/%d ablation_verified=%d/%d load_bearing=%d/%d exact_replay=%.0f%%",
+		sc.KernelVerified, sc.Tasks, sc.AblationVerified, sc.Tasks, sc.MechanismsLoadBearing, sc.Tasks, sc.ExactReplayPassRate)
 }

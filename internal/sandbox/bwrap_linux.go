@@ -32,24 +32,16 @@ func (b *bwrapBackend) Available() bool { return b.binPath != "" }
 
 func (b *bwrapBackend) SupportsNetworkIsolation() bool { return true }
 
-func (b *bwrapBackend) Exec(ctx context.Context, spec ExecSpec) (ExecResult, error) {
-	if b.binPath == "" {
-		return ExecResult{}, ErrSandboxUnavailable
-	}
+// BuildBwrapArgs constructs the deterministic bwrap argument vector for spec (exported so tests
+// can assert the isolation flags without needing bwrap installed).
+func BuildBwrapArgs(spec ExecSpec) ([]string, error) {
 	if spec.WorkspaceDir == "" {
-		return ExecResult{}, errors.New("bwrap: WorkspaceDir is required")
+		return nil, errors.New("bwrap: WorkspaceDir is required")
 	}
 	absWS, err := filepath.Abs(spec.WorkspaceDir)
 	if err != nil {
-		return ExecResult{}, fmt.Errorf("bwrap resolve workspace: %w", err)
+		return nil, fmt.Errorf("bwrap resolve workspace: %w", err)
 	}
-
-	timeout := spec.Timeout
-	if timeout <= 0 {
-		timeout = 60 * time.Second
-	}
-	runCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
 
 	args := []string{
 		"--ro-bind", "/usr", "/usr",
@@ -77,6 +69,14 @@ func (b *bwrapBackend) Exec(ctx context.Context, spec ExecSpec) (ExecResult, err
 		"--bind", absWS, "/workspace",
 		"--chdir", "/workspace",
 		"--unshare-pid",
+		"--unshare-ipc",
+		"--unshare-uts",
+		"--unshare-cgroup-try",
+		// Detach from the controlling terminal so sandboxed code cannot inject keystrokes
+		// into the operator's shell via TIOCSTI.
+		"--new-session",
+		// Matters when soma itself runs as root (containers, CI): no capability survives.
+		"--cap-drop", "ALL",
 		"--die-with-parent",
 		"--clearenv",
 	)
@@ -85,11 +85,11 @@ func (b *bwrapBackend) Exec(ctx context.Context, spec ExecSpec) (ExecResult, err
 	for _, rel := range spec.PinnedReadOnlyFiles {
 		cleanRel := filepath.Clean(rel)
 		if filepath.IsAbs(cleanRel) || cleanRel == "." || strings.HasPrefix(cleanRel, "..") {
-			return ExecResult{}, fmt.Errorf("bwrap: invalid pinned file path %q", rel)
+			return nil, fmt.Errorf("bwrap: invalid pinned file path %q", rel)
 		}
 		hostPath := filepath.Join(absWS, cleanRel)
 		if _, err := os.Stat(hostPath); err != nil {
-			return ExecResult{}, fmt.Errorf("bwrap: pinned file missing %q: %w", rel, err)
+			return nil, fmt.Errorf("bwrap: pinned file missing %q: %w", rel, err)
 		}
 		args = append(args, "--ro-bind", hostPath, filepath.ToSlash(filepath.Join("/workspace", cleanRel)))
 	}
@@ -112,6 +112,38 @@ func (b *bwrapBackend) Exec(ctx context.Context, spec ExecSpec) (ExecResult, err
 
 	args = append(args, "--", spec.Command)
 	args = append(args, spec.Args...)
+	return args, nil
+}
+
+// Command returns an unstarted bwrap-wrapped command for spec. Killing the returned process tears
+// down the whole sandbox: --die-with-parent kills the PID-namespace init, and the kernel then
+// reaps every process inside it.
+func (b *bwrapBackend) Command(ctx context.Context, spec ExecSpec) (*exec.Cmd, error) {
+	if b.binPath == "" {
+		return nil, ErrSandboxUnavailable
+	}
+	args, err := BuildBwrapArgs(spec)
+	if err != nil {
+		return nil, err
+	}
+	return exec.CommandContext(ctx, b.binPath, args...), nil
+}
+
+func (b *bwrapBackend) Exec(ctx context.Context, spec ExecSpec) (ExecResult, error) {
+	if b.binPath == "" {
+		return ExecResult{}, ErrSandboxUnavailable
+	}
+	args, err := BuildBwrapArgs(spec)
+	if err != nil {
+		return ExecResult{}, err
+	}
+
+	timeout := spec.Timeout
+	if timeout <= 0 {
+		timeout = 60 * time.Second
+	}
+	runCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 
 	start := time.Now()
 	cmd := exec.CommandContext(runCtx, b.binPath, args...)

@@ -1720,6 +1720,28 @@ func (s *Store) TotalDailyMeteredSpend(ctx context.Context) (float64, error) {
 	return total, err
 }
 
+// ListUntrustedPageIDs returns every untrusted_external @page recorded for runID, oldest first.
+// These are the implied provenance of any external side effect the run later attempts.
+func (s *Store) ListUntrustedPageIDs(ctx context.Context, runID string) ([]string, error) {
+	rows, err := s.reader.QueryContext(ctx, `
+		SELECT id FROM pages
+		WHERE run_id = ? AND trust_tier = 'untrusted_external'
+		ORDER BY created_at ASC, id ASC`, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
 // ListRunPages lists spilled @page entries for runID newest-first.
 func (s *Store) ListRunPages(ctx context.Context, runID string, limit int) ([]Page, error) {
 	if limit <= 0 {

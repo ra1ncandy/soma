@@ -589,6 +589,9 @@ func (p *OpenAICompatProvider) Generate(ctx context.Context, req GenerateRequest
 	return gen, nil
 }
 
+// inferToolEffectClass maps a tool name to its risk tier. Only the built-in workspace tools are
+// known to be local; anything else (MCP tools, brokers, future tools) is assumed to reach outside
+// the sandbox, so it is subject to taint checks instead of being waved through as read-only.
 func inferToolEffectClass(toolName string) taint.EffectClass {
 	switch toolName {
 	case "fs_read", "fs_list", "page_slice", "page_grep", "page_search", "memory_search", "publish_finding", "bg_poll", "web_search", "web_extract", "vision_analyze":
@@ -596,7 +599,7 @@ func inferToolEffectClass(toolName string) taint.EffectClass {
 	case "fs_write", "fs_patch", "exec", "bg_exec", "bg_kill":
 		return taint.EffectWorkspaceWrite
 	default:
-		return taint.EffectReadOnly
+		return taint.EffectExternalWrite
 	}
 }
 

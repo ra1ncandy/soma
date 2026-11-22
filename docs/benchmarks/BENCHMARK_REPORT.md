@@ -1,55 +1,73 @@
-# `soma` v0.4 Reproducible Shadow Gauntlet Benchmark Report (Suite B6)
+# `soma` Kernel Conformance & Ablation Report (Suite B6)
 
-- **Generated At**: `2026-11-22T19:55:02Z`
+- **Generated At**: `2026-11-22T20:24:58Z`
 - **Kernel Version**: `v0.4.0 (RFC-0001 v2.1 Complete — Shadow Gauntlet & Branching Search)`
-- **Reference Baseline**: Hermes Multi-Host Production Audit (Nov 2026)
-- **Suite B6 Acceptance Gate**: **PASS** (`soma` `100%` vs. Linear `25%` = **4.00x**, `ExactReplay=100%`, `Compactions=0`)
+- **Suite B6 Gate**: **PASS** (kernel verified `4/4`, mechanisms load-bearing `4/4`, exact replay `100%`)
+
+## What this report is, and is not
+
+This is a **deterministic conformance test of kernel mechanisms**, not a model-quality or
+harness-versus-harness benchmark. Every scenario is driven by a **scripted provider** that replays a
+fixed sequence of tool calls, including a deliberate mistake (a premature `Done`, an injected shell
+command, a deceptive local optimum, a 429). No LLM is called.
+
+Each scenario runs that same script twice: once with the kernel mechanism under test **enabled**, once
+with it **disabled**. Both outcomes are then checked against ground truth read back from the workspace
+or the fake host, not from the script's own claim of completion. A mechanism is *load-bearing* when the
+enabled run verifies and the disabled run does not.
+
+It therefore shows that the mechanisms work as specified and that the scenarios would fail without
+them. It says nothing about how often a real model makes these mistakes, about token cost or cache
+behaviour, or about any other agent harness. For live-model results see `benchmarks/live_eval_test.go`.
 
 ---
 
-## 1. Executive Scorecard (`soma` vs. Linear Harness)
+## 1. Scorecard
 
-| Metric | `soma` | Linear Baseline | RFC-0001 v2.1 Gate |
-|---|---:|---:|---|
-| Verified Task Completion Rate | **100.0%** | 25.0% | >= 2.0x linear (**4.00x**) |
-| Average Prefix Cache Hit Rate | **93.12%** | < 85% (lossy compaction) | >= 85% |
-| Total LLM Text Compactions | **0** | High (`567` observed) | `0` |
-| SHA-256 `ModeExact` Replay Pass Rate | **100%** | N/A (unhashed log) | `100%` |
-| Net Token Reduction vs. Unpaged Linear | **59.9%** | Baseline | >= 40% on churny runs |
-
----
-
-## 2. Empirical Hermes Baseline Telemetry
-
-| Failure Mode | Observed Production Telemetry (`state.db` / `agent.log`) | `soma` Architectural Eliminator |
-|---|---|---|
-| Lossy Compactions | `567` compactions across `324` sessions | `@page` Virtual Memory + Immutable L0/L1 Epochs (`0` compactions) |
-| HTTP 429 & Orphan Reaps | `417/781` (53.4%) 429 deaths; `739/1662` (44.5%) orphan reaps | SQLite Cooldown Scheduler + Epoch Handoff Failover |
-| Unattended Approvals & Curator Bloat | `547` `BLOCKED:` tool denials; `150` `.curator_ledger.jsonl` edits | Scoped `bwrap`/Broker Policies + Immutable Lint-Gated Skills |
+| Measured outcome | Result | Gate |
+|---|---:|---|
+| Scenarios verified with mechanism enabled | **4/4** | all |
+| Scenarios verified with mechanism disabled | 0/4 | reported, not gated |
+| Mechanisms shown load-bearing | **4/4** | all |
+| SHA-256 `ModeExact` replay pass rate | **100%** | `100%` |
 
 ---
 
-## 3. Domain-by-Domain Shadow Gauntlet Results
+## 2. Scenario Results
 
-| Task ID | Domain | `soma` | Linear | Branches | Graveyard | Turns | Cache Hit | Oracles | Replay (`exact`) | Notes |
-|---|---|---|---|---:|---:|---:|---:|---|---|---|
-| `shadow-coding-01` | `coding` | **PASS** | FAIL | 1 | 0 | 4 | 93.0% | 1/2 runs | PASS (4 steps) | Oracle caught Turn-2 premature Done cleanly; repaired & passed in git_worktree |
-| `shadow-ops-01` | `ssh_ops` | **PASS** | FAIL | 1 | 0 | 4 | 93.4% | policy+lease | PASS (4 steps) | Blocked metacharacter injection; ran vm-lab-01 & gpu-node-01 checks under remote_leases (vs Hermes 547 BLOCKED errors) |
-| `shadow-ml-lala-01` | `ml_rd` | **PASS** | FAIL | 3 | 2 | 10 | 94.4% | 2/2 tracks | PASS (12 steps) | Abandoned 2 trapped branches into Graveyard; 3rd copy_snapshot branch passed Track D+E |
-| `shadow-quota-01` | `quota_chaos` | **PASS** | PASS (degraded) | 1 | 0 | 2 | 91.7% | 0 lost steps | PASS (2 steps) | Epoch 2 Handoff Packet avoided 429 reap; primary preference restored after cooldown (linear stuck on fallback) |
+| Task ID | Mechanism under test | Enabled | Disabled | Branches | Graveyard | Turns | Replay (`exact`) |
+|---|---|---|---|---:|---:|---:|---|
+| `shadow-coding-01` | External `CommandOracle` gating `Done` | **PASS** | FAIL | 1 | 0 | 4 | PASS (4 steps) |
+| `shadow-ops-01` | Allowlisted `SSHBroker` command policy | **PASS** | FAIL | 1 | 0 | 4 | PASS (4 steps) |
+| `shadow-ml-lala-01` | `BranchSearcher` with cross-branch Graveyard | **PASS** | FAIL | 3 | 2 | 10 | PASS (12 steps) |
+| `shadow-quota-01` | Epoch handoff failover across accounts | **PASS** | FAIL | 1 | 0 | 2 | PASS (2 steps) |
+
+### Evidence
+
+- **`shadow-coding-01`** (Premature completion claim on a git-worktree patch)
+  - Enabled: oracle rejected 1 of 2 completion claim(s); run ended `completed` after 4 turns; required fix present in `handler.go`: true
+  - Disabled: with no oracle the run ended `completed` after 2 turns; required fix present in `handler.go`: false
+- **`shadow-ops-01`** (Injected shell metacharacters in a multi-host SSH task)
+  - Enabled: 2 command(s) reached the fake hosts; injected `rm -rf` payload reached a host: false
+  - Disabled: with no broker the run ended `completed`; 3 command(s) reached the fake hosts; injected `rm -rf` payload reached a host: true
+- **`shadow-ml-lala-01`** (Deceptive local optimum in a non-git ML research task)
+  - Enabled: 3 branch(es) explored, 2 abandoned to the Graveyard; winning branch final artifact `lala-l1.1-causal-dilated-v2` (pr_auc=0.9812, track_d=0.9580, track_e=2.1e-07)
+  - Disabled: with a single branch the run ended `failed` after 5 turns; final artifact `burst-long-L1024` (pr_auc=0.9807, track_d=0.0018, track_e=1.3e-07)
+- **`shadow-quota-01`** (HTTP 429 on the primary subscription mid-run)
+  - Enabled: run ended `completed` in one pass after 1 account rollover(s)
+  - Disabled: with failover disabled a single pass ended `suspended_quota` after 1 turn(s) (suspended on the 429 instead of handing off)
 
 ---
 
-## 4. Reproducible Verification & Time-Travel Inspection
+## Reproduce
 
 ```bash
-# Reproduce full test suite + B1-B6 benchmarks under -race
+# Full test suite + B1-B6 under -race
 go test -count=1 -race -v ./benchmarks/...
 
-# Inspect or regenerate this shadow gauntlet report cleanly
+# Regenerate this report
 make shadow
-# Exact SHA-256 replay for shadow-coding-01 (coding): soma replay br_18ea7624fc6ed551_0002 --mode exact (head step: step_2fcf6140a627e59b77cd4c2d)
-# Exact SHA-256 replay for shadow-ops-01 (ssh_ops): soma replay br_18ea7624fe7c5f89_0002 --mode exact (head step: step_c7b12f1720f3e6cf84de57f7)
-# Exact SHA-256 replay for shadow-ml-lala-01 (ml_rd): soma replay br_18ea7624ff9d137a_0009 --mode exact (head step: step_016a03782eecb4e282e4a022)
-# Exact SHA-256 replay for shadow-quota-01 (quota_chaos): soma replay br_18ea762500551319_0002 --mode exact (head step: step_1d9263ecdcb2f4484021f330)
 ```
+
+Branch and step IDs are generated per run; `soma shadow run --dir <dir>` keeps the store so each
+winning branch can be re-checked with `soma replay <branch> --mode exact`.

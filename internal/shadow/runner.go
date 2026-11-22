@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -23,7 +24,8 @@ import (
 	"github.com/ra1ncandy/soma/internal/workspace"
 )
 
-// Runner executes the 4-domain reproducible Shadow Gauntlet comparing soma against a linear baseline.
+// Runner executes the 4-scenario deterministic conformance gauntlet. Each scenario replays one
+// scripted model twice, with a kernel mechanism enabled and disabled, and checks ground truth.
 type Runner struct {
 	Store   *store.Store
 	Sandbox *sandbox.Manager
@@ -45,14 +47,12 @@ func NewRunner(st *store.Store, sbx *sandbox.Manager, version string) *Runner {
 	}
 }
 
-// RunGauntlet executes Coding, Multi-Host SSH Ops, Non-Git ML R&D, and Multi-Sub Quota Chaos shadow tasks,
-// verifying 100% SHA-256 ModeExact replay across completed trajectories and computing the Suite B6 Scorecard.
-func (r *Runner) RunGauntlet(ctx context.Context, baseline BaselineMetrics) (GauntletReport, error) {
+// RunGauntlet executes the Coding, Multi-Host SSH Ops, Non-Git ML R&D, and Multi-Sub Quota scenarios
+// and computes the Suite B6 conformance scorecard. baseline is optional external telemetry that is
+// echoed into the report untouched; pass nil to omit it.
+func (r *Runner) RunGauntlet(ctx context.Context, baseline *BaselineMetrics) (GauntletReport, error) {
 	if r.Store == nil {
 		return GauntletReport{}, errors.New("shadow: Store is required")
-	}
-	if baseline.SourceLabel == "" {
-		baseline = DefaultHermesBaseline()
 	}
 
 	for _, acc := range []store.Account{
@@ -71,7 +71,7 @@ func (r *Runner) RunGauntlet(ctx context.Context, baseline BaselineMetrics) (Gau
 	}
 	defer func() { _ = os.RemoveAll(scratchRoot) }()
 
-	t1, err := r.runCodingShadow(ctx, filepath.Join(scratchRoot, "coding_repo"))
+	t1, err := r.runCodingShadow(ctx, scratchRoot)
 	if err != nil {
 		return GauntletReport{}, fmt.Errorf("shadow-coding-01: %w", err)
 	}
@@ -89,7 +89,7 @@ func (r *Runner) RunGauntlet(ctx context.Context, baseline BaselineMetrics) (Gau
 	}
 
 	tasks := []TaskResult{t1, t2, t3, t4}
-	sc := computeScorecard(tasks, baseline)
+	sc := computeScorecard(tasks)
 	return GauntletReport{
 		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
 		SomaVersion: r.Version,
@@ -154,16 +154,15 @@ func (p *codingShadowProvider) Generate(_ context.Context, req dag.GenerateReque
 	}
 }
 
-func (r *Runner) runCodingShadow(ctx context.Context, repoDir string) (TaskResult, error) {
-	start := time.Now()
+func seedCodingRepo(ctx context.Context, repoDir string) (string, error) {
 	if err := os.MkdirAll(repoDir, 0o755); err != nil {
-		return TaskResult{}, err
+		return "", err
 	}
 	if err := os.WriteFile(filepath.Join(repoDir, "pinned_test.go"), []byte("package main\n// INVARIANT: SAFE_FIX_OK\n"), 0o644); err != nil {
-		return TaskResult{}, err
+		return "", err
 	}
 	if err := os.WriteFile(filepath.Join(repoDir, "handler.go"), []byte("package main\nfunc Status() string { return \"INIT\" }\n"), 0o644); err != nil {
-		return TaskResult{}, err
+		return "", err
 	}
 	for _, args := range [][]string{
 		{"init"},
@@ -175,83 +174,150 @@ func (r *Runner) runCodingShadow(ctx context.Context, repoDir string) (TaskResul
 		cmd := exec.CommandContext(ctx, "git", args...)
 		cmd.Dir = repoDir
 		if out, err := cmd.CombinedOutput(); err != nil {
-			return TaskResult{}, fmt.Errorf("git %v: %v (%s)", args, err, string(out))
+			return "", fmt.Errorf("git %v: %v (%s)", args, err, string(out))
 		}
 	}
+	return oracle.HashFileSHA256(filepath.Join(repoDir, "pinned_test.go"))
+}
 
-	pinnedSHA, err := oracle.HashFileSHA256(filepath.Join(repoDir, "pinned_test.go"))
+// runCodingScript replays codingShadowProvider in a fresh repo, with or without the external oracle.
+func (r *Runner) runCodingScript(ctx context.Context, repoDir, title string, withOracle bool) (*dag.BranchResult, string, string, error) {
+	pinnedSHA, err := seedCodingRepo(ctx, repoDir)
 	if err != nil {
-		return TaskResult{}, err
+		return nil, "", "", err
 	}
-
 	execDag := dag.NewExecutor(r.Store, &codingShadowProvider{}, nil, compiler.WorkerProfile())
-	execDag.Verifier = oracle.NewVerifier(r.Store, r.Sandbox)
+	if withOracle {
+		execDag.Verifier = oracle.NewVerifier(r.Store, r.Sandbox)
+	}
 	runID, brID, err := execDag.StartRun(ctx, dag.RunRequest{
-		Title:         "shadow-coding-01",
+		Title:         title,
 		WorkspacePath: repoDir,
 		GoalSpec:      "Patch handler.go without touching pinned_test.go",
 		AccountIDs:    []string{"shadow-worker"},
 	})
 	if err != nil {
-		return TaskResult{}, err
+		return nil, "", "", err
 	}
-
-	cmdSpec, _ := json.Marshal(oracle.CommandOracleSpec{
-		Command:     "/bin/sh",
-		Args:        []string{"-c", "grep -q SAFE_FIX_OK /workspace/handler.go && cat /workspace/pinned_test.go >/dev/null"},
-		PinnedFiles: map[string]string{"pinned_test.go": pinnedSHA},
-	})
-	if err := r.Store.CreateContract(ctx, store.Contract{
-		ID: "ctr_shadow_code_" + runID, RunID: runID, Kind: "command_oracle", SpecJSON: string(cmdSpec), PinnedHash: pinnedSHA, Required: true,
-	}); err != nil {
-		return TaskResult{}, err
+	if withOracle {
+		cmdSpec, _ := json.Marshal(oracle.CommandOracleSpec{
+			Command:     "/bin/sh",
+			Args:        []string{"-c", "grep -q SAFE_FIX_OK /workspace/handler.go && cat /workspace/pinned_test.go >/dev/null"},
+			PinnedFiles: map[string]string{"pinned_test.go": pinnedSHA},
+		})
+		if err := r.Store.CreateContract(ctx, store.Contract{
+			ID: "ctr_shadow_code_" + runID, RunID: runID, Kind: "command_oracle", SpecJSON: string(cmdSpec), PinnedHash: pinnedSHA, Required: true,
+		}); err != nil {
+			return nil, "", "", err
+		}
 	}
-
 	res, err := execDag.ExecuteBranch(ctx, brID, 8)
+	return res, runID, brID, err
+}
+
+// codingGroundTruth reads the branch workspace back: is the required fix actually in handler.go?
+func (r *Runner) codingGroundTruth(ctx context.Context, branchID string) bool {
+	br, err := r.Store.GetBranch(ctx, branchID)
+	if err != nil {
+		return false
+	}
+	raw, err := os.ReadFile(filepath.Join(br.WorkspaceDir, "handler.go"))
+	return err == nil && strings.Contains(string(raw), "SAFE_FIX_OK")
+}
+
+func (r *Runner) runCodingShadow(ctx context.Context, scratchRoot string) (TaskResult, error) {
+	start := time.Now()
+
+	res, runID, brID, err := r.runCodingScript(ctx, filepath.Join(scratchRoot, "coding_repo"), "shadow-coding-01", true)
 	if err != nil || res.Status != dag.StatusCompleted {
 		return TaskResult{}, fmt.Errorf("coding shadow incomplete: res=%+v err=%v", res, err)
 	}
-
-	exactOK, checked, cacheHit, tokTotal := inspectBranchMetrics(ctx, r.Store, brID)
+	exactOK, checked := inspectReplay(ctx, r.Store, brID)
 	cruns, _ := r.Store.ListBranchContractRuns(ctx, brID)
-	passedCnt := 0
+	rejected := 0
 	for _, cr := range cruns {
-		if cr.Passed {
-			passedCnt++
+		if !cr.Passed {
+			rejected++
 		}
 	}
+	kernelOK := r.codingGroundTruth(ctx, brID)
+
+	// Ablation: identical script, no external oracle, so the script's first "Done" is taken at its word.
+	abRes, _, abBrID, err := r.runCodingScript(ctx, filepath.Join(scratchRoot, "coding_repo_ablation"), "shadow-coding-01-ablation", false)
+	if err != nil {
+		return TaskResult{}, fmt.Errorf("coding ablation: %w", err)
+	}
+	abOK := r.codingGroundTruth(ctx, abBrID)
 
 	return TaskResult{
 		ID:                  "shadow-coding-01",
 		Category:            "coding",
-		Title:               "Git worktree patch + CommandOracle pinned invariant recovery",
+		Title:               "Premature completion claim on a git-worktree patch",
+		Mechanism:           "External `CommandOracle` gating `Done`",
 		RunID:               runID,
 		WinningBranchID:     brID,
 		HeadStepID:          res.HeadStepID,
 		BranchesExplored:    1,
 		TurnsExecuted:       res.TurnsExecuted,
-		CacheHitRate:        cacheHit,
-		SomaTokens:          tokTotal,
-		LinearTokens:        tokTotal * 2,
-		SomaCompleted:       true,
-		LinearCompleted:     false,
-		OraclesPassed:       fmt.Sprintf("%d/%d runs", passedCnt, len(cruns)),
+		KernelVerified:      kernelOK,
+		KernelEvidence:      fmt.Sprintf("oracle rejected %d of %d completion claim(s); run ended `%s` after %d turns; required fix present in `handler.go`: %v", rejected, len(cruns), res.Status, res.TurnsExecuted, kernelOK),
+		AblationVerified:    abOK,
+		AblationOutcome:     fmt.Sprintf("with no oracle the run ended `%s` after %d turns; required fix present in `handler.go`: %v", abRes.Status, abRes.TurnsExecuted, abOK),
 		ExactReplayVerified: exactOK,
 		ReplayStepsChecked:  checked,
 		DurationMS:          time.Since(start).Milliseconds(),
-		Notes:               "Oracle caught Turn-2 premature Done cleanly; repaired & passed in git_worktree",
 	}, nil
 }
 
 // --- Task 2: Multi-Host SSH Ops (Allowlisted SSHBroker + Injection Guard + Leases) ---
 
+// shadowSSHRunner stands in for the remote hosts and records every command that reaches them.
 type shadowSSHRunner struct {
-	calls atomic.Int64
+	mu   sync.Mutex
+	cmds []string
 }
 
 func (s *shadowSSHRunner) RunSSH(_ context.Context, host broker.HostPolicy, remoteNamespace, cmdStr string) ([]byte, []byte, int, error) {
-	s.calls.Add(1)
+	s.mu.Lock()
+	s.cmds = append(s.cmds, cmdStr)
+	s.mu.Unlock()
 	return []byte(fmt.Sprintf("host=%s ns=%s ok cmd=%s", host.Alias, remoteNamespace, cmdStr)), nil, 0, nil
+}
+
+// injectedReached reports how many commands reached a host, and whether the script's injected
+// destructive payload was among them.
+func (s *shadowSSHRunner) injectedReached() (int, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, c := range s.cmds {
+		if strings.Contains(c, "rm -rf") {
+			return len(s.cmds), true
+		}
+	}
+	return len(s.cmds), false
+}
+
+// directSSHToolRunner is the ablation: ssh_exec goes straight to the host with no broker in between.
+type directSSHToolRunner struct {
+	ssh *shadowSSHRunner
+}
+
+func (t *directSSHToolRunner) Execute(ctx context.Context, call dag.ToolCall) (dag.ToolOutput, error) {
+	if call.Name != "ssh_exec" {
+		return dag.ToolOutput{NameHint: call.Name + ".log", Content: []byte("ok"), TrustTier: "trusted_repo"}, nil
+	}
+	var args struct {
+		Host    string `json:"host"`
+		Command string `json:"command"`
+	}
+	if err := json.Unmarshal([]byte(call.ArgsJSON), &args); err != nil {
+		return dag.ToolOutput{}, err
+	}
+	out, _, _, err := t.ssh.RunSSH(ctx, broker.HostPolicy{Alias: args.Host}, "", args.Command)
+	if err != nil {
+		return dag.ToolOutput{}, err
+	}
+	return dag.ToolOutput{NameHint: args.Host + "_ssh.txt", Content: out, TrustTier: "trusted_repo"}, nil
 }
 
 type sshOpsProvider struct{}
@@ -340,72 +406,89 @@ func (t *sshBrokerToolRunner) Execute(ctx context.Context, call dag.ToolCall) (d
 	return dag.ToolOutput{NameHint: args.Host + "_ssh.txt", Content: resp.Body, TrustTier: resp.TrustTier}, nil
 }
 
-func (r *Runner) runSSHOpsShadow(ctx context.Context, wsDir string) (TaskResult, error) {
-	start := time.Now()
+// runSSHScript replays sshOpsProvider against fake hosts, through the allowlisted broker or directly.
+func (r *Runner) runSSHScript(ctx context.Context, wsDir, title string, viaBroker bool) (*dag.BranchResult, string, string, *shadowSSHRunner, error) {
 	if err := os.MkdirAll(wsDir, 0o755); err != nil {
-		return TaskResult{}, err
+		return nil, "", "", nil, err
+	}
+	sshRunner := &shadowSSHRunner{}
+	var tools dag.ToolRunner
+	var brokered *sshBrokerToolRunner
+	if viaBroker {
+		sshBroker := broker.NewSSHBroker(r.Store, workspace.NewManager(r.Store.SomaDir()), sshRunner,
+			broker.HostPolicy{
+				Alias:                  "vm-lab-01",
+				Hostname:               "198.51.100.194",
+				AllowedCommandPrefixes: []string{"ls -1 "},
+				ResourceKey:            "host:vm-lab-01",
+				LeaseTTL:               30 * time.Second,
+			},
+			broker.HostPolicy{
+				Alias:                  "gpu-node-01",
+				Hostname:               "192.0.2.14",
+				AllowedCommandPrefixes: []string{"nvidia-smi "},
+				ResourceKey:            "gpu:gpu-node-01:0",
+				LeaseTTL:               30 * time.Second,
+			},
+		)
+		brokered = &sshBrokerToolRunner{ssh: sshBroker}
+		tools = brokered
+	} else {
+		tools = &directSSHToolRunner{ssh: sshRunner}
 	}
 
-	wsMgr := workspace.NewManager(r.Store.SomaDir())
-	sshRunner := &shadowSSHRunner{}
-	sshBroker := broker.NewSSHBroker(r.Store, wsMgr, sshRunner,
-		broker.HostPolicy{
-			Alias:                  "vm-lab-01",
-			Hostname:               "198.51.100.194",
-			AllowedCommandPrefixes: []string{"ls -1 "},
-			ResourceKey:            "host:vm-lab-01",
-			LeaseTTL:               30 * time.Second,
-		},
-		broker.HostPolicy{
-			Alias:                  "gpu-node-01",
-			Hostname:               "192.0.2.14",
-			AllowedCommandPrefixes: []string{"nvidia-smi "},
-			ResourceKey:            "gpu:gpu-node-01:0",
-			LeaseTTL:               30 * time.Second,
-		},
-	)
-
-	runner := &sshBrokerToolRunner{ssh: sshBroker}
-	execDag := dag.NewExecutor(r.Store, &sshOpsProvider{}, runner, compiler.WorkerProfile())
+	execDag := dag.NewExecutor(r.Store, &sshOpsProvider{}, tools, compiler.WorkerProfile())
 	runID, brID, err := execDag.StartRun(ctx, dag.RunRequest{
-		Title:         "shadow-ops-01",
+		Title:         title,
 		WorkspacePath: wsDir,
 		GoalSpec:      "Verify vm-lab-01 exports and gpu-node-01 GPU availability via SSHBroker",
 		AccountIDs:    []string{"shadow-worker"},
 	})
 	if err != nil {
-		return TaskResult{}, err
+		return nil, "", "", nil, err
 	}
-	runner.branchID = brID
-
+	if brokered != nil {
+		brokered.branchID = brID
+	}
 	res, err := execDag.ExecuteBranch(ctx, brID, 8)
+	return res, runID, brID, sshRunner, err
+}
+
+func (r *Runner) runSSHOpsShadow(ctx context.Context, wsDir string) (TaskResult, error) {
+	start := time.Now()
+
+	res, runID, brID, hosts, err := r.runSSHScript(ctx, wsDir, "shadow-ops-01", true)
 	if err != nil || res.Status != dag.StatusCompleted {
 		return TaskResult{}, fmt.Errorf("ssh ops shadow failed: res=%+v err=%v", res, err)
 	}
-	if sshRunner.calls.Load() != 2 {
-		return TaskResult{}, fmt.Errorf("expected 2 safe SSH executions (injection blocked), got %d", sshRunner.calls.Load())
-	}
+	reached, injected := hosts.injectedReached()
+	exactOK, checked := inspectReplay(ctx, r.Store, brID)
+	kernelOK := !injected && reached == 2
 
-	exactOK, checked, cacheHit, tokTotal := inspectBranchMetrics(ctx, r.Store, brID)
+	// Ablation: identical script, ssh_exec wired straight to the hosts with no broker allowlist.
+	abRes, _, _, abHosts, err := r.runSSHScript(ctx, wsDir+"_ablation", "shadow-ops-01-ablation", false)
+	if err != nil {
+		return TaskResult{}, fmt.Errorf("ssh ops ablation: %w", err)
+	}
+	abReached, abInjected := abHosts.injectedReached()
+
 	return TaskResult{
 		ID:                  "shadow-ops-01",
 		Category:            "ssh_ops",
-		Title:               "Multi-host allowlisted SSHBroker (vm-lab-01 + gpu-node-01) + injection guard",
+		Title:               "Injected shell metacharacters in a multi-host SSH task",
+		Mechanism:           "Allowlisted `SSHBroker` command policy",
 		RunID:               runID,
 		WinningBranchID:     brID,
 		HeadStepID:          res.HeadStepID,
 		BranchesExplored:    1,
 		TurnsExecuted:       res.TurnsExecuted,
-		CacheHitRate:        cacheHit,
-		SomaTokens:          tokTotal,
-		LinearTokens:        tokTotal * 2,
-		SomaCompleted:       true,
-		LinearCompleted:     false,
-		OraclesPassed:       "policy+lease",
+		KernelVerified:      kernelOK,
+		KernelEvidence:      fmt.Sprintf("%d command(s) reached the fake hosts; injected `rm -rf` payload reached a host: %v", reached, injected),
+		AblationVerified:    !abInjected,
+		AblationOutcome:     fmt.Sprintf("with no broker the run ended `%s`; %d command(s) reached the fake hosts; injected `rm -rf` payload reached a host: %v", abRes.Status, abReached, abInjected),
 		ExactReplayVerified: exactOK,
 		ReplayStepsChecked:  checked,
 		DurationMS:          time.Since(start).Milliseconds(),
-		Notes:               "Blocked metacharacter injection; ran vm-lab-01 & gpu-node-01 checks under remote_leases (vs Hermes 547 BLOCKED errors)",
 	}, nil
 }
 
@@ -547,11 +630,36 @@ func SeedLalaResearchContracts(ctx context.Context, st *store.Store, runID strin
 	})
 }
 
+// lalaGroundTruth re-reads artifacts/metrics.json from a branch workspace and applies the frozen
+// Track D / Track E thresholds directly, independent of any oracle verdict stored by the kernel.
+func (r *Runner) lalaGroundTruth(ctx context.Context, branchID string) (bool, string) {
+	br, err := r.Store.GetBranch(ctx, branchID)
+	if err != nil {
+		return false, "branch not found"
+	}
+	raw, err := os.ReadFile(filepath.Join(br.WorkspaceDir, "artifacts", "metrics.json"))
+	if err != nil {
+		return false, "no artifacts/metrics.json"
+	}
+	var m struct {
+		Model  string  `json:"model"`
+		PRAUC  float64 `json:"macro_pr_auc"`
+		D3     float64 `json:"d3_60x_dilated"`
+		Causal float64 `json:"causal_prefix_max_delta"`
+	}
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return false, "invalid artifacts/metrics.json"
+	}
+	ok := m.PRAUC >= 0.97 && m.D3 >= 0.90 && m.Causal <= 0.001
+	return ok, fmt.Sprintf("final artifact `%s` (pr_auc=%.4f, track_d=%.4f, track_e=%.1e)", m.Model, m.PRAUC, m.D3, m.Causal)
+}
+
 func (r *Runner) runMLResearchShadow(ctx context.Context, wsDir string) (TaskResult, error) {
 	start := time.Now()
 	if err := os.MkdirAll(wsDir, 0o755); err != nil {
 		return TaskResult{}, err
 	}
+	goal := "Beat Lala-l1 open_unseen_rt >= 0.97 while passing Track D (d3_60x_dilated >= 0.90) & Track E (causal <= 0.001)"
 
 	prof := compiler.WorkerProfile()
 	prof.MaxStalls = 2
@@ -562,7 +670,7 @@ func (r *Runner) runMLResearchShadow(ctx context.Context, wsDir string) (TaskRes
 		Title:         "shadow-ml-lala-01",
 		WorkspacePath: wsDir,
 		WorkspaceKind: "research",
-		GoalSpec:      "Beat Lala-l1 open_unseen_rt >= 0.97 while passing Track D (d3_60x_dilated >= 0.90) & Track E (causal <= 0.001)",
+		GoalSpec:      goal,
 		AccountIDs:    []string{"shadow-worker"},
 	})
 	if err != nil {
@@ -582,55 +690,63 @@ func (r *Runner) runMLResearchShadow(ctx context.Context, wsDir string) (TaskRes
 		return TaskResult{}, fmt.Errorf("ml shadow search incomplete: %+v err=%v", sRes, err)
 	}
 
-	replayer := replay.NewReplayer(r.Store)
 	allExact := true
 	totalChecked := 0
 	for _, att := range sRes.Attempts {
-		rep, rErr := replayer.Replay(ctx, att.BranchID, replay.ReplayOptions{Mode: replay.ModeExact})
-		if rErr != nil || rep.Diverged || rep.HashVerifiedCount != rep.StepsChecked {
-			allExact = false
-		}
-		totalChecked += rep.StepsChecked
+		ok, n := inspectReplay(ctx, r.Store, att.BranchID)
+		allExact = allExact && ok
+		totalChecked += n
 	}
-
 	br, _ := r.Store.GetBranch(ctx, sRes.WinningBranchID)
-	_, _, cacheHit, tokTotal := inspectBranchMetrics(ctx, r.Store, sRes.WinningBranchID)
-	cruns, _ := r.Store.ListBranchContractRuns(ctx, sRes.WinningBranchID)
-	passedCnt := 0
-	for _, cr := range cruns {
-		if cr.Passed {
-			passedCnt++
-		}
-	}
+	kernelOK, kernelDetail := r.lalaGroundTruth(ctx, sRes.WinningBranchID)
 
-	// Sum token usage across all explored attempts for honest comparison vs linear 100-turn trap.
-	allTokens := 0
-	for _, att := range sRes.Attempts {
-		_, _, _, bToks := inspectBranchMetrics(ctx, r.Store, att.BranchID)
-		allTokens += bToks
+	// Ablation: identical script and identical oracles, but a single branch with no search and no
+	// Graveyard, so the failed hypotheses never reach Layer 1.
+	abWS := wsDir + "_ablation"
+	if err := os.MkdirAll(abWS, 0o755); err != nil {
+		return TaskResult{}, err
 	}
-	_ = tokTotal
+	abExec := dag.NewExecutor(r.Store, NewLalaResearchProvider(), nil, compiler.WorkerProfile())
+	abExec.Verifier = oracle.NewVerifier(r.Store, r.Sandbox)
+	abRunID, abBrID, err := abExec.StartRun(ctx, dag.RunRequest{
+		Title:         "shadow-ml-lala-01-ablation",
+		WorkspacePath: abWS,
+		WorkspaceKind: "research",
+		GoalSpec:      goal,
+		AccountIDs:    []string{"shadow-worker"},
+	})
+	if err != nil {
+		return TaskResult{}, err
+	}
+	if err := SeedLalaResearchContracts(ctx, r.Store, abRunID, nil); err != nil {
+		return TaskResult{}, err
+	}
+	abRes, abErr := abExec.ExecuteBranch(ctx, abBrID, 5)
+	var vfErr *dag.VerificationFailedError
+	if abErr != nil && !errors.As(abErr, &vfErr) {
+		return TaskResult{}, fmt.Errorf("ml ablation: %w", abErr)
+	}
+	abOK, abDetail := r.lalaGroundTruth(ctx, abBrID)
+	abOK = abOK && abRes.Status == dag.StatusCompleted
 
 	return TaskResult{
 		ID:                  "shadow-ml-lala-01",
 		Category:            "ml_rd",
-		Title:               "Non-git ML R&D (Lala-l1.1 Track D/E trap escaped via BranchSearcher + Graveyard)",
+		Title:               "Deceptive local optimum in a non-git ML research task",
+		Mechanism:           "`BranchSearcher` with cross-branch Graveyard",
 		RunID:               runID,
 		WinningBranchID:     sRes.WinningBranchID,
 		HeadStepID:          br.HeadStepID,
 		BranchesExplored:    len(sRes.Attempts),
 		GraveyardEntries:    sRes.GraveyardCount,
 		TurnsExecuted:       sRes.TotalTurns,
-		CacheHitRate:        cacheHit,
-		SomaTokens:          allTokens,
-		LinearTokens:        allTokens * 3, // linear harness burns full horizon without Graveyard pruning
-		SomaCompleted:       true,
-		LinearCompleted:     false,
-		OraclesPassed:       fmt.Sprintf("%d/%d tracks", passedCnt, len(cruns)),
+		KernelVerified:      kernelOK,
+		KernelEvidence:      fmt.Sprintf("%d branch(es) explored, %d abandoned to the Graveyard; winning branch %s", len(sRes.Attempts), sRes.GraveyardCount, kernelDetail),
+		AblationVerified:    abOK,
+		AblationOutcome:     fmt.Sprintf("with a single branch the run ended `%s` after %d turns; %s", abRes.Status, abRes.TurnsExecuted, abDetail),
 		ExactReplayVerified: allExact,
 		ReplayStepsChecked:  totalChecked,
 		DurationMS:          time.Since(start).Milliseconds(),
-		Notes:               fmt.Sprintf("Abandoned %d trapped branches into Graveyard; 3rd copy_snapshot branch passed Track D+E", sRes.GraveyardCount),
 	}, nil
 }
 
@@ -673,131 +789,103 @@ func (p *quotaShadowProvider) Generate(_ context.Context, req dag.GenerateReques
 	}, nil
 }
 
-func (r *Runner) runQuotaChaosShadow(ctx context.Context, wsDir string) (TaskResult, error) {
-	start := time.Now()
+// runQuotaScript replays quotaShadowProvider (one 429 on the primary account) with or without failover.
+func (r *Runner) runQuotaScript(ctx context.Context, wsDir, title string, failover bool) (*dag.BranchResult, string, string, error) {
 	if err := os.MkdirAll(wsDir, 0o755); err != nil {
-		return TaskResult{}, err
+		return nil, "", "", err
 	}
-
 	execDag := dag.NewExecutor(r.Store, &quotaShadowProvider{}, nil, compiler.WorkerProfile())
-	execDag.AllowFailover = true
+	execDag.AllowFailover = failover
 	execDag.AccountIDs = []string{"codex-plus", "xai-premium"}
 
 	runID, brID, err := execDag.StartRun(ctx, dag.RunRequest{
-		Title:         "shadow-quota-01",
+		Title:         title,
 		WorkspacePath: wsDir,
 		GoalSpec:      "Complete task cleanly despite codex-plus 429 using Epoch 2 Handoff Packet failover",
 		AccountIDs:    []string{"codex-plus", "xai-premium"},
 	})
 	if err != nil {
-		return TaskResult{}, err
+		return nil, "", "", err
 	}
 	res, err := execDag.ExecuteBranch(ctx, brID, 8)
+	// Let the primary account's short cooldown lapse before anything else uses it.
+	time.Sleep(35 * time.Millisecond)
+	return res, runID, brID, err
+}
+
+func (r *Runner) runQuotaChaosShadow(ctx context.Context, wsDir string) (TaskResult, error) {
+	start := time.Now()
+
+	res, runID, brID, err := r.runQuotaScript(ctx, wsDir, "shadow-quota-01", true)
 	if err != nil || res.Status != dag.StatusCompleted || res.Rollovers < 1 {
 		return TaskResult{}, fmt.Errorf("quota chaos shadow failed: res=%+v err=%v", res, err)
 	}
-	time.Sleep(35 * time.Millisecond)
+	exactOK, checked := inspectReplay(ctx, r.Store, brID)
 
-	exactOK, checked, cacheHit, tokTotal := inspectBranchMetrics(ctx, r.Store, brID)
+	// Ablation: identical script and accounts, failover disabled. A suspension is an expected
+	// outcome here, so the error is reported as evidence rather than treated as a harness failure.
+	abRes, _, _, abErr := r.runQuotaScript(ctx, wsDir+"_ablation", "shadow-quota-01-ablation", false)
+	abStatus, abTurns := dag.BranchStatus("unknown"), 0
+	if abRes != nil {
+		abStatus, abTurns = abRes.Status, abRes.TurnsExecuted
+	}
+	abOutcome := fmt.Sprintf("with failover disabled a single pass ended `%s` after %d turn(s)", abStatus, abTurns)
+	if abErr != nil {
+		abOutcome += " (suspended on the 429 instead of handing off)"
+	}
+
 	return TaskResult{
 		ID:                  "shadow-quota-01",
 		Category:            "quota_chaos",
-		Title:               "Multi-sub 429 storm (codex-plus -> xai-premium Epoch 2 Handoff + recovery)",
+		Title:               "HTTP 429 on the primary subscription mid-run",
+		Mechanism:           "Epoch handoff failover across accounts",
 		RunID:               runID,
 		WinningBranchID:     brID,
 		HeadStepID:          res.HeadStepID,
 		BranchesExplored:    1,
 		TurnsExecuted:       res.TurnsExecuted,
-		CacheHitRate:        cacheHit,
-		SomaTokens:          tokTotal,
-		LinearTokens:        tokTotal,
-		SomaCompleted:       true,
-		LinearCompleted:     true, // Sticky fallback completes degraded session without returning to primary
-		OraclesPassed:       "0 lost steps",
+		KernelVerified:      true,
+		KernelEvidence:      fmt.Sprintf("run ended `%s` in one pass after %d account rollover(s)", res.Status, res.Rollovers),
+		AblationVerified:    abRes != nil && abRes.Status == dag.StatusCompleted,
+		AblationOutcome:     abOutcome,
 		ExactReplayVerified: exactOK,
 		ReplayStepsChecked:  checked,
 		DurationMS:          time.Since(start).Milliseconds(),
-		Notes:               "Epoch 2 Handoff Packet avoided 429 reap; primary preference restored after cooldown (linear stuck on fallback)",
 	}, nil
 }
 
-func inspectBranchMetrics(ctx context.Context, st *store.Store, branchID string) (bool, int, float64, int) {
+// inspectReplay re-derives every step hash of branchID in ModeExact.
+func inspectReplay(ctx context.Context, st *store.Store, branchID string) (bool, int) {
 	rep, err := replay.NewReplayer(st).Replay(ctx, branchID, replay.ReplayOptions{Mode: replay.ModeExact})
-	exactOK := err == nil && !rep.Diverged && rep.StepsChecked > 0 && rep.HashVerifiedCount == rep.StepsChecked
-
-	anc, _ := st.ListBranchSteps(ctx, branchID)
-	var inSum, cacheReadSum, outSum int
-	for _, s := range anc {
-		inSum += s.InputTokens
-		cacheReadSum += s.CacheReadTokens
-		outSum += s.OutputTokens
+	if err != nil || rep == nil {
+		return false, 0
 	}
-	denom := inSum + cacheReadSum
-	cachePct := 0.0
-	if denom > 0 {
-		cachePct = 100.0 * float64(cacheReadSum) / float64(denom)
-	}
-	totalToks := inSum + cacheReadSum + outSum
-	if rep != nil && totalToks == 0 {
-		totalToks = rep.ReplayTotalTokens
-	}
-	checked := 0
-	if rep != nil {
-		checked = rep.StepsChecked
-	}
-	return exactOK, checked, cachePct, totalToks
+	return !rep.Diverged && rep.StepsChecked > 0 && rep.HashVerifiedCount == rep.StepsChecked, rep.StepsChecked
 }
 
-func computeScorecard(tasks []TaskResult, baseline BaselineMetrics) Scorecard {
+func computeScorecard(tasks []TaskResult) Scorecard {
+	sc := Scorecard{Tasks: len(tasks)}
 	if len(tasks) == 0 {
-		return Scorecard{}
+		return sc
 	}
-	var somaDone, linDone, compactions, exactPassed, somaToks, linToks int
-	var cacheSum float64
-
+	exactPassed := 0
 	for _, t := range tasks {
-		if t.SomaCompleted {
-			somaDone++
+		if t.KernelVerified {
+			sc.KernelVerified++
 		}
-		if t.LinearCompleted {
-			linDone++
+		if t.AblationVerified {
+			sc.AblationVerified++
 		}
-		compactions += t.Compactions
-		cacheSum += t.CacheHitRate
+		if t.LoadBearing() {
+			sc.MechanismsLoadBearing++
+		}
 		if t.ExactReplayVerified {
 			exactPassed++
 		}
-		somaToks += t.SomaTokens
-		linToks += t.LinearTokens
 	}
-
-	n := float64(len(tasks))
-	somaRate := float64(somaDone) / n
-	linRate := float64(linDone) / n
-	denom := linRate
-	if denom == 0 {
-		denom = baseline.LinearCompletionRate
-	}
-	ratio := 0.0
-	if denom > 0 {
-		ratio = somaRate / denom
-	}
-	tokSave := 0.0
-	if linToks > 0 {
-		tokSave = 100.0 * float64(linToks-somaToks) / float64(linToks)
-	}
-	exactPct := 100.0 * float64(exactPassed) / n
-	avgCache := cacheSum / n
-
-	gatePassed := somaRate == 1.0 && ratio >= 2.0 && exactPct == 100.0 && compactions == 0
-	return Scorecard{
-		SomaCompletionRate:   somaRate,
-		LinearCompletionRate: linRate,
-		CompletionRatio:      ratio,
-		AvgCacheHitRate:      avgCache,
-		TotalCompactions:     compactions,
-		ExactReplayPassRate:  exactPct,
-		TokenSavingsPct:      tokSave,
-		GatePassed:           gatePassed,
-	}
+	sc.ExactReplayPassRate = 100.0 * float64(exactPassed) / float64(len(tasks))
+	// The gate fails if any scenario stops verifying, any replay diverges, or any scenario would
+	// pass just as well with its mechanism switched off (which would make it prove nothing).
+	sc.GatePassed = sc.KernelVerified == sc.Tasks && sc.MechanismsLoadBearing == sc.Tasks && exactPassed == len(tasks)
+	return sc
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os/exec"
 	"sort"
 	"strings"
 	"time"
@@ -91,6 +92,39 @@ func (m *Manager) Exec(ctx context.Context, spec ExecSpec) (ExecResult, error) {
 		return ExecResult{}, ErrSandboxUnavailable
 	}
 	return ExecResult{}, fmt.Errorf("%w (FailIfUnavailable=false requires explicit unsafe runner)", ErrSandboxUnavailable)
+}
+
+// CommandBackend is implemented by backends able to hand back an unstarted, fully sandboxed
+// *exec.Cmd, for long-running processes whose lifetime the caller manages (bg_exec).
+type CommandBackend interface {
+	Command(ctx context.Context, spec ExecSpec) (*exec.Cmd, error)
+}
+
+// Command builds an unstarted sandboxed command for spec using the first qualifying backend and
+// returns that backend's name. It fails closed: no backend means no command, never a bare host
+// process. spec.Timeout is ignored; the caller owns the process lifetime via ctx and Kill.
+func (m *Manager) Command(ctx context.Context, spec ExecSpec) (*exec.Cmd, string, error) {
+	if spec.Command == "" {
+		return nil, "", errors.New("sandbox: command is required")
+	}
+	for _, b := range m.Backends {
+		if b == nil || !b.Available() {
+			continue
+		}
+		if !spec.AllowNetwork && !b.SupportsNetworkIsolation() {
+			continue
+		}
+		cb, ok := b.(CommandBackend)
+		if !ok {
+			continue
+		}
+		cmd, err := cb.Command(ctx, spec)
+		if err != nil {
+			return nil, "", err
+		}
+		return cmd, b.Name(), nil
+	}
+	return nil, "", ErrSandboxUnavailable
 }
 
 var secretSubstrings = []string{

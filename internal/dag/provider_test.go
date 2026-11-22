@@ -185,7 +185,7 @@ func TestLocalToolRunner_FSListExecAndAtPagePrefix(t *testing.T) {
 		t.Fatalf("Observe failed: %+v err=%v", obs, err)
 	}
 
-	runner := dag.NewLocalToolRunner(vm)
+	runner := dag.NewUnsandboxedToolRunner(vm)
 
 	listOut, err := runner.Execute(ctx, dag.ToolCall{
 		Name:         "fs_list",
@@ -474,7 +474,7 @@ func TestFSPatchBgProcsAndWebMultimodalTools(t *testing.T) {
 	_ = st.CreateRun(ctx, store.Run{ID: "run_tools", Title: "tools", WorkspacePath: ws, GoalSpec: "test tools"})
 
 	vm := vmem.NewManager(st)
-	runner := dag.NewLocalToolRunner(vm)
+	runner := dag.NewUnsandboxedToolRunner(vm)
 
 	// 1. Multi-hunk fs_patch with fuzzy indentation tolerance + unified diff + atomic rollback.
 	initialPy := "def alpha():\n    x = 1\n    return x\n\ndef beta():\n    y = 2\n    return y\n"
