@@ -31,6 +31,7 @@ const (
 	StatusSuspendedReconcile BranchStatus = "suspended_reconcile"
 	StatusSuspendedIO        BranchStatus = "suspended_io"
 	StatusVerifying          BranchStatus = "verifying"
+	StatusStalled            BranchStatus = "stalled"
 	StatusCompleted          BranchStatus = "completed"
 	StatusFailed             BranchStatus = "failed"
 	StatusAbandoned          BranchStatus = "abandoned"
@@ -135,6 +136,20 @@ func (e *VerificationFailedError) Error() string {
 	return fmt.Sprintf("verification failed on branch %s: %s", e.BranchID, e.Counterexample)
 }
 
+// StallBreakerError indicates a branch made zero progress for MaxStalls consecutive turns.
+type StallBreakerError struct {
+	BranchID      string
+	HeadStepID    string
+	StallCount    int
+	MaxStalls     int
+	LastStateHash string
+}
+
+func (e *StallBreakerError) Error() string {
+	return fmt.Sprintf("stall breaker tripped on branch %s (%d/%d consecutive unchanged state hashes: %s)",
+		e.BranchID, e.StallCount, e.MaxStalls, e.LastStateHash)
+}
+
 // RunRequest configures a new Run and its root Branch.
 type RunRequest struct {
 	RunID         string
@@ -181,9 +196,10 @@ type Executor struct {
 	Verifier          ContractVerifier
 	Profile           compiler.ModelProfile
 	SystemPrompt      string
-	AccountIDs        []string
-	AllowFailover     bool
-	AfterDispatchHook func(ctx context.Context, entry store.ActionJournalEntry) error
+	AccountIDs          []string
+	AllowFailover       bool
+	EnforceStallBreaker bool
+	AfterDispatchHook   func(ctx context.Context, entry store.ActionJournalEntry) error
 	seq               atomic.Uint64
 }
 
@@ -368,7 +384,7 @@ func (e *Executor) ReconcileAction(ctx context.Context, actionID string, outcome
 		return err
 	}
 
-	snap, snapID, l2, nextTurn, err := e.loadOrInitEpochState(ctx, run, branch)
+	snap, snapID, l2, _, nextTurn, err := e.loadOrInitEpochState(ctx, run, branch)
 	if err != nil {
 		return err
 	}
@@ -506,20 +522,21 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 	}
 	_ = e.Store.UpdateRunStatus(ctx, run.ID, string(StatusRunning))
 
-	snap, snapID, l2, nextTurn, err := e.loadOrInitEpochState(ctx, run, branch)
+	snap, snapID, l2, pendingDeltaAppends, nextTurn, err := e.loadOrInitEpochState(ctx, run, branch)
 	if err != nil {
 		return nil, err
 	}
-	pendingDeltaAppends, err := e.initialPendingDeltaAppends(ctx, branch, snapID)
-	if err != nil {
-		return nil, err
-	}
+	forkRolled := snap.Epoch > branch.Epoch
+	branch.Epoch = snap.Epoch
 
 	res := &BranchResult{
 		RunID:      run.ID,
 		BranchID:   branch.ID,
 		HeadStepID: branch.HeadStepID,
 		Status:     BranchStatus(branch.Status),
+	}
+	if forkRolled {
+		res.Rollovers++
 	}
 
 	// Phase 0: Crash recovery of unfinished action_journal entries before taking any new LLM turns.
@@ -972,6 +989,18 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 		res.HeadStepID = sid
 		res.Status = StatusRunning
 		res.TurnsExecuted++
+
+		if e.EnforceStallBreaker && e.Profile.MaxStalls > 0 && branch.StallCount >= e.Profile.MaxStalls {
+			_ = e.Store.UpdateBranchStatus(ctx, branch.ID, string(StatusStalled), acc.ID, branch.StallCount)
+			res.Status = StatusStalled
+			return res, &StallBreakerError{
+				BranchID:      branch.ID,
+				HeadStepID:    sid,
+				StallCount:    branch.StallCount,
+				MaxStalls:     e.Profile.MaxStalls,
+				LastStateHash: lastStateHash,
+			}
+		}
 	}
 
 	if lastOracleError != "" {
@@ -1213,39 +1242,39 @@ func (e *Executor) commitRecoveredAction(
 	return []compiler.LogEntry{logEntry}, nil
 }
 
-func (e *Executor) loadOrInitEpochState(ctx context.Context, run store.Run, branch store.Branch) (compiler.EpochSnapshot, string, []compiler.LogEntry, int, error) {
+func (e *Executor) loadOrInitEpochState(ctx context.Context, run store.Run, branch store.Branch) (compiler.EpochSnapshot, string, []compiler.LogEntry, []compiler.LogEntry, int, error) {
 	if branch.HeadStepID == "" {
 		activeMem, graveyard, err := e.loadMemoryAndGraveyard(ctx, run.ID)
 		if err != nil {
-			return compiler.EpochSnapshot{}, "", nil, 1, err
+			return compiler.EpochSnapshot{}, "", nil, nil, 1, err
 		}
 		snap := compiler.NewEpochSnapshot(branch.Epoch, e.buildEpochInput(run, activeMem, graveyard))
 		snapID, err := e.persistEpochSnapshot(ctx, run.ID, branch.ID, snap)
 		if err != nil {
-			return compiler.EpochSnapshot{}, "", nil, 1, err
+			return compiler.EpochSnapshot{}, "", nil, nil, 1, err
 		}
-		return snap, snapID, nil, 1, nil
+		return snap, snapID, nil, nil, 1, nil
 	}
 
 	headStep, err := e.Store.GetStep(ctx, branch.HeadStepID)
 	if err != nil {
-		return compiler.EpochSnapshot{}, "", nil, 1, err
+		return compiler.EpochSnapshot{}, "", nil, nil, 1, err
 	}
 	ancestry, err := e.Store.GetAncestry(ctx, branch.HeadStepID)
 	if err != nil {
-		return compiler.EpochSnapshot{}, "", nil, 1, err
+		return compiler.EpochSnapshot{}, "", nil, nil, 1, err
 	}
 	snapRow, err := e.Store.GetEpochSnapshot(ctx, headStep.EpochSnapshotID)
 	if err != nil {
-		return compiler.EpochSnapshot{}, "", nil, 1, err
+		return compiler.EpochSnapshot{}, "", nil, nil, 1, err
 	}
 	l0Bytes, err := e.Store.Blobs().Get(snapRow.Layer0BlobHash)
 	if err != nil {
-		return compiler.EpochSnapshot{}, "", nil, 1, err
+		return compiler.EpochSnapshot{}, "", nil, nil, 1, err
 	}
 	l1Bytes, err := e.Store.Blobs().Get(snapRow.Layer1BlobHash)
 	if err != nil {
-		return compiler.EpochSnapshot{}, "", nil, 1, err
+		return compiler.EpochSnapshot{}, "", nil, nil, 1, err
 	}
 	snap := compiler.EpochSnapshot{
 		Epoch:          snapRow.Epoch,
@@ -1263,47 +1292,45 @@ func (e *Executor) loadOrInitEpochState(ctx context.Context, run store.Run, bran
 		}
 		dBytes, err := e.Store.Blobs().Get(s.FrameDeltaBlobHash)
 		if err != nil {
-			return compiler.EpochSnapshot{}, "", nil, 1, err
+			return compiler.EpochSnapshot{}, "", nil, nil, 1, err
 		}
 		var delta compiler.FrameDelta
 		if err := json.Unmarshal(dBytes, &delta); err != nil {
-			return compiler.EpochSnapshot{}, "", nil, 1, err
+			return compiler.EpochSnapshot{}, "", nil, nil, 1, err
 		}
 		l2 = append(l2, delta.AppendedL2...)
 	}
 
 	// Include the last step's emitted entries so the next turn sees the latest observation.
+	var lastEmitted []compiler.LogEntry
 	emBytes, err := e.Store.Blobs().Get(headStep.EmittedBlobHash)
 	if err == nil {
 		var ep EmittedPayload
 		if json.Unmarshal(emBytes, &ep) == nil {
-			l2 = append(l2, ep.ResultingLogEntries...)
+			lastEmitted = ep.ResultingLogEntries
+			l2 = append(l2, lastEmitted...)
 		}
 	}
 
-	return snap, snapRow.ID, l2, headStep.TurnIndex + 1, nil
-}
+	// On a freshly forked branch, roll over cleanly into Epoch N+1 if active memory or Graveyard changed.
+	if branch.ForkedFromStepID != "" && branch.HeadStepID == branch.ForkedFromStepID {
+		activeMem, graveyard, memErr := e.loadMemoryAndGraveyard(ctx, run.ID)
+		if memErr != nil {
+			return compiler.EpochSnapshot{}, "", nil, nil, 1, memErr
+		}
+		baseIn := e.buildEpochInput(run, activeMem, graveyard)
+		probe := compiler.NewEpochSnapshot(snap.Epoch, baseIn)
+		if probe.PrefixHashL0L1 != snapRow.PrefixHashL0L1 {
+			nextSnap, skeleton := compiler.Rollover(snap, l2, activeMem, graveyard, baseIn)
+			nextSnapID, saveErr := e.persistEpochSnapshot(ctx, run.ID, branch.ID, nextSnap)
+			if saveErr != nil {
+				return compiler.EpochSnapshot{}, "", nil, nil, 1, saveErr
+			}
+			return nextSnap, nextSnapID, skeleton, skeleton, headStep.TurnIndex + 1, nil
+		}
+	}
 
-func (e *Executor) initialPendingDeltaAppends(ctx context.Context, branch store.Branch, snapID string) ([]compiler.LogEntry, error) {
-	if branch.HeadStepID == "" {
-		return nil, nil
-	}
-	headStep, err := e.Store.GetStep(ctx, branch.HeadStepID)
-	if err != nil {
-		return nil, err
-	}
-	if headStep.EpochSnapshotID != snapID {
-		return nil, nil
-	}
-	emBytes, err := e.Store.Blobs().Get(headStep.EmittedBlobHash)
-	if err != nil {
-		return nil, err
-	}
-	var ep EmittedPayload
-	if err := json.Unmarshal(emBytes, &ep); err != nil {
-		return nil, err
-	}
-	return ep.ResultingLogEntries, nil
+	return snap, snapRow.ID, l2, lastEmitted, headStep.TurnIndex + 1, nil
 }
 
 func (e *Executor) persistEpochSnapshot(ctx context.Context, runID, branchID string, snap compiler.EpochSnapshot) (string, error) {

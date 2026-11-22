@@ -68,7 +68,7 @@ func (s styleset) statusBadge(status string) string {
 	switch up {
 	case "COMPLETED", "CLEAN", "VERIFIED", "ACTIVE", "DONE", "READY", "APPROVED":
 		return s.badgeOK.Render("[" + up + "]")
-	case "SUSPENDED_QUOTA", "SUSPENDED_APPROVAL", "SUSPENDED_RECONCILE", "PROPOSED", "WARN", "PENDING", "COALESCED":
+	case "SUSPENDED_QUOTA", "SUSPENDED_APPROVAL", "SUSPENDED_RECONCILE", "PROPOSED", "WARN", "PENDING", "COALESCED", "STALLED":
 		return s.badgeWarn.Render("[" + up + "]")
 	case "FAILED", "ABANDONED", "BLOCKED", "SUPERSEDED", "ARCHIVED":
 		return s.badgeErr.Render("[" + up + "]")

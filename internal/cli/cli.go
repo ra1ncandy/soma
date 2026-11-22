@@ -21,7 +21,7 @@ import (
 	"github.com/ra1ncandy/soma/internal/store"
 )
 
-const Version = "v0.3.0 (RFC-0001 v2.1 TUI, Tier-0 Daemon, Bridges & Quotas)"
+const Version = "v0.4.0 (RFC-0001 v2.1 Complete — Shadow Gauntlet & Branching Search)"
 
 type projectConfig struct {
 	Version       int    `yaml:"version"`
@@ -58,6 +58,8 @@ func NewRootCmd() *cobra.Command {
 		newAccountCmd(),
 		newInboxCmd(),
 		newConsolidateCmd(),
+		newShadowCmd(),
+		newSearchCmd(),
 	)
 	return root
 }

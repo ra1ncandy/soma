@@ -1,4 +1,4 @@
-.PHONY: build test bench vet clean
+.PHONY: build test bench vet shadow clean
 
 BINARY := bin/soma
 BRIDGE_BINARY := bin/soma-bridge-discord
@@ -15,6 +15,9 @@ bench:
 
 vet:
 	go vet ./...
+
+shadow: build
+	TMP=$$(mktemp -d) && trap 'rm -rf "$$TMP"' EXIT && ./$(BINARY) shadow run --dir "$$TMP" --out-md docs/benchmarks/BENCHMARK_REPORT.md
 
 clean:
 	rm -rf bin/ coverage.out
