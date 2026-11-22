@@ -227,3 +227,19 @@ CREATE INDEX IF NOT EXISTS idx_declass_page_cap ON declassifications(page_id, ca
 CREATE INDEX IF NOT EXISTS idx_memory_active ON memory_nodes(scope, status, valid_to);
 CREATE INDEX IF NOT EXISTS idx_trigger_expires ON trigger_runs(expires_at);
 CREATE INDEX IF NOT EXISTS idx_inbox_pending ON inbox_items(status, created_at);
+
+-- 12. Matryoshka Int8 Vector Index (Memory Nodes & @page Chunks)
+CREATE TABLE IF NOT EXISTS embeddings (
+    kind TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    chunk_index INTEGER NOT NULL DEFAULT 0,
+    start_line INTEGER NOT NULL DEFAULT 0,
+    end_line INTEGER NOT NULL DEFAULT 0,
+    model_id TEXT NOT NULL DEFAULT '',
+    dims INTEGER NOT NULL,
+    vec_int8 BLOB NOT NULL,
+    snippet TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (kind, target_id, chunk_index)
+);
+CREATE INDEX IF NOT EXISTS idx_embeddings_kind_target ON embeddings(kind, target_id);

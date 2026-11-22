@@ -11,11 +11,37 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/ra1ncandy/soma/internal/dag"
+	"github.com/ra1ncandy/soma/internal/embed"
 	"github.com/ra1ncandy/soma/internal/oracle"
 	"github.com/ra1ncandy/soma/internal/sandbox"
 	"github.com/ra1ncandy/soma/internal/shadow"
 	"github.com/ra1ncandy/soma/internal/vmem"
 )
+
+func configureEmbedderFromEnv(exec *dag.Executor) {
+	if exec == nil {
+		return
+	}
+	model := strings.TrimSpace(os.Getenv("SOMA_EMBED_MODEL"))
+	baseURL := strings.TrimSpace(os.Getenv("SOMA_EMBED_URL"))
+	if model == "" && baseURL == "" {
+		return
+	}
+	if baseURL == "" {
+		baseURL = strings.TrimSpace(os.Getenv("SOMA_API_BASE"))
+		if baseURL == "" {
+			baseURL = "http://127.0.0.1:11434/v1"
+		}
+	}
+	if model == "" {
+		model = "qwen3-embedding:0.6b"
+	}
+	apiKey := strings.TrimSpace(os.Getenv("SOMA_EMBED_KEY"))
+	if apiKey == "" {
+		apiKey = strings.TrimSpace(os.Getenv("SOMA_API_KEY"))
+	}
+	exec.SetEmbedder(embed.NewOpenAICompatEmbedder(baseURL, apiKey, model, embed.DefaultMatryoshkaDims))
+}
 
 func newShadowCmd() *cobra.Command {
 	shCmd := &cobra.Command{
@@ -151,8 +177,11 @@ func newSearchCmd() *cobra.Command {
 			}
 
 			sbx := sandbox.NewManager()
-			tools := dag.NewSandboxedToolRunner(vmem.NewManager(st), sbx)
+			vm := vmem.NewManager(st)
+			tools := dag.NewSandboxedToolRunner(vm, sbx)
 			exec := dag.NewExecutor(st, prov, tools, prof)
+			exec.VM = vm
+			configureEmbedderFromEnv(exec)
 			exec.AccountIDs = []string{accID}
 			exec.Verifier = oracle.NewVerifier(st, sbx)
 			searcher := dag.NewBranchSearcher(exec)

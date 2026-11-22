@@ -174,6 +174,21 @@ func canonicalOpenAITools() []map[string]any {
 		{
 			"type": "function",
 			"function": map[string]any{
+				"name":        "memory_search",
+				"description": "Search scoped bi-temporal memory rules, facts, and preferences using Hybrid BM25 + Matryoshka int8 Vector RRF.",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"query": map[string]any{"type": "string", "description": "Natural language or keyword search query"},
+						"scope": map[string]any{"type": "string", "description": "Optional memory scope filter (e.g. 'global')"},
+					},
+					"required": []string{"query"},
+				},
+			},
+		},
+		{
+			"type": "function",
+			"function": map[string]any{
 				"name":        "page_grep",
 				"description": "Search a spilled @page virtual memory handle using a regex or substring pattern.",
 				"parameters": map[string]any{
@@ -183,6 +198,21 @@ func canonicalOpenAITools() []map[string]any {
 						"pattern": map[string]any{"type": "string", "description": "Regex pattern to match lines"},
 					},
 					"required": []string{"page_id", "pattern"},
+				},
+			},
+		},
+		{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "page_search",
+				"description": "Hybrid BM25 + Matryoshka int8 Vector RRF search across 40-line chunks of spilled @page virtual memory handles.",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"page_id": map[string]any{"type": "string", "description": "Optional specific page handle ID to search within"},
+						"query":   map[string]any{"type": "string", "description": "Conceptual or keyword query to rank @page chunks"},
+					},
+					"required": []string{"query"},
 				},
 			},
 		},
@@ -442,7 +472,7 @@ func (p *OpenAICompatProvider) Generate(ctx context.Context, req GenerateRequest
 
 func inferToolEffectClass(toolName string) taint.EffectClass {
 	switch toolName {
-	case "fs_read", "fs_list", "page_slice", "page_grep":
+	case "fs_read", "fs_list", "page_slice", "page_grep", "page_search", "memory_search":
 		return taint.EffectReadOnly
 	case "fs_write", "fs_patch", "exec":
 		return taint.EffectWorkspaceWrite

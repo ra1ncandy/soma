@@ -1794,3 +1794,76 @@ func (s *Store) CountPendingInbox(ctx context.Context) (int, error) {
 	err := s.reader.QueryRowContext(ctx, `SELECT COUNT(*) FROM inbox_items WHERE status = 'pending'`).Scan(&count)
 	return count, err
 }
+
+// --- Matryoshka Int8 Embeddings (Memory & @page Chunks) ---
+
+// UpsertEmbedding stores or updates an int8-quantized Matryoshka embedding record.
+func (s *Store) UpsertEmbedding(ctx context.Context, rec EmbeddingRecord) error {
+	now := time.Now().Unix()
+	if rec.CreatedAt == 0 {
+		rec.CreatedAt = now
+	}
+	if rec.Dims == 0 {
+		rec.Dims = len(rec.VecInt8)
+	}
+	return s.WithWriteTx(ctx, func(conn *sql.Conn) error {
+		_, err := conn.ExecContext(ctx, `
+			INSERT INTO embeddings (
+				kind, target_id, chunk_index, start_line, end_line,
+				model_id, dims, vec_int8, snippet, created_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(kind, target_id, chunk_index) DO UPDATE SET
+				start_line = excluded.start_line,
+				end_line = excluded.end_line,
+				model_id = excluded.model_id,
+				dims = excluded.dims,
+				vec_int8 = excluded.vec_int8,
+				snippet = excluded.snippet,
+				created_at = excluded.created_at`,
+			rec.Kind, rec.TargetID, rec.ChunkIndex, rec.StartLine, rec.EndLine,
+			rec.ModelID, rec.Dims, rec.VecInt8, rec.Snippet, rec.CreatedAt,
+		)
+		return err
+	})
+}
+
+// GetEmbeddingsByTargets fetches all stored embedding chunks for kind and targetIDs ordered by target_id, chunk_index.
+func (s *Store) GetEmbeddingsByTargets(ctx context.Context, kind string, targetIDs []string) ([]EmbeddingRecord, error) {
+	if len(targetIDs) == 0 {
+		return nil, nil
+	}
+	placeholders := make([]string, len(targetIDs))
+	args := make([]any, 0, len(targetIDs)+1)
+	args = append(args, kind)
+	for i, id := range targetIDs {
+		placeholders[i] = "?"
+		args = append(args, id)
+	}
+	query := fmt.Sprintf(`
+		SELECT kind, target_id, chunk_index, start_line, end_line,
+		       model_id, dims, vec_int8, snippet, created_at
+		FROM embeddings
+		WHERE kind = ? AND target_id IN (%s)
+		ORDER BY target_id ASC, chunk_index ASC`, strings.Join(placeholders, ","))
+
+	rows, err := s.reader.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []EmbeddingRecord
+	for rows.Next() {
+		var r EmbeddingRecord
+		var rawVec []byte
+		if err := rows.Scan(
+			&r.Kind, &r.TargetID, &r.ChunkIndex, &r.StartLine, &r.EndLine,
+			&r.ModelID, &r.Dims, &rawVec, &r.Snippet, &r.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		r.VecInt8 = append([]byte(nil), rawVec...)
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}

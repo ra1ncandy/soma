@@ -170,7 +170,9 @@ func DefaultCoreSyscalls() []SyscallDef {
 		{Name: "exec", Signature: "exec(cmd, args_json)"},
 		{Name: "fs_patch", Signature: "fs_patch(path, unified_diff)"},
 		{Name: "fs_read", Signature: "fs_read(path)"},
+		{Name: "memory_search", Signature: "memory_search(query, scope?)"},
 		{Name: "page_grep", Signature: "page_grep(page_id, pattern)"},
+		{Name: "page_search", Signature: "page_search(query, page_id?)"},
 		{Name: "page_slice", Signature: "page_slice(page_id, start_line, end_line)"},
 		{Name: "tool_search", Signature: "tool_search(query)"},
 	}

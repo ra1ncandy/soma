@@ -88,3 +88,45 @@ func TestBiTemporalMemoryMINJADefenseAndWorkspaceAudit(t *testing.T) {
 		t.Fatalf("expected 1 stale finding for missing_moved.go, got %+v err=%v", stale, err)
 	}
 }
+
+func TestMemoryHybridSearchAndSemanticConflictDetection(t *testing.T) {
+	ctx := context.Background()
+	ws := t.TempDir()
+	st, err := store.Open(filepath.Join(ws, ".soma"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+
+	svc := NewService(st)
+
+	rules := []ProposeRequest{
+		{ID: "M-r1", Scope: "repo:app", Kind: "rule", Content: "Always run `go test -race ./...` before committing changes to internal/dag"},
+		{ID: "M-r2", Scope: "repo:app", Kind: "rule", Content: "Use Bubblewrap (--unshare-net --unshare-pid) for all sandboxed shell execution"},
+		{ID: "M-r3", Scope: "repo:app", Kind: "fact", Content: "The rpc_watchdog service requires timeout_ms=4250 in config/timeout.yaml for SOMA_CRC_7741"},
+	}
+	for _, r := range rules {
+		if _, err := svc.Propose(ctx, r); err != nil {
+			t.Fatalf("Propose %s: %v", r.ID, err)
+		}
+	}
+
+	// 1. Hybrid search finds exact + semantic match.
+	hits, err := svc.Search(ctx, []string{"repo:app"}, nil, "SOMA_CRC_7741 watchdog timeout_ms", 2)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(hits) == 0 || hits[0].Node.ID != "M-r3" {
+		t.Fatalf("expected M-r3 ranked #1, got %+v", hits)
+	}
+
+	// 2. Semantic conflict detection flags near-duplicate rule in the same scope/kind.
+	conflicts, err := svc.FindSemanticConflicts(ctx, "repo:app", "rule",
+		"Always run `go test -race ./...` before committing any edits to internal/dag", 0.75)
+	if err != nil {
+		t.Fatalf("FindSemanticConflicts: %v", err)
+	}
+	if len(conflicts) == 0 || conflicts[0].ID != "M-r1" {
+		t.Fatalf("expected semantic conflict with M-r1, got %+v", conflicts)
+	}
+}

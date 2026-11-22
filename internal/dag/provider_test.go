@@ -14,6 +14,7 @@ import (
 
 	"github.com/ra1ncandy/soma/internal/compiler"
 	"github.com/ra1ncandy/soma/internal/dag"
+	"github.com/ra1ncandy/soma/internal/memory"
 	"github.com/ra1ncandy/soma/internal/store"
 	"github.com/ra1ncandy/soma/internal/taint"
 	"github.com/ra1ncandy/soma/internal/vmem"
@@ -117,8 +118,8 @@ func TestOpenAICompatProvider_ToolsSessionCacheAnd429(t *testing.T) {
 		t.Fatalf("expected sticky run-scoped x-opencode-session header, got %q", gotSess)
 	}
 	rawTools, ok := lastReqBody["tools"].([]any)
-	if !ok || len(rawTools) != 6 {
-		t.Fatalf("expected 6 canonical tools in request body, got %+v", lastReqBody["tools"])
+	if !ok || len(rawTools) != 8 {
+		t.Fatalf("expected 8 canonical tools in request body, got %+v", lastReqBody["tools"])
 	}
 
 	// Call 2: normal completion without tool_calls -> Done=true.
@@ -207,6 +208,40 @@ func TestLocalToolRunner_FSListExecAndAtPagePrefix(t *testing.T) {
 	})
 	if err != nil || !strings.Contains(string(grepOut.Content), "NEEDLE_991") {
 		t.Fatalf("page_grep with @ prefix failed: %q err=%v", string(grepOut.Content), err)
+	}
+
+	pageSearchOut, err := runner.Execute(ctx, dag.ToolCall{
+		Name:         "page_search",
+		ArgsJSON:     `{"query":"NEEDLE_991"}`,
+		WorkspaceDir: ws,
+	})
+	if err != nil || !strings.Contains(string(pageSearchOut.Content), "NEEDLE_991") {
+		t.Fatalf("page_search failed: %q err=%v", string(pageSearchOut.Content), err)
+	}
+
+	memSvc := memory.NewService(st)
+	for i := 1; i <= 15; i++ {
+		_, _ = memSvc.Propose(ctx, memory.ProposeRequest{
+			ID:      "M-noise-" + string(rune('a'+i)),
+			Scope:   "global",
+			Kind:    "rule",
+			Content: "Unrelated frontend CSS padding convention rule",
+		})
+	}
+	_, _ = memSvc.Propose(ctx, memory.ProposeRequest{
+		ID:      "M-needle-rule",
+		Scope:   "global",
+		Kind:    "rule",
+		Content: "When NEEDLE_991 appears in big.log, set timeout_ms=4250 in config/timeout.yaml",
+	})
+
+	memSearchOut, err := runner.Execute(ctx, dag.ToolCall{
+		Name:         "memory_search",
+		ArgsJSON:     `{"query":"NEEDLE_991 timeout_ms config"}`,
+		WorkspaceDir: ws,
+	})
+	if err != nil || !strings.Contains(string(memSearchOut.Content), "M-needle-rule") {
+		t.Fatalf("memory_search failed: %q err=%v", string(memSearchOut.Content), err)
 	}
 }
 
@@ -328,5 +363,98 @@ func TestOpenAICompatProvider_MultiToolBatchAndTransientRetry(t *testing.T) {
 	bBytes, bErr := os.ReadFile(filepath.Join(br.WorkspaceDir, "b.txt"))
 	if aErr != nil || bErr != nil || string(aBytes) != "alpha" || string(bBytes) != "beta" {
 		t.Fatalf("expected both batched files written in workspace, got a=%q (%v) b=%q (%v)", string(aBytes), aErr, string(bBytes), bErr)
+	}
+}
+
+func TestEpochPinnedHybridLayer1MemorySelection(t *testing.T) {
+	ctx := context.Background()
+	ws := t.TempDir()
+	st, err := store.Open(filepath.Join(ws, ".soma"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+
+	if err := os.WriteFile(filepath.Join(ws, "README.md"), []byte("# demo\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	_ = st.UpsertAccount(ctx, store.Account{
+		ID: "mem_acc", Provider: "local", ModelID: "mock", BillingMode: "local", MaxConcurrent: 1,
+	})
+
+	memSvc := memory.NewService(st)
+	// Seed 20 unrelated rules and 1 highly relevant rule.
+	for i := 1; i <= 20; i++ {
+		_, _ = memSvc.Propose(ctx, memory.ProposeRequest{
+			ID:      "M-unrel-" + string(rune('a'+i)),
+			Scope:   "global",
+			Kind:    "rule",
+			Content: "Unrelated CSS animation keyframe styling rule",
+		})
+	}
+	_, _ = memSvc.Propose(ctx, memory.ProposeRequest{
+		ID:      "M-watchdog-target",
+		Scope:   "global",
+		Kind:    "rule",
+		Content: "For SOMA_CRC_7741 rpc_watchdog timeout failures, set timeout_ms=4250 in config/timeout.yaml",
+	})
+	_, _ = memSvc.Propose(ctx, memory.ProposeRequest{
+		ID:      "M-watchdog-rel1",
+		Scope:   "global",
+		Kind:    "rule",
+		Content: "Always validate config/timeout.yaml YAML syntax after updating timeout_ms",
+	})
+	_, _ = memSvc.Propose(ctx, memory.ProposeRequest{
+		ID:      "M-watchdog-rel2",
+		Scope:   "global",
+		Kind:    "rule",
+		Content: "Check rpc_watchdog logs when diagnosing timeout_ms errors",
+	})
+	_, _ = memSvc.Propose(ctx, memory.ProposeRequest{
+		ID:      "M-watchdog-rel3",
+		Scope:   "global",
+		Kind:    "rule",
+		Content: "Timeout configuration lives in config/timeout.yaml",
+	})
+
+	execDag := dag.NewExecutor(st, &dag.MockProvider{ModelName: "mock"}, nil, compiler.WorkerProfile())
+	execDag.AccountIDs = []string{"mem_acc"}
+	execDag.MaxLayer1Memories = 3
+
+	_, brID, err := execDag.StartRun(ctx, dag.RunRequest{
+		Title:         "epoch-mem-budget",
+		WorkspacePath: ws,
+		GoalSpec:      "Diagnose SOMA_CRC_7741 rpc_watchdog timeout_ms in config/timeout.yaml",
+		AccountIDs:    []string{"mem_acc"},
+	})
+	if err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+	res, err := execDag.ExecuteBranch(ctx, brID, 5)
+	if err != nil || res.Status != dag.StatusCompleted {
+		t.Fatalf("ExecuteBranch: res=%+v err=%v", res, err)
+	}
+
+	steps, err := st.ListBranchSteps(ctx, brID)
+	if err != nil || len(steps) != 3 {
+		t.Fatalf("expected 3 steps, got %d err=%v", len(steps), err)
+	}
+
+	var prevPrefix string
+	for _, s := range steps {
+		frame, rErr := compiler.ReconstructFrame(ctx, st, s.ID, compiler.WorkerProfile())
+		if rErr != nil {
+			t.Fatalf("ReconstructFrame(%s): %v", s.ID, rErr)
+		}
+		if !strings.Contains(frame.Layer1, "M-watchdog-target") {
+			t.Fatalf("expected M-watchdog-target selected into Layer 1, got:\n%s", frame.Layer1)
+		}
+		if strings.Count(frame.Layer1, "[M-") != 3 {
+			t.Fatalf("expected exactly MaxLayer1Memories=3 rules in Layer 1, got:\n%s", frame.Layer1)
+		}
+		if prevPrefix != "" && frame.PrefixHashL0L1 != prevPrefix {
+			t.Fatalf("PrefixHashL0L1 mutated mid-epoch!")
+		}
+		prevPrefix = frame.PrefixHashL0L1
 	}
 }

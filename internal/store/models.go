@@ -221,3 +221,17 @@ type TriggerRun struct {
 	CreatedAt        int64
 	ExpiresAt        int64
 }
+
+// EmbeddingRecord stores a Matryoshka int8-quantized vector for a memory_node or @page line chunk.
+type EmbeddingRecord struct {
+	Kind       string
+	TargetID   string
+	ChunkIndex int
+	StartLine  int
+	EndLine    int
+	ModelID    string
+	Dims       int
+	VecInt8    []byte
+	Snippet    string
+	CreatedAt  int64
+}

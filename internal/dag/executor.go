@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"github.com/ra1ncandy/soma/internal/compiler"
+	"github.com/ra1ncandy/soma/internal/embed"
+	"github.com/ra1ncandy/soma/internal/memory"
 	"github.com/ra1ncandy/soma/internal/sandbox"
 	"github.com/ra1ncandy/soma/internal/store"
 	"github.com/ra1ncandy/soma/internal/taint"
@@ -190,21 +192,23 @@ type EmittedPayload struct {
 
 // Executor drives the Merkle DAG execution loop with durable 2-phase journaling and @page context VM.
 type Executor struct {
-	Store             *store.Store
-	VM                *vmem.Manager
-	Workspace         *workspace.Manager
-	Scheduler         *QuotaScheduler
-	Provider          ModelProvider
-	Tools             ToolRunner
-	Reconciler        ActionReconciler
-	Verifier          ContractVerifier
-	Profile           compiler.ModelProfile
-	SystemPrompt      string
+	Store               *store.Store
+	VM                  *vmem.Manager
+	Memory              *memory.Service
+	Workspace           *workspace.Manager
+	Scheduler           *QuotaScheduler
+	Provider            ModelProvider
+	Tools               ToolRunner
+	Reconciler          ActionReconciler
+	Verifier            ContractVerifier
+	Profile             compiler.ModelProfile
+	SystemPrompt        string
+	MaxLayer1Memories   int
 	AccountIDs          []string
 	AllowFailover       bool
 	EnforceStallBreaker bool
 	AfterDispatchHook   func(ctx context.Context, entry store.ActionJournalEntry) error
-	seq               atomic.Uint64
+	seq                 atomic.Uint64
 }
 
 // NewExecutor builds a configured DAG Executor.
@@ -214,20 +218,36 @@ func NewExecutor(
 	tools ToolRunner,
 	prof compiler.ModelProfile,
 ) *Executor {
+	vm := vmem.NewManager(st)
 	if tools == nil {
-		tools = NewLocalToolRunner(vmem.NewManager(st))
+		tools = NewLocalToolRunner(vm)
 	}
 	if prof.Name == "" {
 		prof = compiler.WorkerProfile()
 	}
 	return &Executor{
-		Store:     st,
-		VM:        vmem.NewManager(st),
-		Workspace: workspace.NewManager(st.SomaDir()),
-		Scheduler: NewQuotaScheduler(st),
-		Provider:  provider,
-		Tools:     tools,
-		Profile:   prof,
+		Store:             st,
+		VM:                vm,
+		Memory:            memory.NewService(st),
+		Workspace:         workspace.NewManager(st.SomaDir()),
+		Scheduler:         NewQuotaScheduler(st),
+		Provider:          provider,
+		Tools:             tools,
+		Profile:           prof,
+		MaxLayer1Memories: 25,
+	}
+}
+
+// SetEmbedder configures a custom local or remote Matryoshka int8 Embedder for both memory and @page retrieval.
+func (e *Executor) SetEmbedder(emb embed.Embedder) {
+	if emb == nil {
+		return
+	}
+	if e.VM != nil {
+		e.VM.SetEmbedder(emb)
+	}
+	if e.Memory != nil {
+		e.Memory.SetEmbedder(emb)
 	}
 }
 
@@ -1469,7 +1489,8 @@ func (e *Executor) rolloverWithHandoff(
 }
 
 func (e *Executor) loadMemoryAndGraveyard(ctx context.Context, runID string) ([]compiler.MemoryEntry, []compiler.GraveyardEntry, error) {
-	nodes, err := e.Store.ListActiveMemoryByScopes(ctx, []string{"global", "repo:" + runID}, nil)
+	scopes := []string{"global", "repo:" + runID}
+	nodes, err := e.Store.ListActiveMemoryByScopes(ctx, scopes, nil)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1491,6 +1512,31 @@ func (e *Executor) loadMemoryAndGraveyard(ctx context.Context, runID string) ([]
 				Kind:    n.Kind,
 				Content: n.Content,
 			})
+		}
+	}
+
+	// Epoch-Pinned Hybrid Retrieval: when active memory exceeds MaxLayer1Memories, rank against the Run's
+	// GoalSpec using Hybrid BM25 + Matryoshka int8 Vector RRF and freeze top-K for the entire epoch.
+	maxMem := e.MaxLayer1Memories
+	if maxMem > 0 && len(mem) > maxMem && e.Memory != nil {
+		var goal string
+		if run, rErr := e.Store.GetRun(ctx, runID); rErr == nil {
+			goal = run.GoalSpec
+		}
+		if strings.TrimSpace(goal) != "" {
+			hits, sErr := e.Memory.Search(ctx, scopes, []string{"rule", "fact", "preference"}, goal, maxMem)
+			if sErr == nil && len(hits) > 0 {
+				selected := make([]compiler.MemoryEntry, 0, len(hits))
+				for _, h := range hits {
+					selected = append(selected, compiler.MemoryEntry{
+						ID:      h.Node.ID,
+						Scope:   h.Node.Scope,
+						Kind:    h.Node.Kind,
+						Content: h.Node.Content,
+					})
+				}
+				mem = selected
+			}
 		}
 	}
 	return mem, grave, nil
@@ -1675,6 +1721,52 @@ func (r *LocalToolRunner) Execute(ctx context.Context, call ToolCall) (ToolOutpu
 			return ToolOutput{}, err
 		}
 		return ToolOutput{NameHint: "grep.txt", Content: []byte(out), TrustTier: "trusted_repo"}, nil
+
+	case "page_search":
+		if r.vm == nil {
+			return ToolOutput{}, errors.New("page_search: virtual memory manager not initialized")
+		}
+		query, _ := args["query"].(string)
+		pid, _ := args["page_id"].(string)
+		out, err := r.vm.Search(ctx, "", query, pid, 5)
+		if err != nil {
+			return ToolOutput{}, err
+		}
+		return ToolOutput{NameHint: "page_search.txt", Content: []byte(out), TrustTier: "trusted_repo"}, nil
+
+	case "memory_search":
+		if r.vm == nil || r.vm.Store() == nil {
+			return ToolOutput{}, errors.New("memory_search: store not initialized")
+		}
+		query, _ := args["query"].(string)
+		scope, _ := args["scope"].(string)
+		var scopes []string
+		if strings.TrimSpace(scope) != "" {
+			scopes = []string{strings.TrimSpace(scope)}
+		}
+		memSvc := memory.NewService(r.vm.Store())
+		hits, err := memSvc.Search(ctx, scopes, nil, query, 5)
+		if err != nil {
+			return ToolOutput{}, err
+		}
+		if len(hits) == 0 {
+			return ToolOutput{
+				NameHint:  "memory_search.txt",
+				Content:   []byte(fmt.Sprintf("memory_search: 0 matches for %q", query)),
+				TrustTier: "trusted_repo",
+			}, nil
+		}
+		var sb strings.Builder
+		fmt.Fprintf(&sb, "memory_search: top %d match(es) for %q (Hybrid BM25 + int8 MRL RRF):\n", len(hits), query)
+		for i, h := range hits {
+			fmt.Fprintf(&sb, "%d. [%s] (%s/%s rrf=%.4f bm25=%.2f cos=%.2f): %s\n",
+				i+1, h.Node.ID, h.Node.Scope, h.Node.Kind, h.RRFScore, h.BM25Score, h.CosineScore, h.Node.Content)
+		}
+		return ToolOutput{
+			NameHint:  "memory_search.txt",
+			Content:   []byte(strings.TrimRight(sb.String(), "\n")),
+			TrustTier: "trusted_repo",
+		}, nil
 
 	default:
 		return ToolOutput{

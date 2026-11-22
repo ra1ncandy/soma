@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ra1ncandy/soma/internal/embed"
 	"github.com/ra1ncandy/soma/internal/store"
 )
 
@@ -36,16 +37,30 @@ type ObserveResult struct {
 	Page       store.Page
 }
 
-// Manager manages @page spilling, previews, slicing, and regex grep against Store.
+// Manager manages @page spilling, previews, slicing, regex grep, and hybrid BM25 + int8 MRL search against Store.
 type Manager struct {
-	store *store.Store
-	seq   atomic.Uint64
+	store    *store.Store
+	embedder embed.Embedder
+	seq      atomic.Uint64
 }
 
-// NewManager constructs a virtual memory manager backed by st.
+// NewManager constructs a virtual memory manager backed by st with a default 256-dim int8 Matryoshka embedder.
 func NewManager(st *store.Store) *Manager {
-	return &Manager{store: st}
+	return &Manager{
+		store:    st,
+		embedder: embed.NewLocalSimHashEmbedder(embed.DefaultMatryoshkaDims),
+	}
 }
+
+// SetEmbedder configures a custom local or remote Embedder for @page chunk indexing and search.
+func (m *Manager) SetEmbedder(emb embed.Embedder) {
+	if emb != nil {
+		m.embedder = emb
+	}
+}
+
+// Store returns the underlying SQLite store backing this virtual memory manager.
+func (m *Manager) Store() *store.Store { return m.store }
 
 // Observe implements the Anti-Syscall-Tax rule: small outputs return inline; large outputs spill to zstd blobs.
 func (m *Manager) Observe(ctx context.Context, req ObserveRequest) (ObserveResult, error) {
@@ -167,6 +182,201 @@ func (m *Manager) Grep(ctx context.Context, pageID, pattern string, maxMatches i
 	}
 	header := fmt.Sprintf("@%s: %d match(es) for %q (showing %d):", page.ID, total, pattern, len(matches))
 	return header + "\n" + strings.Join(matches, "\n"), nil
+}
+
+// Search performs Hybrid BM25 + Matryoshka int8 Vector RRF search across 40-line chunks of spilled @page blobs
+// in runID (or a specific pageIDFilter if non-empty), returning top-K matching line ranges.
+func (m *Manager) Search(ctx context.Context, runID, query, pageIDFilter string, topK int) (string, error) {
+	if topK <= 0 {
+		topK = 5
+	}
+	if topK > 10 {
+		topK = 10
+	}
+	pageIDFilter = strings.TrimPrefix(strings.TrimSpace(pageIDFilter), "@")
+
+	var pages []store.Page
+	if pageIDFilter != "" {
+		p, err := m.store.GetPage(ctx, pageIDFilter)
+		if err != nil {
+			return "", err
+		}
+		pages = []store.Page{p}
+	} else {
+		var err error
+		pages, err = m.store.ListRunPages(ctx, runID, 50)
+		if err != nil {
+			return "", err
+		}
+		if len(pages) == 0 && runID != "" {
+			pages, err = m.store.ListRunPages(ctx, "", 50)
+			if err != nil {
+				return "", err
+			}
+		}
+	}
+	if len(pages) == 0 {
+		return "page_search: no spilled @page handles available", nil
+	}
+
+	const chunkLines = 40
+	type chunkMeta struct {
+		pageID    string
+		chunkIdx  int
+		startLine int
+		endLine   int
+		text      string
+	}
+
+	var docs []embed.Document
+	metaByDocID := make(map[string]chunkMeta)
+
+	for _, pg := range pages {
+		raw, err := m.store.Blobs().Get(pg.ContentHash)
+		if err != nil {
+			continue
+		}
+		_ = m.store.TouchPage(ctx, pg.ID)
+		lines := splitLines(raw)
+		if len(lines) == 0 {
+			continue
+		}
+
+		cachedVecs := make(map[int][]byte)
+		if recs, err := m.store.GetEmbeddingsByTargets(ctx, "page_chunk", []string{pg.ID}); err == nil {
+			for _, r := range recs {
+				if len(r.VecInt8) > 0 {
+					cachedVecs[r.ChunkIndex] = r.VecInt8
+				}
+			}
+		}
+
+		var uncachedIdx []int
+		var uncachedMeta []chunkMeta
+		var uncachedTexts []string
+
+		numChunks := (len(lines) + chunkLines - 1) / chunkLines
+		pageChunks := make([]chunkMeta, 0, numChunks)
+		for cIdx := 0; cIdx < numChunks; cIdx++ {
+			start := cIdx*chunkLines + 1
+			end := start + chunkLines - 1
+			if end > len(lines) {
+				end = len(lines)
+			}
+			var sb strings.Builder
+			for l := start; l <= end; l++ {
+				fmt.Fprintf(&sb, "L%d: %s\n", l, truncateLine(lines[l-1], 180))
+			}
+			txt := strings.TrimRight(sb.String(), "\n")
+			cm := chunkMeta{
+				pageID:    pg.ID,
+				chunkIdx:  cIdx,
+				startLine: start,
+				endLine:   end,
+				text:      txt,
+			}
+			pageChunks = append(pageChunks, cm)
+			if _, ok := cachedVecs[cIdx]; !ok && m.embedder != nil {
+				uncachedIdx = append(uncachedIdx, cIdx)
+				uncachedMeta = append(uncachedMeta, cm)
+				uncachedTexts = append(uncachedTexts, txt)
+			}
+		}
+
+		if len(uncachedTexts) > 0 && m.embedder != nil {
+			if vecs, err := m.embedder.Embed(ctx, uncachedTexts, false); err == nil && len(vecs) == len(uncachedIdx) {
+				for j, cIdx := range uncachedIdx {
+					cachedVecs[cIdx] = vecs[j]
+					cm := uncachedMeta[j]
+					_ = m.store.UpsertEmbedding(ctx, store.EmbeddingRecord{
+						Kind:       "page_chunk",
+						TargetID:   pg.ID,
+						ChunkIndex: cIdx,
+						StartLine:  cm.startLine,
+						EndLine:    cm.endLine,
+						ModelID:    m.embedder.ModelID(),
+						Dims:       len(vecs[j]),
+						VecInt8:    vecs[j],
+					})
+				}
+			}
+		}
+
+		for _, cm := range pageChunks {
+			docID := fmt.Sprintf("%s#%d", cm.pageID, cm.chunkIdx)
+			metaByDocID[docID] = cm
+			docs = append(docs, embed.Document{
+				ID:      docID,
+				Text:    cm.text,
+				VecInt8: cachedVecs[cm.chunkIdx],
+				Boost:   1.0,
+			})
+		}
+	}
+
+	ranked, err := embed.HybridSearch(ctx, m.embedder, query, docs, topK)
+	if err != nil {
+		return "", err
+	}
+	if len(ranked) == 0 {
+		return fmt.Sprintf("page_search: 0 matches for %q across %d page(s)", query, len(pages)), nil
+	}
+
+	var out strings.Builder
+	fmt.Fprintf(&out, "page_search: top %d chunk(s) for %q (Hybrid BM25 + int8 MRL RRF):\n", len(ranked), query)
+	for rankIdx, r := range ranked {
+		cm := metaByDocID[r.ID]
+		fmt.Fprintf(&out, "--- [%d] @%s lines %d..%d (rrf=%.4f bm25=%.2f cos=%.2f) ---\n",
+			rankIdx+1, cm.pageID, cm.startLine, cm.endLine, r.RRFScore, r.BM25Score, r.CosineScore)
+		// Show up to 10 best matching lines from the chunk so observation stays compact.
+		out.WriteString(compactChunkSnippet(cm.text, query, 10))
+		out.WriteByte('\n')
+	}
+	return strings.TrimRight(out.String(), "\n"), nil
+}
+
+func compactChunkSnippet(chunkText, query string, maxLines int) string {
+	lines := strings.Split(chunkText, "\n")
+	if len(lines) <= maxLines {
+		return chunkText
+	}
+	qToks := embed.Tokenize(query)
+	type scoredLine struct {
+		idx  int
+		hits int
+		line string
+	}
+	var matched []int
+	for i, l := range lines {
+		low := strings.ToLower(l)
+		hits := 0
+		for _, qt := range qToks {
+			if strings.Contains(low, qt) {
+				hits++
+			}
+		}
+		if hits > 0 {
+			matched = append(matched, i)
+		}
+	}
+	if len(matched) == 0 {
+		return strings.Join(lines[:maxLines], "\n")
+	}
+	keep := make(map[int]bool)
+	for _, idx := range matched {
+		for d := -1; d <= 1; d++ {
+			if idx+d >= 0 && idx+d < len(lines) && len(keep) < maxLines {
+				keep[idx+d] = true
+			}
+		}
+	}
+	var out []string
+	for i, l := range lines {
+		if keep[i] {
+			out = append(out, l)
+		}
+	}
+	return strings.Join(out, "\n")
 }
 
 func (m *Manager) loadPage(ctx context.Context, pageID string) (store.Page, []byte, error) {

@@ -138,4 +138,13 @@ func TestObserveThresholdsAndPreviewers(t *testing.T) {
 	if p := GeneratePreview(TypeDiff, []byte(diffSample), 15); !strings.Contains(p, "+2 -1 lines") {
 		t.Fatalf("unexpected diff preview:\n%s", p)
 	}
+
+	// Hybrid BM25 + Matryoshka int8 Vector RRF chunk search across spilled @page.
+	searchRes, err := mgr.Search(ctx, "run_vm", "DATA RACE handler.go:88", resBig.PageID, 3)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if !strings.Contains(searchRes, "L2501: FAIL: DATA RACE") || !strings.Contains(searchRes, resBig.PageID) {
+		t.Fatalf("expected page_search to rank chunk containing L2501 #1, got:\n%s", searchRes)
+	}
 }

@@ -168,8 +168,11 @@ func newRunCmd() *cobra.Command {
 			}
 
 			sbx := sandbox.NewManager()
-			tools := dag.NewSandboxedToolRunner(vmem.NewManager(st), sbx)
+			vm := vmem.NewManager(st)
+			tools := dag.NewSandboxedToolRunner(vm, sbx)
 			exec := dag.NewExecutor(st, prov, tools, prof)
+			exec.VM = vm
+			configureEmbedderFromEnv(exec)
 			exec.AccountIDs = []string{accID}
 			exec.Verifier = oracle.NewVerifier(st, sbx)
 			runID, branchID, err := exec.StartRun(cmd.Context(), dag.RunRequest{
@@ -230,8 +233,11 @@ func newResumeCmd() *cobra.Command {
 			}
 
 			sbx := sandbox.NewManager()
-			tools := dag.NewSandboxedToolRunner(vmem.NewManager(st), sbx)
+			vm := vmem.NewManager(st)
+			tools := dag.NewSandboxedToolRunner(vm, sbx)
 			exec := dag.NewExecutor(st, prov, tools, prof)
+			exec.VM = vm
+			configureEmbedderFromEnv(exec)
 			exec.AccountIDs = []string{accID}
 			exec.Verifier = oracle.NewVerifier(st, sbx)
 			res, execErr := exec.ExecuteBranch(cmd.Context(), branch.ID, maxTurns)
