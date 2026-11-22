@@ -76,6 +76,7 @@ func (b *bwrapBackend) Exec(ctx context.Context, spec ExecSpec) (ExecResult, err
 		"--tmpfs", "/tmp",
 		"--bind", absWS, "/workspace",
 		"--chdir", "/workspace",
+		"--unshare-pid",
 		"--die-with-parent",
 		"--clearenv",
 	)
@@ -114,6 +115,7 @@ func (b *bwrapBackend) Exec(ctx context.Context, spec ExecSpec) (ExecResult, err
 
 	start := time.Now()
 	cmd := exec.CommandContext(runCtx, b.binPath, args...)
+	cmd.WaitDelay = 500 * time.Millisecond
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

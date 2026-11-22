@@ -91,7 +91,7 @@ func (m *Manager) Observe(ctx context.Context, req ObserveRequest) (ObserveResul
 	}
 
 	manifest := fmt.Sprintf(
-		"@%s [%s | %s | %d bytes | %d lines | sha256:%s]\n%s\n(Use page_slice(%q, start, end) or page_grep(%q, pattern) to inspect raw lines.)",
+		"@%s [%s | %s | %d bytes | %d lines | sha256:%s]\n%s\n(Use page_grep(%q, pattern) or page_slice(%q, start, end) to inspect raw lines.)",
 		pageID, ct, req.TrustTier, page.ByteSize, page.LineCount, hash[:12], preview, pageID, pageID,
 	)
 

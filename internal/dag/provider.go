@@ -45,6 +45,7 @@ type GenerateResponse struct {
 	Done             bool                 `json:"done"`
 	FinalSummary     string               `json:"final_summary,omitempty"`
 	ToolCall         *ToolCallSpec        `json:"tool_call,omitempty"`
+	ToolCalls        []ToolCallSpec       `json:"tool_calls,omitempty"`
 	DynamicSkill     *compiler.SkillBody  `json:"dynamic_skill,omitempty"`
 	DynamicMCP       *compiler.ToolSchema `json:"dynamic_mcp,omitempty"`
 	StateHash        string               `json:"state_hash"`
@@ -204,6 +205,17 @@ func canonicalOpenAITools() []map[string]any {
 	}
 }
 
+func sleepWithContext(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
 func (p *OpenAICompatProvider) Generate(ctx context.Context, req GenerateRequest) (*GenerateResponse, error) {
 	if p.BaseURL == "" {
 		return nil, errors.New("openai-compat provider: empty BaseURL")
@@ -232,60 +244,89 @@ func (p *OpenAICompatProvider) Generate(ctx context.Context, req GenerateRequest
 		return nil, err
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.BaseURL+"/chat/completions", bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("User-Agent", "soma/0.4")
-	if p.APIKey != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+p.APIKey)
-	}
-	if strings.Contains(strings.ToLower(p.BaseURL), "opencode.ai") {
-		sessRun := req.RunID
-		if sessRun == "" {
-			sessRun = "run"
-		}
-		sessBr := req.BranchID
-		if sessBr == "" {
-			sessBr = "main"
-		}
-		httpReq.Header.Set("x-opencode-session", fmt.Sprintf("soma-%s-%s", sessRun, sessBr))
-	}
-
 	start := time.Now()
 	client := p.HTTPClient
 	if client == nil {
 		client = http.DefaultClient
 	}
-	resp, err := client.Do(httpReq)
-	if err != nil {
-		return nil, &TransientError{AccountID: req.AccountID, Err: err}
-	}
-	defer func() { _ = resp.Body.Close() }()
 
-	respBytes, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	if err != nil {
-		return nil, &TransientError{AccountID: req.AccountID, Err: err}
+	const maxAttempts = 3
+	var respBytes []byte
+	var statusCode int
+	var retryAfterHeader string
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.BaseURL+"/chat/completions", bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("User-Agent", "soma/0.4")
+		if p.APIKey != "" {
+			httpReq.Header.Set("Authorization", "Bearer "+p.APIKey)
+		}
+		if strings.Contains(strings.ToLower(p.BaseURL), "opencode.ai") {
+			sessRun := req.RunID
+			if sessRun == "" {
+				sessRun = "run"
+			}
+			// Route all branches of a run to the same upstream RadixAttention worker so forked
+			// branches share the warm Layer 0 KV cache prefix across the search tree.
+			httpReq.Header.Set("x-opencode-session", fmt.Sprintf("soma-%s", sessRun))
+		}
+
+		resp, err := client.Do(httpReq)
+		if err != nil {
+			tErr := &TransientError{AccountID: req.AccountID, Err: err}
+			if attempt < maxAttempts && ctx.Err() == nil {
+				if sleepErr := sleepWithContext(ctx, time.Duration(attempt)*300*time.Millisecond); sleepErr != nil {
+					return nil, tErr
+				}
+				continue
+			}
+			return nil, tErr
+		}
+		b, readErr := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		_ = resp.Body.Close()
+		if readErr != nil {
+			tErr := &TransientError{AccountID: req.AccountID, Err: readErr}
+			if attempt < maxAttempts && ctx.Err() == nil {
+				if sleepErr := sleepWithContext(ctx, time.Duration(attempt)*300*time.Millisecond); sleepErr != nil {
+					return nil, tErr
+				}
+				continue
+			}
+			return nil, tErr
+		}
+		respBytes = b
+		statusCode = resp.StatusCode
+		retryAfterHeader = resp.Header.Get("Retry-After")
+
+		if statusCode >= 500 && attempt < maxAttempts && ctx.Err() == nil {
+			if sleepErr := sleepWithContext(ctx, time.Duration(attempt)*300*time.Millisecond); sleepErr != nil {
+				break
+			}
+			continue
+		}
+		break
 	}
 
-	if resp.StatusCode == http.StatusTooManyRequests {
-		retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
+	if statusCode == http.StatusTooManyRequests {
+		retryAfter := parseRetryAfter(retryAfterHeader)
 		return nil, &RateLimitError{
 			AccountID:  req.AccountID,
 			RetryAfter: retryAfter,
 			Err:        fmt.Errorf("HTTP 429: %s", string(respBytes)),
 		}
 	}
-	if resp.StatusCode >= 500 {
+	if statusCode >= 500 {
 		return nil, &TransientError{
 			AccountID:  req.AccountID,
-			StatusCode: resp.StatusCode,
-			Err:        fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBytes)),
+			StatusCode: statusCode,
+			Err:        fmt.Errorf("HTTP %d: %s", statusCode, string(respBytes)),
 		}
 	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("upstream HTTP %d: %s", resp.StatusCode, string(respBytes))
+	if statusCode < 200 || statusCode >= 300 {
+		return nil, fmt.Errorf("upstream HTTP %d: %s", statusCode, string(respBytes))
 	}
 
 	var parsed struct {
@@ -356,30 +397,39 @@ func (p *OpenAICompatProvider) Generate(ctx context.Context, req GenerateRequest
 	}
 
 	if len(msg.ToolCalls) > 0 {
-		fn := msg.ToolCalls[0].Function
-		argsJSON := strings.TrimSpace(fn.Arguments)
-		if argsJSON == "" {
-			argsJSON = "{}"
+		var specs []ToolCallSpec
+		var hashParts []string
+		var names []string
+		for _, rawTC := range msg.ToolCalls {
+			fn := rawTC.Function
+			argsJSON := strings.TrimSpace(fn.Arguments)
+			if argsJSON == "" {
+				argsJSON = "{}"
+			}
+			var refs []string
+			var argMap map[string]any
+			if json.Unmarshal([]byte(argsJSON), &argMap) == nil {
+				if pid, ok := argMap["page_id"].(string); ok && strings.TrimSpace(pid) != "" {
+					refs = append(refs, strings.TrimPrefix(strings.TrimSpace(pid), "@"))
+				}
+			}
+			specs = append(specs, ToolCallSpec{
+				Name:              fn.Name,
+				ArgsJSON:          argsJSON,
+				EffectClass:       inferToolEffectClass(fn.Name),
+				ReferencedPageIDs: refs,
+			})
+			hashParts = append(hashParts, fn.Name+"|"+argsJSON)
+			names = append(names, fn.Name)
 		}
 		if reasoning == "" {
-			reasoning = fmt.Sprintf("invoke %s", fn.Name)
-		}
-		var refs []string
-		var argMap map[string]any
-		if json.Unmarshal([]byte(argsJSON), &argMap) == nil {
-			if pid, ok := argMap["page_id"].(string); ok && strings.TrimSpace(pid) != "" {
-				refs = append(refs, strings.TrimPrefix(strings.TrimSpace(pid), "@"))
-			}
+			reasoning = fmt.Sprintf("invoke %s", strings.Join(names, ", "))
 		}
 		gen.Reasoning = reasoning
 		gen.Done = false
-		gen.ToolCall = &ToolCallSpec{
-			Name:              fn.Name,
-			ArgsJSON:          argsJSON,
-			EffectClass:       inferToolEffectClass(fn.Name),
-			ReferencedPageIDs: refs,
-		}
-		gen.StateHash = shortHashHex([]byte(fn.Name + "|" + argsJSON))
+		gen.ToolCalls = specs
+		gen.ToolCall = &gen.ToolCalls[0]
+		gen.StateHash = shortHashHex([]byte(strings.Join(hashParts, ";")))
 		return gen, nil
 	}
 

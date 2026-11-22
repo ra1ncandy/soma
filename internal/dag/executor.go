@@ -705,8 +705,13 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 		}
 		lastStateHash = genResp.StateHash
 
+		calls := genResp.ToolCalls
+		if len(calls) == 0 && genResp.ToolCall != nil {
+			calls = []ToolCallSpec{*genResp.ToolCall}
+		}
+
 		// Completion turn (no tool call).
-		if genResp.Done || genResp.ToolCall == nil {
+		if genResp.Done || len(calls) == 0 {
 			doneEntry := compiler.LogEntry{
 				Kind:        "turn",
 				TurnIndex:   nextTurn,
@@ -804,135 +809,182 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 			return res, nil
 		}
 
-		// Tool Call Turn: evaluate Data/Action-level taint policy BEFORE preparing dispatch.
-		tc := genResp.ToolCall
-		if tc.EffectClass == "" {
-			tc.EffectClass = taint.EffectReadOnly
+		// Tool Call Turn (single or batched): pre-evaluate Data/Action-level taint policy across all calls BEFORE dispatching.
+		type plannedCall struct {
+			spec       ToolCallSpec
+			decision   taint.PolicyDecision
+			reason     string
+			actionID   string
+			argsHash   string
+			idemKey    string
+			provJSON   string
 		}
-		provJSONBytes, _ := json.Marshal(tc.ReferencedPageIDs)
-		provJSON := string(provJSONBytes)
-
-		decision, reason, err := taint.EvaluateAction(ctx, e.Store, taint.ActionPolicyInput{
-			ToolName:          tc.Name,
-			CapabilityScope:   tc.CapabilityScope,
-			EffectClass:       tc.EffectClass,
-			ReferencedPageIDs: tc.ReferencedPageIDs,
-			ExplicitDeny:      tc.ExplicitDeny,
-		})
-		if err != nil {
-			return res, err
-		}
-
-		actionID := fmt.Sprintf("act_%x_%04d", time.Now().UnixNano(), e.seq.Add(1))
-		argsHash := sha256Hex([]byte(tc.ArgsJSON))
-		idemKey := sha256Hex([]byte(fmt.Sprintf("%s|%d|%s|%s", branch.ID, nextTurn, tc.Name, argsHash)))
-
-		if decision == taint.DecisionAsk {
-			_ = e.Store.PrepareAction(ctx, store.ActionJournalEntry{
-				ActionID:            actionID,
-				RunID:               run.ID,
-				BranchID:            branch.ID,
-				ParentStepID:        branch.HeadStepID,
-				Epoch:               snap.Epoch,
-				TurnIndex:           nextTurn,
-				ToolName:            tc.Name,
-				ArgsJSON:            tc.ArgsJSON,
-				ArgsHash:            argsHash,
-				EffectClass:         string(tc.EffectClass),
-				IdempotencyKey:      idemKey,
-				InputProvenanceJSON: provJSON,
-				Status:              "prepared",
-			})
-			_ = e.Store.InsertInboxItem(ctx, store.InboxItem{
-				ID:          "inbox_" + actionID,
-				RunID:       run.ID,
-				BranchID:    branch.ID,
-				ItemKind:    "approval",
-				Title:       fmt.Sprintf("Approval required for %s (%s)", tc.Name, tc.EffectClass),
-				Summary:     reason,
-				ArtifactRef: actionID,
-				Urgency:     "urgent",
-			})
-			_ = e.Store.UpdateBranchStatus(ctx, branch.ID, string(StatusSuspendedApproval), acc.ID, branch.StallCount)
-			res.Status = StatusSuspendedApproval
-			return res, &SuspendedApprovalError{BranchID: branch.ID, ActionID: actionID, Reason: reason}
-		}
-
-		var obsText, obsPageID string
-		if decision == taint.DecisionDeny {
-			obsText = "POLICY DENY: " + reason
-		} else {
-			entry := store.ActionJournalEntry{
-				ActionID:            actionID,
-				RunID:               run.ID,
-				BranchID:            branch.ID,
-				ParentStepID:        branch.HeadStepID,
-				Epoch:               snap.Epoch,
-				TurnIndex:           nextTurn,
-				ToolName:            tc.Name,
-				ArgsJSON:            tc.ArgsJSON,
-				ArgsHash:            argsHash,
-				EffectClass:         string(tc.EffectClass),
-				IdempotencyKey:      idemKey,
-				InputProvenanceJSON: provJSON,
-				Status:              "prepared",
+		planned := make([]plannedCall, len(calls))
+		var allRefs []string
+		for idx, tc := range calls {
+			if tc.EffectClass == "" {
+				tc.EffectClass = taint.EffectReadOnly
 			}
-			if err := e.Store.PrepareAction(ctx, entry); err != nil {
-				return res, err
-			}
-			if err := e.Store.MarkActionDispatched(ctx, actionID); err != nil {
-				return res, err
-			}
+			provJSONBytes, _ := json.Marshal(tc.ReferencedPageIDs)
+			provJSON := string(provJSONBytes)
+			allRefs = append(allRefs, tc.ReferencedPageIDs...)
 
-			out, execErr := e.Tools.Execute(ctx, ToolCall{
-				ActionID:          actionID,
-				IdempotencyKey:    idemKey,
-				Name:              tc.Name,
-				ArgsJSON:          tc.ArgsJSON,
-				EffectClass:       tc.EffectClass,
+			decision, reason, err := taint.EvaluateAction(ctx, e.Store, taint.ActionPolicyInput{
+				ToolName:          tc.Name,
 				CapabilityScope:   tc.CapabilityScope,
-				WorkspaceDir:      branch.WorkspaceDir,
+				EffectClass:       tc.EffectClass,
 				ReferencedPageIDs: tc.ReferencedPageIDs,
+				ExplicitDeny:      tc.ExplicitDeny,
 			})
-			if e.AfterDispatchHook != nil {
-				if hookErr := e.AfterDispatchHook(ctx, entry); hookErr != nil {
-					return res, hookErr
-				}
+			if err != nil {
+				return res, err
 			}
-			if execErr != nil {
-				obsText = "TOOL ERROR: " + execErr.Error()
-			} else {
-				obsRes, obsErr := e.VM.Observe(ctx, vmem.ObserveRequest{
-					RunID:                run.ID,
-					NameHint:             out.NameHint,
-					Content:              out.Content,
-					TrustTier:            out.TrustTier,
-					InlineThresholdBytes: e.Profile.InlineThresholdBytes,
+
+			actionID := fmt.Sprintf("act_%x_%04d", time.Now().UnixNano(), e.seq.Add(1))
+			argsHash := sha256Hex([]byte(tc.ArgsJSON))
+			idemRaw := fmt.Sprintf("%s|%d|%s|%s", branch.ID, nextTurn, tc.Name, argsHash)
+			if idx > 0 {
+				idemRaw = fmt.Sprintf("%s|%d", idemRaw, idx)
+			}
+			idemKey := sha256Hex([]byte(idemRaw))
+
+			if decision == taint.DecisionAsk {
+				_ = e.Store.PrepareAction(ctx, store.ActionJournalEntry{
+					ActionID:            actionID,
+					RunID:               run.ID,
+					BranchID:            branch.ID,
+					ParentStepID:        branch.HeadStepID,
+					Epoch:               snap.Epoch,
+					TurnIndex:           nextTurn,
+					ToolName:            tc.Name,
+					ArgsJSON:            tc.ArgsJSON,
+					ArgsHash:            argsHash,
+					EffectClass:         string(tc.EffectClass),
+					IdempotencyKey:      idemKey,
+					InputProvenanceJSON: provJSON,
+					Status:              "prepared",
 				})
-				if obsErr != nil {
-					return res, obsErr
-				}
-				if obsRes.Paged {
-					obsText = obsRes.Manifest
-					obsPageID = obsRes.PageID
-				} else {
-					obsText = obsRes.InlineText
-				}
+				_ = e.Store.InsertInboxItem(ctx, store.InboxItem{
+					ID:          "inbox_" + actionID,
+					RunID:       run.ID,
+					BranchID:    branch.ID,
+					ItemKind:    "approval",
+					Title:       fmt.Sprintf("Approval required for %s (%s)", tc.Name, tc.EffectClass),
+					Summary:     reason,
+					ArtifactRef: actionID,
+					Urgency:     "urgent",
+				})
+				_ = e.Store.UpdateBranchStatus(ctx, branch.ID, string(StatusSuspendedApproval), acc.ID, branch.StallCount)
+				res.Status = StatusSuspendedApproval
+				return res, &SuspendedApprovalError{BranchID: branch.ID, ActionID: actionID, Reason: reason}
+			}
+			planned[idx] = plannedCall{
+				spec:     tc,
+				decision: decision,
+				reason:   reason,
+				actionID: actionID,
+				argsHash: argsHash,
+				idemKey:  idemKey,
+				provJSON: provJSON,
 			}
 		}
 
-		turnEntry := compiler.LogEntry{
-			Kind:        "turn",
-			TurnIndex:   nextTurn,
-			Reasoning:   genResp.Reasoning,
-			Action:      fmt.Sprintf("%s(%s)", tc.Name, tc.ArgsJSON),
-			Observation: obsText,
-			PageID:      obsPageID,
+		var turnEntries []compiler.LogEntry
+		var lastActionID, lastObsPageID, lastObsText string
+		var hasCommittedAction bool
+
+		for idx, pc := range planned {
+			tc := pc.spec
+			var obsText, obsPageID string
+			if pc.decision == taint.DecisionDeny {
+				obsText = "POLICY DENY: " + pc.reason
+			} else {
+				if hasCommittedAction {
+					if err := e.Store.MarkActionStatus(ctx, lastActionID, "committed", lastObsPageID, lastObsText, ""); err != nil {
+						return res, err
+					}
+				}
+				entry := store.ActionJournalEntry{
+					ActionID:            pc.actionID,
+					RunID:               run.ID,
+					BranchID:            branch.ID,
+					ParentStepID:        branch.HeadStepID,
+					Epoch:               snap.Epoch,
+					TurnIndex:           nextTurn,
+					ToolName:            tc.Name,
+					ArgsJSON:            tc.ArgsJSON,
+					ArgsHash:            pc.argsHash,
+					EffectClass:         string(tc.EffectClass),
+					IdempotencyKey:      pc.idemKey,
+					InputProvenanceJSON: pc.provJSON,
+					Status:              "prepared",
+				}
+				if err := e.Store.PrepareAction(ctx, entry); err != nil {
+					return res, err
+				}
+				if err := e.Store.MarkActionDispatched(ctx, pc.actionID); err != nil {
+					return res, err
+				}
+
+				out, execErr := e.Tools.Execute(ctx, ToolCall{
+					ActionID:          pc.actionID,
+					IdempotencyKey:    pc.idemKey,
+					Name:              tc.Name,
+					ArgsJSON:          tc.ArgsJSON,
+					EffectClass:       tc.EffectClass,
+					CapabilityScope:   tc.CapabilityScope,
+					WorkspaceDir:      branch.WorkspaceDir,
+					ReferencedPageIDs: tc.ReferencedPageIDs,
+				})
+				if e.AfterDispatchHook != nil {
+					if hookErr := e.AfterDispatchHook(ctx, entry); hookErr != nil {
+						return res, hookErr
+					}
+				}
+				if execErr != nil {
+					obsText = "TOOL ERROR: " + execErr.Error()
+				} else {
+					obsRes, obsErr := e.VM.Observe(ctx, vmem.ObserveRequest{
+						RunID:                run.ID,
+						NameHint:             out.NameHint,
+						Content:              out.Content,
+						TrustTier:            out.TrustTier,
+						InlineThresholdBytes: e.Profile.InlineThresholdBytes,
+					})
+					if obsErr != nil {
+						return res, obsErr
+					}
+					if obsRes.Paged {
+						obsText = obsRes.Manifest
+						obsPageID = obsRes.PageID
+					} else {
+						obsText = obsRes.InlineText
+					}
+				}
+				lastActionID = pc.actionID
+				lastObsPageID = obsPageID
+				lastObsText = obsText
+				hasCommittedAction = true
+			}
+
+			entryReasoning := genResp.Reasoning
+			if idx > 0 {
+				entryReasoning = fmt.Sprintf("batched tool call (%d/%d)", idx+1, len(planned))
+			}
+			turnEntries = append(turnEntries, compiler.LogEntry{
+				Kind:        "turn",
+				TurnIndex:   nextTurn,
+				Reasoning:   entryReasoning,
+				Action:      fmt.Sprintf("%s(%s)", tc.Name, tc.ArgsJSON),
+				Observation: obsText,
+				PageID:      obsPageID,
+			})
 		}
-		nextPending := appendDynamicEntries(nextTurn, genResp, turnEntry)
+
+		nextPending := appendDynamicEntries(nextTurn, genResp, turnEntries...)
 		emPayload := EmittedPayload{
 			Response:            *genResp,
-			ActionID:            actionID,
+			ActionID:            lastActionID,
 			ResultingLogEntries: nextPending,
 		}
 		emBytes, _ := json.Marshal(emPayload)
@@ -941,7 +993,13 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 			return res, err
 		}
 
-		sid := ComputeStepID(branch.HeadStepID, branch.ID, snapID, acc.ModelID, deltaHash, frame.CompiledFrameHash, emHash, obsPageID)
+		allProvBytes, _ := json.Marshal(allRefs)
+		allProvJSON := string(allProvBytes)
+		if len(planned) == 1 {
+			allProvJSON = planned[0].provJSON
+		}
+
+		sid := ComputeStepID(branch.HeadStepID, branch.ID, snapID, acc.ModelID, deltaHash, frame.CompiledFrameHash, emHash, lastObsPageID)
 		stepRow := store.Step{
 			ID:                  sid,
 			RunID:               run.ID,
@@ -956,8 +1014,8 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 			FrameDeltaBlobHash:  deltaHash,
 			CompiledFrameHash:   frame.CompiledFrameHash,
 			EmittedBlobHash:     emHash,
-			ObservationPageID:   obsPageID,
-			InputProvenanceJSON: provJSON,
+			ObservationPageID:   lastObsPageID,
+			InputProvenanceJSON: allProvJSON,
 			InputTokens:         genResp.InputTokens,
 			CacheReadTokens:     genResp.CacheReadTokens,
 			CacheWriteTokens:    genResp.CacheWriteTokens,
@@ -966,7 +1024,7 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 			LatencyMS:           genResp.LatencyMS,
 		}
 
-		if decision == taint.DecisionDeny {
+		if !hasCommittedAction {
 			err = e.Store.AppendStep(ctx, stepRow, store.BranchUpdate{
 				Epoch:           snap.Epoch,
 				Status:          string(StatusRunning),
@@ -974,7 +1032,7 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 				StallCount:      branch.StallCount,
 			})
 		} else {
-			err = e.Store.CommitActionAndAppendStep(ctx, actionID, obsPageID, obsText, stepRow, store.BranchUpdate{
+			err = e.Store.CommitActionAndAppendStep(ctx, lastActionID, lastObsPageID, lastObsText, stepRow, store.BranchUpdate{
 				Epoch:           snap.Epoch,
 				Status:          string(StatusRunning),
 				ActiveAccountID: acc.ID,
@@ -1016,7 +1074,7 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 	return res, nil
 }
 
-func appendDynamicEntries(turn int, resp *GenerateResponse, turnEntry compiler.LogEntry) []compiler.LogEntry {
+func appendDynamicEntries(turn int, resp *GenerateResponse, turnEntries ...compiler.LogEntry) []compiler.LogEntry {
 	var out []compiler.LogEntry
 	if resp.DynamicSkill != nil {
 		out = append(out, compiler.LogEntry{
@@ -1034,7 +1092,7 @@ func appendDynamicEntries(turn int, resp *GenerateResponse, turnEntry compiler.L
 			Observation: resp.DynamicMCP.JSONSchema,
 		})
 	}
-	return append(out, turnEntry)
+	return append(out, turnEntries...)
 }
 
 func (e *Executor) recoverPendingActions(
@@ -1438,10 +1496,14 @@ func (e *Executor) loadMemoryAndGraveyard(ctx context.Context, runID string) ([]
 	return mem, grave, nil
 }
 
+func defaultKernelSystemPrompt() string {
+	return "You are soma, executing inside an isolated branch workspace. Available workspace tools: fs_list, fs_read, fs_write, exec, page_grep, page_slice. When large outputs spill to @page_XXXX handles, inspect them using page_grep(page_id, pattern) or page_slice(page_id, start_line, end_line) instead of guessing. You may emit multiple tool calls in a single turn (e.g. reading or grepping multiple files/pages at once, or writing multiple required output files in one turn). Verify all edits before declaring completion."
+}
+
 func (e *Executor) buildEpochInput(run store.Run, activeMem []compiler.MemoryEntry, grave []compiler.GraveyardEntry) compiler.EpochInput {
 	sys := e.SystemPrompt
 	if sys == "" {
-		sys = "You are soma, executing inside an isolated branch workspace. Available workspace tools: fs_list, fs_read, fs_write, exec, page_grep, page_slice. When large outputs spill to @page_XXXX handles, inspect them using page_grep(page_id, pattern) or page_slice(page_id, start_line, end_line) instead of guessing. Verify all edits before declaring completion."
+		sys = defaultKernelSystemPrompt()
 	}
 	return compiler.EpochInput{
 		SystemPrompt:  sys,
@@ -1577,6 +1639,7 @@ func (r *LocalToolRunner) Execute(ctx context.Context, call ToolCall) (ToolOutpu
 		runCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 		defer cancel()
 		cmd := exec.CommandContext(runCtx, "/bin/sh", "-c", command)
+		cmd.WaitDelay = 500 * time.Millisecond
 		cmd.Dir = call.WorkspaceDir
 		cmd.Env = sandbox.ScrubEnv(nil)
 		out, err := cmd.CombinedOutput()

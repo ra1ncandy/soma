@@ -113,8 +113,8 @@ func TestOpenAICompatProvider_ToolsSessionCacheAnd429(t *testing.T) {
 	if resp1.CacheReadTokens != 1750 || resp1.InputTokens != 250 || resp1.CostUSD != 0.0012 {
 		t.Fatalf("unexpected usage telemetry: %+v", resp1)
 	}
-	if gotSess := lastReqHeaders.Get("x-opencode-session"); gotSess != "soma-run_abc-br_1" {
-		t.Fatalf("expected sticky x-opencode-session header, got %q", gotSess)
+	if gotSess := lastReqHeaders.Get("x-opencode-session"); gotSess != "soma-run_abc" {
+		t.Fatalf("expected sticky run-scoped x-opencode-session header, got %q", gotSess)
 	}
 	rawTools, ok := lastReqBody["tools"].([]any)
 	if !ok || len(rawTools) != 6 {
@@ -207,5 +207,126 @@ func TestLocalToolRunner_FSListExecAndAtPagePrefix(t *testing.T) {
 	})
 	if err != nil || !strings.Contains(string(grepOut.Content), "NEEDLE_991") {
 		t.Fatalf("page_grep with @ prefix failed: %q err=%v", string(grepOut.Content), err)
+	}
+}
+
+func TestOpenAICompatProvider_MultiToolBatchAndTransientRetry(t *testing.T) {
+	ctx := context.Background()
+
+	var attempts int
+	var capturedMsgs []any
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		var reqBody map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&reqBody)
+		if msgs, ok := reqBody["messages"].([]any); ok {
+			capturedMsgs = msgs
+		}
+
+		switch attempts {
+		case 1:
+			// Simulate transient upstream 502 gateway hiccup on first attempt.
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte(`{"error":"bad gateway"}`))
+		case 2:
+			// Retry succeeds and emits TWO tool calls in a single turn.
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"choices": []map[string]any{{
+					"message": map[string]any{
+						"content": "Write both a.txt and b.txt in one batched turn.",
+						"tool_calls": []map[string]any{
+							{
+								"id":   "call_a",
+								"type": "function",
+								"function": map[string]any{
+									"name":      "fs_write",
+									"arguments": `{"path":"a.txt","content":"alpha"}`,
+								},
+							},
+							{
+								"id":   "call_b",
+								"type": "function",
+								"function": map[string]any{
+									"name":      "fs_write",
+									"arguments": `{"path":"b.txt","content":"beta"}`,
+								},
+							},
+						},
+					},
+				}},
+				"usage": map[string]any{
+					"prompt_tokens":     1200,
+					"completion_tokens": 50,
+					"prompt_tokens_details": map[string]any{
+						"cached_tokens": 1000,
+					},
+				},
+			})
+		default:
+			// Turn 2: finish run.
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"choices": []map[string]any{{
+					"message": map[string]any{
+						"content": "Both files written and verified in 2 turns.",
+					},
+				}},
+				"usage": map[string]any{
+					"prompt_tokens":     1350,
+					"completion_tokens": 25,
+					"prompt_tokens_details": map[string]any{
+						"cached_tokens": 1200,
+					},
+				},
+			})
+		}
+	}))
+	defer ts.Close()
+
+	ws := t.TempDir()
+	st, err := store.Open(filepath.Join(ws, ".soma"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+	_ = st.UpsertAccount(ctx, store.Account{
+		ID: "batch_acc", Provider: "openai", ModelID: "beam-free", BillingMode: "subscription", MaxConcurrent: 1,
+	})
+
+	prov := dag.NewOpenAICompatProvider(ts.URL, "secret")
+	execDag := dag.NewExecutor(st, prov, nil, compiler.WorkerProfile())
+	execDag.AccountIDs = []string{"batch_acc"}
+
+	_, brID, err := execDag.StartRun(ctx, dag.RunRequest{
+		Title:         "batch-test",
+		WorkspacePath: ws,
+		GoalSpec:      "Create a.txt and b.txt",
+		AccountIDs:    []string{"batch_acc"},
+	})
+	if err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+
+	res, err := execDag.ExecuteBranch(ctx, brID, 5)
+	if err != nil {
+		t.Fatalf("ExecuteBranch: %v", err)
+	}
+	if res.Status != dag.StatusCompleted || res.TurnsExecuted != 2 {
+		t.Fatalf("expected completion in 2 turns, got status=%s turns=%d", res.Status, res.TurnsExecuted)
+	}
+	if attempts != 3 {
+		t.Fatalf("expected 3 HTTP requests (1 transient 502 + 2 successful turns), got %d", attempts)
+	}
+	if len(capturedMsgs) != 2 {
+		t.Fatalf("expected 2 monotonic messages (system L0+L1, user L2+L3), got %d messages", len(capturedMsgs))
+	}
+
+	br, err := st.GetBranch(ctx, brID)
+	if err != nil {
+		t.Fatalf("GetBranch: %v", err)
+	}
+	aBytes, aErr := os.ReadFile(filepath.Join(br.WorkspaceDir, "a.txt"))
+	bBytes, bErr := os.ReadFile(filepath.Join(br.WorkspaceDir, "b.txt"))
+	if aErr != nil || bErr != nil || string(aBytes) != "alpha" || string(bBytes) != "beta" {
+		t.Fatalf("expected both batched files written in workspace, got a=%q (%v) b=%q (%v)", string(aBytes), aErr, string(bBytes), bErr)
 	}
 }

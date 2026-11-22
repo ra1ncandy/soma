@@ -119,7 +119,7 @@ func previewLog(lines []string, byteLen, maxLines int) []string {
 		}
 		if logErrRe.MatchString(line) {
 			errCount++
-			errLines = append(errLines, fmt.Sprintf("L%d: %s", idx+1, truncateLine(line, 140)))
+			errLines = append(errLines, fmt.Sprintf("L%d: %s", idx+1, truncateLine(line, 200)))
 		}
 	}
 

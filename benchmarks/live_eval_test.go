@@ -379,7 +379,7 @@ func TestLiveEvaluation_HypothesisAB(t *testing.T) {
 			return ok, fmt.Sprintf("yaml_4250=%v error_code=%q timeout_ms=%v", hasTimeout, code, diag["timeout_ms"])
 		}
 
-		goal := "Find the exact ERROR code and required timeout in logs/worker_a.log and logs/worker_b.log. Update config/timeout.yaml setting timeout_ms to that exact integer, and create diagnosis.json containing {\"error_code\": \"...\", \"timeout_ms\": <int>}."
+		goal := "Inspect logs/worker_a.log and logs/worker_b.log to locate the single ERROR line containing ERR_CODE and REQUIRED_TIMEOUT_MS. Update config/timeout.yaml setting timeout_ms to that exact integer, and create diagnosis.json containing {\"error_code\": \"...\", \"timeout_ms\": <int>}."
 
 		// 1A) Linear Baseline
 		linWS := t.TempDir()
@@ -431,6 +431,14 @@ func TestLiveEvaluation_HypothesisAB(t *testing.T) {
 
 		t.Logf("[Exp1] %s", linMetrics.Format())
 		t.Logf("[Exp1] %s", somaMetrics.Format())
+		if !somaPass {
+			steps, _ := st.ListBranchSteps(ctx, brID)
+			if len(steps) > 0 {
+				if f, rErr := compiler.ReconstructFrame(ctx, st, steps[len(steps)-1].ID, compiler.WorkerProfile()); rErr == nil {
+					t.Logf("[Exp1 soma L2 trace]\n%s", f.Layer2)
+				}
+			}
+		}
 	})
 
 	t.Run("Exp2_ExternalOracleVsSelfGrade", func(t *testing.T) {
