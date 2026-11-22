@@ -9,7 +9,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/ra1ncandy/soma/internal/sandbox"
@@ -24,6 +23,7 @@ type bgJob struct {
 	workspaceDir string
 	startedAt    time.Time
 	cmd          *exec.Cmd
+	sandboxed    bool
 
 	mu       sync.Mutex
 	buf      bytes.Buffer
@@ -64,20 +64,59 @@ func NewBgProcessManager() *BgProcessManager {
 	}
 }
 
-// Start launches command asynchronously inside workspaceDir with a secret-scrubbed environment.
-func (m *BgProcessManager) Start(runID, workspaceDir, command, label string) (string, error) {
+// BgStartSpec describes one background job launch.
+type BgStartSpec struct {
+	RunID        string
+	WorkspaceDir string
+	Command      string
+	Label        string
+	// Sandbox wraps the job in the same fail-closed OS isolation as synchronous exec.
+	Sandbox *sandbox.Manager
+	// AllowUnsandboxed permits a bare host shell when Sandbox is nil. Never set this for
+	// model-driven runs: it hands the model the operator's network and filesystem.
+	AllowUnsandboxed bool
+}
+
+// ErrUnsandboxedExec is returned when a shell tool is invoked with no sandbox and no explicit opt-out.
+var ErrUnsandboxedExec = errors.New("dag: refusing to run shell command without an OS sandbox (fail-closed)")
+
+// Start launches spec.Command asynchronously inside the OS sandbox (network-isolated, workspace-
+// confined, secret-scrubbed). It fails closed when no sandbox backend is available.
+func (m *BgProcessManager) Start(spec BgStartSpec) (string, error) {
+	runID, workspaceDir, command, label := spec.RunID, spec.WorkspaceDir, spec.Command, spec.Label
 	if strings.TrimSpace(command) == "" {
 		return "", errors.New("bg_exec requires non-empty command")
 	}
+
+	var cmd *exec.Cmd
+	sandboxed := false
+	switch {
+	case spec.Sandbox != nil:
+		var err error
+		cmd, _, err = spec.Sandbox.Command(context.Background(), sandbox.ExecSpec{
+			WorkspaceDir: workspaceDir,
+			Command:      "/bin/sh",
+			Args:         []string{"-c", command},
+		})
+		if err != nil {
+			return "", fmt.Errorf("bg_exec sandbox: %w", err)
+		}
+		sandboxed = true
+	case spec.AllowUnsandboxed:
+		cmd = exec.Command("/bin/sh", "-c", command)
+		cmd.Dir = workspaceDir
+		cmd.Env = sandbox.ScrubEnv(nil)
+		setProcGroup(cmd)
+	default:
+		return "", ErrUnsandboxedExec
+	}
+	// Do not let a grandchild holding the output pipe block Wait forever after exit/kill.
+	cmd.WaitDelay = 2 * time.Second
+
 	jobID := fmt.Sprintf("bg_%04d", m.seq.Add(1))
 	if label == "" {
 		label = jobID
 	}
-
-	cmd := exec.Command("/bin/sh", "-c", command)
-	cmd.Dir = workspaceDir
-	cmd.Env = sandbox.ScrubEnv(nil)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	job := &bgJob{
 		id:           jobID,
@@ -87,6 +126,7 @@ func (m *BgProcessManager) Start(runID, workspaceDir, command, label string) (st
 		workspaceDir: workspaceDir,
 		startedAt:    time.Now(),
 		cmd:          cmd,
+		sandboxed:    sandboxed,
 	}
 	cmd.Stdout = job
 	cmd.Stderr = job
@@ -193,16 +233,15 @@ func (m *BgProcessManager) Kill(ctx context.Context, vm *vmem.Manager, jobID str
 
 	job.mu.Lock()
 	alreadyDone := job.done
-	var pid int
-	if job.cmd != nil && job.cmd.Process != nil {
-		pid = job.cmd.Process.Pid
-	}
 	job.mu.Unlock()
 
-	if !alreadyDone && pid > 0 {
-		// Kill entire process group (-pid).
-		_ = syscall.Kill(-pid, syscall.SIGKILL)
-		_ = syscall.Kill(pid, syscall.SIGKILL)
+	if !alreadyDone && job.cmd != nil && job.cmd.Process != nil {
+		if job.sandboxed {
+			// Killing the sandbox launcher tears down its whole PID namespace.
+			_ = job.cmd.Process.Kill()
+		} else {
+			killProcTree(job.cmd)
+		}
 		deadline := time.Now().Add(2 * time.Second)
 		for time.Now().Before(deadline) {
 			job.mu.Lock()

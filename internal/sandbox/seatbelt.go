@@ -68,6 +68,18 @@ func GenerateSBPL(spec ExecSpec) string {
 	return b.String()
 }
 
+// Command returns an unstarted sandbox-exec-wrapped command for spec.
+func (s *seatbeltBackend) Command(ctx context.Context, spec ExecSpec) (*exec.Cmd, error) {
+	if s.binPath == "" {
+		return nil, ErrSandboxUnavailable
+	}
+	args := append([]string{"-p", GenerateSBPL(spec), spec.Command}, spec.Args...)
+	cmd := exec.CommandContext(ctx, s.binPath, args...)
+	cmd.Dir = spec.WorkspaceDir
+	cmd.Env = ScrubEnv(spec.ExtraEnv)
+	return cmd, nil
+}
+
 func (s *seatbeltBackend) Exec(ctx context.Context, spec ExecSpec) (ExecResult, error) {
 	if s.binPath == "" {
 		return ExecResult{}, ErrSandboxUnavailable
