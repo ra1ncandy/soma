@@ -48,13 +48,13 @@ func configureEmbedderFromEnv(exec *dag.Executor) {
 func newShadowCmd() *cobra.Command {
 	shCmd := &cobra.Command{
 		Use:   "shadow",
-		Short: "Run and format the reproducible Suite B6 Shadow Gauntlet (soma vs. Hermes/linear)",
+		Short: "Run and format the deterministic Suite B6 kernel conformance gauntlet (scripted provider, no LLM)",
 	}
 
 	var dir, baselinePath, outMD, outJSON string
 	runCmd := &cobra.Command{
 		Use:   "run",
-		Short: "Execute all 4 reproducible shadow gauntlet scenarios and print/write the scorecard",
+		Short: "Run all 4 scenarios with each kernel mechanism enabled and disabled, and print/write the scorecard",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			absDir, err := filepath.Abs(dir)
 			if err != nil {
@@ -66,7 +66,7 @@ func newShadowCmd() *cobra.Command {
 			}
 			defer func() { _ = st.Close() }()
 
-			base := shadow.DefaultHermesBaseline()
+			var base *shadow.BaselineMetrics
 			if strings.TrimSpace(baselinePath) != "" {
 				base, err = shadow.LoadBaselineJSON(baselinePath)
 				if err != nil {
@@ -86,14 +86,14 @@ func newShadowCmd() *cobra.Command {
 			}
 
 			out := cmd.OutOrStdout()
-			fmt.Fprintf(out, "Shadow Gauntlet Complete (gate_passed=%v)\n", rep.Scorecard.GatePassed)
-			fmt.Fprintf(out, "  Completion:   soma=%.1f%% vs linear=%.1f%% (ratio=%.2fx)\n",
-				rep.Scorecard.SomaCompletionRate*100.0, rep.Scorecard.LinearCompletionRate*100.0, rep.Scorecard.CompletionRatio)
-			fmt.Fprintf(out, "  Cache Hit:    %.2f%% | Compactions: %d | Exact Replay: %.0f%%\n",
-				rep.Scorecard.AvgCacheHitRate, rep.Scorecard.TotalCompactions, rep.Scorecard.ExactReplayPassRate)
+			sc := rep.Scorecard
+			fmt.Fprintf(out, "Conformance Gauntlet Complete (gate_passed=%v; scripted provider, no LLM)\n", sc.GatePassed)
+			fmt.Fprintf(out, "  Verified with mechanism enabled:  %d/%d\n", sc.KernelVerified, sc.Tasks)
+			fmt.Fprintf(out, "  Verified with mechanism disabled: %d/%d\n", sc.AblationVerified, sc.Tasks)
+			fmt.Fprintf(out, "  Mechanisms load-bearing: %d/%d | Exact Replay: %.0f%%\n", sc.MechanismsLoadBearing, sc.Tasks, sc.ExactReplayPassRate)
 			for _, t := range rep.Tasks {
-				fmt.Fprintf(out, "  - %-16s [soma=%-4v linear=%-5v] branches=%d graveyard=%d replay=%v (%d steps)\n",
-					t.ID, t.SomaCompleted, t.LinearCompleted, t.BranchesExplored, t.GraveyardEntries, t.ExactReplayVerified, t.ReplayStepsChecked)
+				fmt.Fprintf(out, "  - %-18s [enabled=%-5v disabled=%-5v] branches=%d graveyard=%d replay=%v (%d steps)\n",
+					t.ID, t.KernelVerified, t.AblationVerified, t.BranchesExplored, t.GraveyardEntries, t.ExactReplayVerified, t.ReplayStepsChecked)
 			}
 			if outMD != "" {
 				fmt.Fprintf(out, "Wrote Markdown report: %s\n", outMD)
@@ -108,7 +108,7 @@ func newShadowCmd() *cobra.Command {
 		},
 	}
 	runCmd.Flags().StringVar(&dir, "dir", ".", "Workspace directory for shadow .soma store")
-	runCmd.Flags().StringVar(&baselinePath, "baseline", "", "Optional JSON file overriding Hermes baseline metrics")
+	runCmd.Flags().StringVar(&baselinePath, "baseline", "", "Optional JSON file of external telemetry to attach to the report (unverified, not scored)")
 	runCmd.Flags().StringVar(&outMD, "out-md", "", "Optional output path for Markdown benchmark report")
 	runCmd.Flags().StringVar(&outJSON, "out-json", "", "Optional output path for JSON benchmark report")
 
