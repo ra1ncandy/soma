@@ -165,10 +165,13 @@ func (f CompiledFrame) WireBytes() []byte {
 // DefaultCoreSyscalls returns the canonically sorted core v2.1 syscalls.
 func DefaultCoreSyscalls() []SyscallDef {
 	return []SyscallDef{
+		{Name: "bg_exec", Signature: "bg_exec(command, label?)"},
+		{Name: "bg_kill", Signature: "bg_kill(job_id)"},
+		{Name: "bg_poll", Signature: "bg_poll(job_id)"},
 		{Name: "branch_fork", Signature: "branch_fork(label, reason)"},
 		{Name: "broker_call", Signature: "broker_call(capability, op, params_json)"},
 		{Name: "exec", Signature: "exec(cmd, args_json)"},
-		{Name: "fs_patch", Signature: "fs_patch(path, unified_diff)"},
+		{Name: "fs_patch", Signature: "fs_patch(path, patch)"},
 		{Name: "fs_read", Signature: "fs_read(path)"},
 		{Name: "memory_search", Signature: "memory_search(query, scope?)"},
 		{Name: "page_grep", Signature: "page_grep(page_id, pattern)"},
@@ -176,6 +179,9 @@ func DefaultCoreSyscalls() []SyscallDef {
 		{Name: "page_slice", Signature: "page_slice(page_id, start_line, end_line)"},
 		{Name: "publish_finding", Signature: "publish_finding(summary, page_id?)"},
 		{Name: "tool_search", Signature: "tool_search(query)"},
+		{Name: "vision_analyze", Signature: "vision_analyze(image_path, prompt)"},
+		{Name: "web_extract", Signature: "web_extract(url)"},
+		{Name: "web_search", Signature: "web_search(query, max_results?)"},
 	}
 }
 

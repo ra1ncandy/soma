@@ -13,6 +13,7 @@ import (
 	"github.com/ra1ncandy/soma/internal/dag"
 	"github.com/ra1ncandy/soma/internal/embed"
 	"github.com/ra1ncandy/soma/internal/oracle"
+	"github.com/ra1ncandy/soma/internal/replay"
 	"github.com/ra1ncandy/soma/internal/sandbox"
 	"github.com/ra1ncandy/soma/internal/shadow"
 	"github.com/ra1ncandy/soma/internal/store"
@@ -334,5 +335,75 @@ func newSwarmCmd() *cobra.Command {
 	cmd.Flags().StringVar(&profileName, "profile", "worker", "Model profile (worker|frontier)")
 	cmd.Flags().BoolVar(&useMock, "mock", false, "Use deterministic local simulation provider")
 	cmd.Flags().IntVar(&maxTurns, "max-turns", 8, "Maximum turns per worker")
+	return cmd
+}
+
+func newExportTrajectoriesCmd() *cobra.Command {
+	var dir, runID, format, outPath string
+	var verifiedOnly, requireContract bool
+
+	cmd := &cobra.Command{
+		Use:   "export-trajectories",
+		Short: "Export oracle-verified SFT trajectories or contrastive DPO/GRPO preference pairs as JSONL",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			absDir, err := filepath.Abs(dir)
+			if err != nil {
+				return err
+			}
+			st, err := openStore(absDir)
+			if err != nil {
+				return err
+			}
+			defer func() { _ = st.Close() }()
+
+			rep := replay.NewReplayer(st)
+			opts := replay.ExportOptions{
+				RunID:           runID,
+				VerifiedOnly:    verifiedOnly,
+				RequireContract: requireContract,
+			}
+
+			var raw []byte
+			var count int
+			switch strings.ToLower(strings.TrimSpace(format)) {
+			case "dpo", "grpo", "preference":
+				pairs, err := rep.ExportDPO(cmd.Context(), opts)
+				if err != nil {
+					return err
+				}
+				count = len(pairs)
+				raw, err = replay.EncodeJSONL(pairs)
+				if err != nil {
+					return err
+				}
+			default:
+				examples, err := rep.ExportSFT(cmd.Context(), opts)
+				if err != nil {
+					return err
+				}
+				count = len(examples)
+				raw, err = replay.EncodeJSONL(examples)
+				if err != nil {
+					return err
+				}
+			}
+
+			if strings.TrimSpace(outPath) != "" {
+				if err := os.WriteFile(outPath, raw, 0o644); err != nil {
+					return err
+				}
+				fmt.Fprintf(cmd.OutOrStdout(), "Exported %d %s trajectory record(s) -> %s\n", count, strings.ToUpper(format), outPath)
+				return nil
+			}
+			_, _ = cmd.OutOrStdout().Write(raw)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&dir, "dir", ".", "Workspace directory")
+	cmd.Flags().StringVar(&runID, "run-id", "", "Optional specific run ID (exports all runs when empty)")
+	cmd.Flags().StringVar(&format, "format", "sft", "Export format (sft|dpo)")
+	cmd.Flags().StringVar(&outPath, "out", "", "Optional output .jsonl file path (prints to stdout when empty)")
+	cmd.Flags().BoolVar(&verifiedOnly, "verified-only", true, "Only export completed branches passing required verification oracles")
+	cmd.Flags().BoolVar(&requireContract, "require-contract", false, "Require at least one attached external verification contract")
 	return cmd
 }

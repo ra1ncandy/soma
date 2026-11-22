@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1610,21 +1611,32 @@ func detectWorkspaceKind(wsPath string) string {
 	return "generic"
 }
 
-// LocalToolRunner executes safe workspace-scoped operations (fs_list, fs_read, fs_write, exec, page_slice, page_grep, page_search, memory_search, publish_finding).
+// LocalToolRunner executes safe workspace-scoped operations (fs_list, fs_read, fs_write, fs_patch, exec, bg_exec, bg_poll, bg_kill, page_slice, page_grep, page_search, memory_search, publish_finding, web_search, web_extract, vision_analyze).
 type LocalToolRunner struct {
-	vm         *vmem.Manager
-	Sandbox    *sandbox.Manager
-	Blackboard *Blackboard
+	vm             *vmem.Manager
+	Sandbox        *sandbox.Manager
+	Blackboard     *Blackboard
+	BgProcs        *BgProcessManager
+	HTTPClient     *http.Client
+	SearchEndpoint string
+	VisionBaseURL  string
 }
 
 // NewLocalToolRunner constructs a workspace-scoped tool runner.
 func NewLocalToolRunner(vm *vmem.Manager) *LocalToolRunner {
-	return &LocalToolRunner{vm: vm}
+	return &LocalToolRunner{
+		vm:      vm,
+		BgProcs: NewBgProcessManager(),
+	}
 }
 
 // NewSandboxedToolRunner constructs a workspace-scoped tool runner executing shell commands inside sbx.
 func NewSandboxedToolRunner(vm *vmem.Manager, sbx *sandbox.Manager) *LocalToolRunner {
-	return &LocalToolRunner{vm: vm, Sandbox: sbx}
+	return &LocalToolRunner{
+		vm:      vm,
+		Sandbox: sbx,
+		BgProcs: NewBgProcessManager(),
+	}
 }
 
 func (r *LocalToolRunner) Execute(ctx context.Context, call ToolCall) (ToolOutput, error) {
@@ -1703,6 +1715,102 @@ func (r *LocalToolRunner) Execute(ctx context.Context, call ToolCall) (ToolOutpu
 			Content:   []byte(fmt.Sprintf("wrote %d bytes to %s", len(content), rel)),
 			TrustTier: "trusted_repo",
 		}, nil
+
+	case "fs_patch":
+		rel, _ := args["path"].(string)
+		target, err := resolveInsideWorkspace(call.WorkspaceDir, rel)
+		if err != nil {
+			return ToolOutput{}, err
+		}
+		origBytes, err := os.ReadFile(target)
+		if err != nil {
+			return ToolOutput{}, err
+		}
+		patchText, _ := args["patch"].(string)
+		if patchText == "" {
+			patchText, _ = args["unified_diff"].(string)
+		}
+		var explicit []HunkSpec
+		if sVal, ok := args["search"].(string); ok && sVal != "" {
+			rVal, _ := args["replace"].(string)
+			repAll, _ := args["replace_all"].(bool)
+			explicit = append(explicit, HunkSpec{Search: sVal, Replace: rVal, ReplaceAll: repAll})
+		}
+		patched, appliedCount, err := ApplyFilePatch(string(origBytes), patchText, explicit)
+		if err != nil {
+			return ToolOutput{}, err
+		}
+		if err := os.WriteFile(target, []byte(patched), 0o644); err != nil {
+			return ToolOutput{}, err
+		}
+		return ToolOutput{
+			NameHint:  rel,
+			Content:   []byte(fmt.Sprintf("patched %s (%d hunk(s) applied, %d bytes)", rel, appliedCount, len(patched))),
+			TrustTier: "trusted_repo",
+		}, nil
+
+	case "bg_exec":
+		command, _ := args["command"].(string)
+		label, _ := args["label"].(string)
+		if r.BgProcs == nil {
+			r.BgProcs = NewBgProcessManager()
+		}
+		jobID, err := r.BgProcs.Start(call.RunID, call.WorkspaceDir, command, label)
+		if err != nil {
+			return ToolOutput{}, err
+		}
+		return ToolOutput{
+			NameHint:  "bg_exec.txt",
+			Content:   []byte(fmt.Sprintf("started background job %s (use bg_poll(%q) to inspect output/@page or bg_kill(%q) to stop)", jobID, jobID, jobID)),
+			TrustTier: "trusted_repo",
+		}, nil
+
+	case "bg_poll":
+		jobID, _ := args["job_id"].(string)
+		if r.BgProcs == nil {
+			return ToolOutput{}, errors.New("bg_poll: no background jobs started")
+		}
+		out, err := r.BgProcs.Poll(ctx, r.vm, jobID, 3*1024)
+		if err != nil {
+			return ToolOutput{}, err
+		}
+		return ToolOutput{
+			NameHint:  "bg_poll.txt",
+			Content:   []byte(out),
+			TrustTier: "trusted_repo",
+		}, nil
+
+	case "bg_kill":
+		jobID, _ := args["job_id"].(string)
+		if r.BgProcs == nil {
+			return ToolOutput{}, errors.New("bg_kill: no background jobs started")
+		}
+		out, err := r.BgProcs.Kill(ctx, r.vm, jobID, 3*1024)
+		if err != nil {
+			return ToolOutput{}, err
+		}
+		return ToolOutput{
+			NameHint:  "bg_kill.txt",
+			Content:   []byte(out),
+			TrustTier: "trusted_repo",
+		}, nil
+
+	case "web_search":
+		query, _ := args["query"].(string)
+		maxF, _ := args["max_results"].(float64)
+		return ExecuteWebSearch(ctx, r.HTTPClient, r.SearchEndpoint, query, int(maxF))
+
+	case "web_extract":
+		targetURL, _ := args["url"].(string)
+		return ExecuteWebExtract(ctx, r.HTTPClient, targetURL)
+
+	case "vision_analyze":
+		imgPath, _ := args["image_path"].(string)
+		if imgPath == "" {
+			imgPath, _ = args["path"].(string)
+		}
+		prompt, _ := args["prompt"].(string)
+		return ExecuteVisionAnalyze(ctx, r.HTTPClient, r.VisionBaseURL, "", "", call.WorkspaceDir, imgPath, prompt)
 
 	case "exec":
 		command, _ := args["command"].(string)

@@ -118,6 +118,49 @@ func canonicalOpenAITools() []map[string]any {
 		{
 			"type": "function",
 			"function": map[string]any{
+				"name":        "bg_exec",
+				"description": "Start a long-running background shell command inside the workspace and return a job_id.",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"command": map[string]any{"type": "string", "description": "Shell command to run in background"},
+						"label":   map[string]any{"type": "string", "description": "Optional human-readable job label"},
+					},
+					"required": []string{"command"},
+				},
+			},
+		},
+		{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "bg_kill",
+				"description": "Terminate a background job by job_id and return its final output/@page snapshot.",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"job_id": map[string]any{"type": "string", "description": "Background job ID (e.g. bg_0001)"},
+					},
+					"required": []string{"job_id"},
+				},
+			},
+		},
+		{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "bg_poll",
+				"description": "Check status and output of a background job (large outputs spill to @page handles).",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"job_id": map[string]any{"type": "string", "description": "Background job ID (e.g. bg_0001)"},
+					},
+					"required": []string{"job_id"},
+				},
+			},
+		},
+		{
+			"type": "function",
+			"function": map[string]any{
 				"name":        "exec",
 				"description": "Execute a shell command inside the isolated branch workspace.",
 				"parameters": map[string]any{
@@ -139,6 +182,23 @@ func canonicalOpenAITools() []map[string]any {
 					"properties": map[string]any{
 						"path": map[string]any{"type": "string", "description": "Optional relative subdirectory (default '.')"},
 					},
+				},
+			},
+		},
+		{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "fs_patch",
+				"description": "Apply single or multi-hunk SEARCH/REPLACE blocks or a unified diff to a workspace file with fuzzy indentation tolerance.",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"patch":   map[string]any{"type": "string", "description": "<<<<<<< SEARCH ... ======= ... >>>>>>> REPLACE block(s) or unified diff"},
+						"path":    map[string]any{"type": "string", "description": "Relative target file path"},
+						"replace": map[string]any{"type": "string", "description": "Optional explicit replacement snippet when not using patch field"},
+						"search":  map[string]any{"type": "string", "description": "Optional explicit search snippet when not using patch field"},
+					},
+					"required": []string{"path"},
 				},
 			},
 		},
@@ -244,6 +304,50 @@ func canonicalOpenAITools() []map[string]any {
 						"summary": map[string]any{"type": "string", "description": "Concise finding summary to deliver to sibling agents"},
 					},
 					"required": []string{"summary"},
+				},
+			},
+		},
+		{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "vision_analyze",
+				"description": "Inspect a workspace image file (dimensions, format, and multimodal visual/OCR analysis).",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"image_path": map[string]any{"type": "string", "description": "Relative path to image file inside workspace"},
+						"prompt":     map[string]any{"type": "string", "description": "Visual question or analysis instruction"},
+					},
+					"required": []string{"image_path"},
+				},
+			},
+		},
+		{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "web_extract",
+				"description": "Fetch an HTTP/HTTPS URL and extract clean readable text (marked untrusted_external for provenance taint).",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"url": map[string]any{"type": "string", "description": "Target http:// or https:// URL"},
+					},
+					"required": []string{"url"},
+				},
+			},
+		},
+		{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "web_search",
+				"description": "Search the web for documentation, issues, or technical references (marked untrusted_external).",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"max_results": map[string]any{"type": "integer", "description": "Optional max results (default 5)"},
+						"query":       map[string]any{"type": "string", "description": "Web search query"},
+					},
+					"required": []string{"query"},
 				},
 			},
 		},
@@ -487,9 +591,9 @@ func (p *OpenAICompatProvider) Generate(ctx context.Context, req GenerateRequest
 
 func inferToolEffectClass(toolName string) taint.EffectClass {
 	switch toolName {
-	case "fs_read", "fs_list", "page_slice", "page_grep", "page_search", "memory_search", "publish_finding":
+	case "fs_read", "fs_list", "page_slice", "page_grep", "page_search", "memory_search", "publish_finding", "bg_poll", "web_search", "web_extract", "vision_analyze":
 		return taint.EffectReadOnly
-	case "fs_write", "fs_patch", "exec":
+	case "fs_write", "fs_patch", "exec", "bg_exec", "bg_kill":
 		return taint.EffectWorkspaceWrite
 	default:
 		return taint.EffectReadOnly

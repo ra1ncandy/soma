@@ -127,3 +127,52 @@ func TestBwrapContainmentAndPinnedReadOnlyOracle(t *testing.T) {
 		t.Fatalf("pinned file corrupted! got %q err=%v", string(gotPinned), err)
 	}
 }
+
+func TestDockerAndSSHBackends_BuildArgsAndScrubEnv(t *testing.T) {
+	ws := t.TempDir()
+	pinnedRel := "oracle_check.py"
+	if err := os.WriteFile(filepath.Join(ws, pinnedRel), []byte("assert True\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	dk := NewDockerBackend("python:3.12-slim")
+	dkArgs, err := dk.BuildArgs(ws, ExecSpec{
+		WorkspaceDir:        ws,
+		PinnedReadOnlyFiles: []string{pinnedRel},
+		AllowNetwork:        false,
+		Command:             "python3",
+		Args:                []string{"oracle_check.py"},
+		ExtraEnv: map[string]string{
+			"OPENAI_API_KEY": "sk-secret",
+			"SOMA_WORKER":    "1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("DockerBackend.BuildArgs: %v", err)
+	}
+	dkJoined := strings.Join(dkArgs, " ")
+	if !strings.Contains(dkJoined, "--network=none") || !strings.Contains(dkJoined, ":/workspace/oracle_check.py:ro") {
+		t.Fatalf("expected --network=none and :ro mount in docker args: %s", dkJoined)
+	}
+	if strings.Contains(dkJoined, "sk-secret") || !strings.Contains(dkJoined, "SOMA_WORKER=1") {
+		t.Fatalf("expected scrubbed env in docker args: %s", dkJoined)
+	}
+
+	sshB := NewSSHBackend("pchan-ml", "/home/ame/soma-remote", "-p", "22")
+	sshArgs := sshB.BuildArgs(ExecSpec{
+		WorkspaceDir: ws,
+		Command:      "python3",
+		Args:         []string{"train.py", "--epochs", "5"},
+		ExtraEnv: map[string]string{
+			"RUNPOD_API_KEY": "rp-secret",
+			"CUDA_VISIBLE":   "0",
+		},
+	})
+	sshJoined := strings.Join(sshArgs, " ")
+	if !strings.Contains(sshJoined, "BatchMode=yes") || !strings.Contains(sshJoined, "pchan-ml") || !strings.Contains(sshJoined, "/home/ame/soma-remote/") {
+		t.Fatalf("unexpected ssh args: %s", sshJoined)
+	}
+	if strings.Contains(sshJoined, "rp-secret") || !strings.Contains(sshJoined, "CUDA_VISIBLE='0'") {
+		t.Fatalf("expected scrubbed env in ssh args: %s", sshJoined)
+	}
+}

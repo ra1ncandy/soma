@@ -1,9 +1,13 @@
 package dag_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"image"
+	"image/color"
+	"image/png"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -118,8 +122,8 @@ func TestOpenAICompatProvider_ToolsSessionCacheAnd429(t *testing.T) {
 		t.Fatalf("expected sticky run-scoped x-opencode-session header, got %q", gotSess)
 	}
 	rawTools, ok := lastReqBody["tools"].([]any)
-	if !ok || len(rawTools) != 9 {
-		t.Fatalf("expected 9 canonical tools in request body, got %+v", lastReqBody["tools"])
+	if !ok || len(rawTools) != 16 {
+		t.Fatalf("expected 16 canonical tools in request body, got %+v", lastReqBody["tools"])
 	}
 
 	// Call 2: normal completion without tool_calls -> Done=true.
@@ -457,4 +461,159 @@ func TestEpochPinnedHybridLayer1MemorySelection(t *testing.T) {
 		}
 		prevPrefix = frame.PrefixHashL0L1
 	}
+}
+
+func TestFSPatchBgProcsAndWebMultimodalTools(t *testing.T) {
+	ctx := context.Background()
+	ws := t.TempDir()
+	st, err := store.Open(filepath.Join(ws, ".soma"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+	_ = st.CreateRun(ctx, store.Run{ID: "run_tools", Title: "tools", WorkspacePath: ws, GoalSpec: "test tools"})
+
+	vm := vmem.NewManager(st)
+	runner := dag.NewLocalToolRunner(vm)
+
+	// 1. Multi-hunk fs_patch with fuzzy indentation tolerance + unified diff + atomic rollback.
+	initialPy := "def alpha():\n    x = 1\n    return x\n\ndef beta():\n    y = 2\n    return y\n"
+	pyPath := filepath.Join(ws, "app.py")
+	if err := os.WriteFile(pyPath, []byte(initialPy), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	patchBlock := "<<<<<<< SEARCH\nx = 1\nreturn x\n=======\nx = 10\nreturn x * 2\n>>>>>>> REPLACE\n<<<<<<< SEARCH\n    y = 2\n=======\n    y = 42\n>>>>>>> REPLACE"
+	_, err = runner.Execute(ctx, dag.ToolCall{
+		RunID:        "run_tools",
+		Name:         "fs_patch",
+		ArgsJSON:     `{"path":"app.py","patch":` + mustJSONQuote(patchBlock) + `}`,
+		WorkspaceDir: ws,
+	})
+	if err != nil {
+		t.Fatalf("fs_patch multi-hunk fuzzy: %v", err)
+	}
+	patchedPy, _ := os.ReadFile(pyPath)
+	if !strings.Contains(string(patchedPy), "    x = 10\n    return x * 2") || !strings.Contains(string(patchedPy), "    y = 42") {
+		t.Fatalf("unexpected patched app.py:\n%s", string(patchedPy))
+	}
+
+	// Verify atomic rollback when 2nd hunk fails.
+	badPatch := "<<<<<<< SEARCH\n    y = 42\n=======\n    y = 999\n>>>>>>> REPLACE\n<<<<<<< SEARCH\nNON_EXISTENT_LINE\n=======\nfoo\n>>>>>>> REPLACE"
+	if _, err := runner.Execute(ctx, dag.ToolCall{
+		RunID:        "run_tools",
+		Name:         "fs_patch",
+		ArgsJSON:     `{"path":"app.py","patch":` + mustJSONQuote(badPatch) + `}`,
+		WorkspaceDir: ws,
+	}); err == nil {
+		t.Fatal("expected error when 2nd hunk fails")
+	}
+	afterFailPy, _ := os.ReadFile(pyPath)
+	if strings.Contains(string(afterFailPy), "999") {
+		t.Fatalf("fs_patch failed to roll back atomically! got:\n%s", string(afterFailPy))
+	}
+
+	// 2. Background process management (bg_exec -> bg_poll -> bg_kill).
+	startOut, err := runner.Execute(ctx, dag.ToolCall{
+		RunID:        "run_tools",
+		Name:         "bg_exec",
+		ArgsJSON:     `{"command":"echo BG_READY_77 && sleep 10","label":"daemon-sim"}`,
+		WorkspaceDir: ws,
+	})
+	if err != nil || !strings.Contains(string(startOut.Content), "bg_0001") {
+		t.Fatalf("bg_exec failed: %s err=%v", string(startOut.Content), err)
+	}
+	time.Sleep(120 * time.Millisecond)
+
+	pollOut, err := runner.Execute(ctx, dag.ToolCall{
+		RunID:        "run_tools",
+		Name:         "bg_poll",
+		ArgsJSON:     `{"job_id":"bg_0001"}`,
+		WorkspaceDir: ws,
+	})
+	if err != nil || !strings.Contains(string(pollOut.Content), "BG_READY_77") {
+		t.Fatalf("bg_poll failed: %s err=%v", string(pollOut.Content), err)
+	}
+
+	killOut, err := runner.Execute(ctx, dag.ToolCall{
+		RunID:        "run_tools",
+		Name:         "bg_kill",
+		ArgsJSON:     `{"job_id":"bg_0001"}`,
+		WorkspaceDir: ws,
+	})
+	if err != nil || !strings.Contains(string(killOut.Content), "exited") {
+		t.Fatalf("bg_kill failed: %s err=%v", string(killOut.Content), err)
+	}
+
+	// 3. Web search, Web extract (with untrusted_external provenance taint), and Vision analyze.
+	webSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/search":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"results": []map[string]string{
+					{"title": "Soma Kernel Docs", "url": "https://example.org/soma", "snippet": "Monotonic 4-layer KV cache kernel"},
+				},
+			})
+		case "/page":
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte(`<html><head><script>alert(1)</script></head><body><h1>Architecture</h1><p>Content-addressed @page virtual memory.</p></body></html>`))
+		case "/v1/chat/completions":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"choices": []map[string]any{{
+					"message": map[string]string{"content": "Detected 32x16 test chart PNG with blue header."},
+				}},
+			})
+		}
+	}))
+	defer webSrv.Close()
+
+	runner.HTTPClient = webSrv.Client()
+	runner.SearchEndpoint = webSrv.URL + "/search"
+	runner.VisionBaseURL = webSrv.URL + "/v1"
+
+	wsOut, err := runner.Execute(ctx, dag.ToolCall{
+		RunID:        "run_tools",
+		Name:         "web_search",
+		ArgsJSON:     `{"query":"soma kernel"}`,
+		WorkspaceDir: ws,
+	})
+	if err != nil || wsOut.TrustTier != "untrusted_external" || !strings.Contains(string(wsOut.Content), "Soma Kernel Docs") {
+		t.Fatalf("web_search unexpected output: %+v err=%v", wsOut, err)
+	}
+
+	weOut, err := runner.Execute(ctx, dag.ToolCall{
+		RunID:        "run_tools",
+		Name:         "web_extract",
+		ArgsJSON:     `{"url":"` + webSrv.URL + `/page"}`,
+		WorkspaceDir: ws,
+	})
+	if err != nil || weOut.TrustTier != "untrusted_external" || strings.Contains(string(weOut.Content), "alert(1)") || !strings.Contains(string(weOut.Content), "Content-addressed @page") {
+		t.Fatalf("web_extract unexpected output: %+v err=%v", weOut, err)
+	}
+
+	// Create a real 32x16 PNG image in workspace and run vision_analyze.
+	img := image.NewRGBA(image.Rect(0, 0, 32, 16))
+	img.Set(0, 0, color.RGBA{R: 10, G: 20, B: 200, A: 255})
+	var pngBuf bytes.Buffer
+	if err := png.Encode(&pngBuf, img); err != nil {
+		t.Fatalf("png.Encode: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(ws, "chart.png"), pngBuf.Bytes(), 0o644); err != nil {
+		t.Fatalf("WriteFile chart.png: %v", err)
+	}
+
+	visOut, err := runner.Execute(ctx, dag.ToolCall{
+		RunID:        "run_tools",
+		Name:         "vision_analyze",
+		ArgsJSON:     `{"image_path":"chart.png","prompt":"Inspect chart dimensions and content"}`,
+		WorkspaceDir: ws,
+	})
+	if err != nil || !strings.Contains(string(visOut.Content), "dimensions=32x16") || !strings.Contains(string(visOut.Content), "Detected 32x16 test chart PNG") {
+		t.Fatalf("vision_analyze unexpected output: %s err=%v", string(visOut.Content), err)
+	}
+}
+
+func mustJSONQuote(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
 }

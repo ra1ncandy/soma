@@ -160,4 +160,33 @@ func TestThreeReplayModes(t *testing.T) {
 	if err != nil || sbBranch.WorkspaceDir == br.WorkspaceDir {
 		t.Fatalf("expected isolated workspace dir for sandbox branch, orig=%s new=%s err=%v", br.WorkspaceDir, sbBranch.WorkspaceDir, err)
 	}
+
+	// 4. Abandon the diverged sandbox branch to the Graveyard and verify ExportSFT + Contrastive ExportDPO!
+	if err := exec.AbandonBranch(ctx, sbRep.SandboxBranchID, "failed held-out dilation check", ""); err != nil {
+		t.Fatalf("AbandonBranch: %v", err)
+	}
+
+	sftList, err := replayer.ExportSFT(ctx, ExportOptions{VerifiedOnly: true})
+	if err != nil {
+		t.Fatalf("ExportSFT: %v", err)
+	}
+	if len(sftList) != 1 || sftList[0].BranchID != branchID || len(sftList[0].Messages) < 4 {
+		t.Fatalf("expected exactly 1 completed SFT trajectory (excluding abandoned branch), got %+v", sftList)
+	}
+
+	dpoPairs, err := replayer.ExportDPO(ctx, ExportOptions{VerifiedOnly: true})
+	if err != nil {
+		t.Fatalf("ExportDPO: %v", err)
+	}
+	if len(dpoPairs) != 1 {
+		t.Fatalf("expected 1 contrastive DPO preference pair (chosen=%s vs rejected=%s), got %+v", branchID, sbRep.SandboxBranchID, dpoPairs)
+	}
+	pair := dpoPairs[0]
+	if pair.ChosenBranchID != branchID || pair.RejectedBranchID != sbRep.SandboxBranchID || pair.GraveyardReason == "" {
+		t.Fatalf("unexpected DPO pair metadata: %+v", pair)
+	}
+	jsonlBytes, err := EncodeJSONL(dpoPairs)
+	if err != nil || len(jsonlBytes) == 0 {
+		t.Fatalf("EncodeJSONL failed: len=%d err=%v", len(jsonlBytes), err)
+	}
 }
