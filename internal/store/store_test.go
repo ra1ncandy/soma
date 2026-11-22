@@ -1,0 +1,431 @@
+package store
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sync"
+	"testing"
+	"time"
+)
+
+func openTestStore(t *testing.T) *Store {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), ".soma")
+	st, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open(%s): %v", dir, err)
+	}
+	t.Cleanup(func() {
+		if err := st.Close(); err != nil {
+			t.Errorf("Close(): %v", err)
+		}
+	})
+	return st
+}
+
+func TestSchemaFKAndBlobs(t *testing.T) {
+	ctx := context.Background()
+	st := openTestStore(t)
+
+	err := st.CreateBranch(ctx, Branch{
+		ID:     "b_orphan",
+		RunID:  "does_not_exist",
+		Label:  "orphan",
+		Status: "queued",
+	})
+	if err == nil {
+		t.Fatal("expected foreign key error for orphan branch, got nil")
+	}
+
+	payload := []byte("hello world log payload repeated data repeated data")
+	h1, rel1, err := st.Blobs().Put(payload)
+	if err != nil {
+		t.Fatalf("Blobs.Put: %v", err)
+	}
+	h2, rel2, err := st.Blobs().Put(payload)
+	if err != nil {
+		t.Fatalf("Blobs.Put duplicate: %v", err)
+	}
+	if h1 != h2 || rel1 != rel2 {
+		t.Fatalf("expected deterministic dedup hash/path, got (%s,%s) vs (%s,%s)", h1, rel1, h2, rel2)
+	}
+	got, err := st.Blobs().Get(h1)
+	if err != nil {
+		t.Fatalf("Blobs.Get: %v", err)
+	}
+	if string(got) != string(payload) {
+		t.Fatalf("blob content mismatch: %q", string(got))
+	}
+
+	absBlob := filepath.Join(st.SomaDir(), rel1)
+	origBytes, err := os.ReadFile(absBlob)
+	if err != nil {
+		t.Fatalf("read raw blob: %v", err)
+	}
+	origBytes[len(origBytes)-1] ^= 0xff
+	if err := os.WriteFile(absBlob, origBytes, 0o644); err != nil {
+		t.Fatalf("corrupt raw blob: %v", err)
+	}
+	if _, err := st.Blobs().Get(h1); err == nil {
+		t.Fatal("expected blob decode or checksum error on corrupted file")
+	}
+}
+
+func TestAncestrySnapshotsJournalDeclassLeases(t *testing.T) {
+	ctx := context.Background()
+	st := openTestStore(t)
+
+	if err := st.CreateRun(ctx, Run{
+		ID:            "run_1",
+		Title:         "Test Run",
+		WorkspacePath: "/tmp/ws",
+		WorkspaceKind: "git",
+		GoalSpec:      "fix bug",
+	}); err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+	if err := st.CreateBranch(ctx, Branch{
+		ID:                "b_main",
+		RunID:             "run_1",
+		Label:             "main",
+		WorkspaceDir:      "/tmp/ws",
+		WorkspaceStrategy: "git_worktree",
+	}); err != nil {
+		t.Fatalf("CreateBranch main: %v", err)
+	}
+
+	hL0, _, _ := st.Blobs().Put([]byte("layer0"))
+	hL1, _, _ := st.Blobs().Put([]byte("layer1"))
+	hDelta, _, _ := st.Blobs().Put([]byte("delta"))
+	if err := st.PutEpochSnapshot(ctx, EpochSnapshot{
+		ID:             "snap_1",
+		RunID:          "run_1",
+		BranchID:       "b_main",
+		Epoch:          1,
+		Layer0BlobHash: hL0,
+		Layer1BlobHash: hL1,
+		PrefixHashL0L1: "pref_1",
+		MetadataJSON:   `{"epoch":1}`,
+	}); err != nil {
+		t.Fatalf("PutEpochSnapshot: %v", err)
+	}
+
+	if err := st.PutPage(ctx, Page{
+		ID:          "page_1",
+		RunID:       "run_1",
+		ContentHash: hDelta,
+		BlobPath:    "blobs/x",
+		ContentType: "log",
+		TrustTier:   "untrusted_external",
+		ByteSize:    100,
+		LineCount:   5,
+		PreviewText: "preview",
+	}); err != nil {
+		t.Fatalf("PutPage: %v", err)
+	}
+
+	if err := st.PrepareAction(ctx, ActionJournalEntry{
+		ActionID:            "act_1",
+		RunID:               "run_1",
+		BranchID:            "b_main",
+		Epoch:               1,
+		TurnIndex:           1,
+		ToolName:            "fs_read",
+		ArgsJSON:            `{"path":"a.go"}`,
+		ArgsHash:            "ah_1",
+		EffectClass:         "read_only",
+		IdempotencyKey:      "idem_1",
+		InputProvenanceJSON: `["page_1"]`,
+	}); err != nil {
+		t.Fatalf("PrepareAction: %v", err)
+	}
+	if err := st.MarkActionDispatched(ctx, "act_1"); err != nil {
+		t.Fatalf("MarkActionDispatched: %v", err)
+	}
+	if err := st.CommitActionAndAppendStep(ctx, "act_1", "page_1", "ok", Step{
+		ID:                  "s1",
+		RunID:               "run_1",
+		BranchID:            "b_main",
+		Epoch:               1,
+		TurnIndex:           1,
+		AccountID:           "acc_1",
+		ModelID:             "m_1",
+		StateHash:           "sh_s1",
+		EpochSnapshotID:     "snap_1",
+		FrameDeltaBlobHash:  hDelta,
+		CompiledFrameHash:   "cfh_1",
+		EmittedBlobHash:     hDelta,
+		ObservationPageID:   "page_1",
+		InputProvenanceJSON: `["page_1"]`,
+	}, BranchUpdate{Epoch: 1, Status: "running"}); err != nil {
+		t.Fatalf("CommitActionAndAppendStep: %v", err)
+	}
+
+	pending, err := st.ListPendingActions(ctx, "b_main")
+	if err != nil {
+		t.Fatalf("ListPendingActions: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("expected 0 pending actions after commit, got %d", len(pending))
+	}
+
+	// Fork b_alt from s1 and append s2.
+	if err := st.CreateBranch(ctx, Branch{
+		ID:               "b_alt",
+		RunID:            "run_1",
+		ParentBranchID:   "b_main",
+		ForkedFromStepID: "s1",
+		Label:            "alt",
+	}); err != nil {
+		t.Fatalf("CreateBranch alt: %v", err)
+	}
+	if err := st.AppendStep(ctx, Step{
+		ID:                 "s2",
+		RunID:              "run_1",
+		BranchID:           "b_alt",
+		ParentStepID:       "s1",
+		Epoch:              1,
+		TurnIndex:          2,
+		AccountID:          "acc_1",
+		ModelID:            "m_1",
+		StateHash:          "sh_s2",
+		EpochSnapshotID:    "snap_1",
+		FrameDeltaBlobHash: hDelta,
+		CompiledFrameHash:  "cfh_2",
+		EmittedBlobHash:    hDelta,
+	}, BranchUpdate{Epoch: 1, Status: "completed"}); err != nil {
+		t.Fatalf("AppendStep s2: %v", err)
+	}
+
+	anc, err := st.GetAncestry(ctx, "s2")
+	if err != nil {
+		t.Fatalf("GetAncestry: %v", err)
+	}
+	if len(anc) != 2 || anc[0].ID != "s1" || anc[1].ID != "s2" {
+		t.Fatalf("unexpected ancestry: %+v", anc)
+	}
+
+	// Declassification scoping check.
+	ok, err := st.HasDeclassification(ctx, "page_1", "http:github.com")
+	if err != nil || ok {
+		t.Fatalf("expected false before declassification, got (%v, %v)", ok, err)
+	}
+	if err := st.AddDeclassification(ctx, Declassification{
+		ID:              "dec_1",
+		PageID:          "page_1",
+		CapabilityScope: "http:github.com",
+		Method:          "schema_parser",
+		ApprovedBy:      "metrics_v1",
+		SchemaName:      "metrics",
+	}); err != nil {
+		t.Fatalf("AddDeclassification: %v", err)
+	}
+	ok, err = st.HasDeclassification(ctx, "page_1", "http:github.com")
+	if err != nil || !ok {
+		t.Fatalf("expected true for matching scope, got (%v, %v)", ok, err)
+	}
+	okOther, err := st.HasDeclassification(ctx, "page_1", "ssh:prod")
+	if err != nil || okOther {
+		t.Fatalf("expected false for unrelated scope, got (%v, %v)", okOther, err)
+	}
+
+	// Remote lease mutual exclusion.
+	if _, err := st.AcquireRemoteLease(ctx, "gpu:pchan:0", "b_main", "runs/run_1/b_main", 60*time.Second); err != nil {
+		t.Fatalf("AcquireRemoteLease b_main: %v", err)
+	}
+	if _, err := st.AcquireRemoteLease(ctx, "gpu:pchan:0", "b_alt", "runs/run_1/b_alt", 60*time.Second); !errors.Is(err, ErrLeaseBusy) {
+		t.Fatalf("expected ErrLeaseBusy for b_alt, got %v", err)
+	}
+	if err := st.ReleaseRemoteLease(ctx, "gpu:pchan:0", "b_main"); err != nil {
+		t.Fatalf("ReleaseRemoteLease: %v", err)
+	}
+	if _, err := st.AcquireRemoteLease(ctx, "gpu:pchan:0", "b_alt", "runs/run_1/b_alt", 60*time.Second); err != nil {
+		t.Fatalf("AcquireRemoteLease b_alt after release: %v", err)
+	}
+
+	// Bi-temporal memory deterministic sorting + edge creation.
+	now := time.Now().Unix()
+	vOld := now - 5
+	for _, n := range []MemoryNode{
+		{ID: "M-002", Scope: "global", Kind: "rule", Content: "second", Enabled: true, Status: "active"},
+		{ID: "M-001", Scope: "global", Kind: "rule", Content: "first", Enabled: true, Status: "active"},
+		{ID: "M-000", Scope: "global", Kind: "rule", Content: "expired", Enabled: true, Status: "active", ValidTo: &vOld},
+	} {
+		if err := st.InsertMemoryNode(ctx, n); err != nil {
+			t.Fatalf("InsertMemoryNode %s: %v", n.ID, err)
+		}
+	}
+	if err := st.AddMemoryEdge(ctx, MemoryEdge{
+		FromNodeID: "M-002",
+		ToNodeID:   "M-000",
+		Relation:   "SUPERSEDES",
+	}); err != nil {
+		t.Fatalf("AddMemoryEdge: %v", err)
+	}
+	active, err := st.ListActiveMemory(ctx, "global", []string{"rule"})
+	if err != nil {
+		t.Fatalf("ListActiveMemory: %v", err)
+	}
+	if len(active) != 2 || active[0].ID != "M-001" || active[1].ID != "M-002" {
+		t.Fatalf("unexpected active memory order/filter: %+v", active)
+	}
+
+	// Inbox item round-trip.
+	if err := st.InsertInboxItem(ctx, InboxItem{
+		ID:       "inbox_1",
+		RunID:    "run_1",
+		BranchID: "b_main",
+		ItemKind: "reconcile",
+		Title:    "Verify action",
+		Summary:  "Check remote result",
+		Urgency:  "urgent",
+	}); err != nil {
+		t.Fatalf("InsertInboxItem: %v", err)
+	}
+	items, err := st.ListInboxItems(ctx, "pending")
+	if err != nil || len(items) != 1 || items[0].ID != "inbox_1" {
+		t.Fatalf("ListInboxItems: %+v, err=%v", items, err)
+	}
+}
+
+func TestSplitPoolConcurrencyNoSQLiteBusy(t *testing.T) {
+	ctx := context.Background()
+	st := openTestStore(t)
+
+	if err := st.CreateRun(ctx, Run{
+		ID:            "run_conc",
+		Title:         "Concurrency",
+		WorkspacePath: "/tmp",
+		GoalSpec:      "stress",
+	}); err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+
+	const writers = 8
+	const readers = 16
+	const iters = 25
+
+	hBlob, _, err := st.Blobs().Put([]byte("snap"))
+	if err != nil {
+		t.Fatalf("Put blob: %v", err)
+	}
+
+	for w := 0; w < writers; w++ {
+		bID := fmt.Sprintf("b_%d", w)
+		if err := st.CreateBranch(ctx, Branch{
+			ID:    bID,
+			RunID: "run_conc",
+			Label: "worker",
+		}); err != nil {
+			t.Fatalf("CreateBranch: %v", err)
+		}
+		if err := st.PutEpochSnapshot(ctx, EpochSnapshot{
+			ID:             fmt.Sprintf("snap_%d", w),
+			RunID:          "run_conc",
+			BranchID:       bID,
+			Epoch:          1,
+			Layer0BlobHash: hBlob,
+			Layer1BlobHash: hBlob,
+			PrefixHashL0L1: "pref",
+			MetadataJSON:   "{}",
+		}); err != nil {
+			t.Fatalf("PutEpochSnapshot: %v", err)
+		}
+	}
+
+	errCh := make(chan error, writers+readers)
+	var wg sync.WaitGroup
+
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(wid int) {
+			defer wg.Done()
+			bID := fmt.Sprintf("b_%d", wid)
+			snapID := fmt.Sprintf("snap_%d", wid)
+			prev := ""
+			for i := 0; i < iters; i++ {
+				payload := []byte(fmt.Sprintf("writer=%d step=%d data=abc", wid, i))
+				h, _, err := st.Blobs().Put(payload)
+				if err != nil {
+					errCh <- err
+					return
+				}
+				sid := fmt.Sprintf("s_%d_%d", wid, i)
+				if err := st.AppendStep(ctx, Step{
+					ID:                 sid,
+					RunID:              "run_conc",
+					BranchID:           bID,
+					ParentStepID:       prev,
+					Epoch:              1,
+					TurnIndex:          i + 1,
+					AccountID:          "acc",
+					ModelID:            "mod",
+					StateHash:          sid,
+					EpochSnapshotID:    snapID,
+					FrameDeltaBlobHash: h,
+					CompiledFrameHash:  h,
+					EmittedBlobHash:    h,
+				}, BranchUpdate{Epoch: 1, Status: "running"}); err != nil {
+					errCh <- err
+					return
+				}
+				prev = sid
+			}
+		}(w)
+	}
+
+	for r := 0; r < readers; r++ {
+		wg.Add(1)
+		go func(rid int) {
+			defer wg.Done()
+			bID := fmt.Sprintf("b_%d", rid%writers)
+			for i := 0; i < iters*2; i++ {
+				if _, err := st.ListBranches(ctx, "run_conc"); err != nil {
+					errCh <- err
+					return
+				}
+				if _, err := st.ListBranchSteps(ctx, bID); err != nil {
+					errCh <- err
+					return
+				}
+			}
+		}(r)
+	}
+
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("concurrent store failure: %v", err)
+		}
+	}
+
+	if err := st.UpsertAccount(ctx, Account{
+		ID:            "sub1",
+		Provider:      "openai-codex",
+		ModelID:       "gpt-6.2-sol",
+		BillingMode:   "subscription",
+		MaxConcurrent: 2,
+	}); err != nil {
+		t.Fatalf("UpsertAccount: %v", err)
+	}
+	nowMs := time.Now().UnixMilli()
+	if err := st.AcquireLease(ctx, "sub1", nowMs); err != nil {
+		t.Fatalf("lease 1: %v", err)
+	}
+	if err := st.AcquireLease(ctx, "sub1", nowMs); err != nil {
+		t.Fatalf("lease 2: %v", err)
+	}
+	if err := st.AcquireLease(ctx, "sub1", nowMs); !errors.Is(err, ErrNoCapacity) {
+		t.Fatalf("expected ErrNoCapacity on 3rd lease, got %v", err)
+	}
+	if err := st.ReleaseLease(ctx, "sub1", 0); err != nil {
+		t.Fatalf("ReleaseLease: %v", err)
+	}
+	if err := st.AcquireLease(ctx, "sub1", nowMs); err != nil {
+		t.Fatalf("lease after release: %v", err)
+	}
+}

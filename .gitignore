@@ -1,0 +1,6 @@
+.soma/
+bin/
+*.db
+*.db-wal
+*.db-shm
+coverage.out
