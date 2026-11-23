@@ -1,21 +1,31 @@
 package dag
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
 	"io/fs"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
+
+	"gopkg.in/yaml.v3"
 
 	"github.com/ra1ncandy/soma/internal/broker"
 	"github.com/ra1ncandy/soma/internal/compiler"
@@ -23,6 +33,7 @@ import (
 	"github.com/ra1ncandy/soma/internal/mcp"
 	"github.com/ra1ncandy/soma/internal/memory"
 	"github.com/ra1ncandy/soma/internal/sandbox"
+	"github.com/ra1ncandy/soma/internal/skills"
 	"github.com/ra1ncandy/soma/internal/store"
 	"github.com/ra1ncandy/soma/internal/taint"
 	"github.com/ra1ncandy/soma/internal/vmem"
@@ -105,6 +116,7 @@ type ToolOutput struct {
 	TrustTier string
 	StateHash string
 	Summary   string
+	Viewport  *compiler.ViewportFrame
 }
 
 // ToolRunner executes syscalls or mocked tools.
@@ -214,6 +226,7 @@ type Executor struct {
 	AccountIDs          []string
 	AllowFailover       bool
 	EnforceStallBreaker bool
+	GUIConfig           *GUISubagentConfig
 	AfterDispatchHook   func(ctx context.Context, entry store.ActionJournalEntry) error
 	seq                 atomic.Uint64
 }
@@ -249,8 +262,13 @@ func NewExecutor(
 		Profile:           prof,
 		MaxLayer1Memories: 25,
 	}
-	if lt, ok := ex.Tools.(*LocalToolRunner); ok && lt.ForkBranchFunc == nil {
-		lt.ForkBranchFunc = ex.forkBranchFromCurrentHead
+	if lt, ok := ex.Tools.(*LocalToolRunner); ok {
+		if lt.ForkBranchFunc == nil {
+			lt.ForkBranchFunc = ex.forkBranchFromCurrentHead
+		}
+		if lt.GUITaskFunc == nil {
+			lt.GUITaskFunc = ex.RunGUISubagent
+		}
 	}
 	return ex
 }
@@ -598,7 +616,7 @@ func (e *Executor) ReconcileAction(ctx context.Context, actionID string, outcome
 // ExecuteBranch runs or resumes branchID up to maxTurns, handling 429s, crashes, rollovers, and provenance.
 func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns int) (*BranchResult, error) {
 	if maxTurns <= 0 {
-		maxTurns = 50
+		maxTurns = 100
 	}
 	branch, err := e.Store.GetBranch(ctx, branchID)
 	if err != nil {
@@ -647,7 +665,9 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 	}
 
 	lastStateHash := ""
+	prevStateHash := ""
 	lastOracleError := ""
+	var currentViewport *compiler.ViewportFrame
 	if branch.HeadStepID != "" {
 		if hs, err := e.Store.GetStep(ctx, branch.HeadStepID); err == nil {
 			lastStateHash = hs.StateHash
@@ -709,6 +729,7 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 			AccountQuotaSummary: fmt.Sprintf("%s:%s", acc.ID, acc.ModelID),
 			StallCount:          branch.StallCount,
 			MaxStalls:           e.Profile.MaxStalls,
+			Viewport:            currentViewport,
 		}
 
 		// Drain any pending cross-agent Blackboard findings/graveyard notices into Layer 2 (keeping Layer 0+1 frozen).
@@ -801,11 +822,12 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 		res.TotalTokens += genResp.InputTokens + genResp.CacheReadTokens + genResp.OutputTokens
 		res.CacheReadToks += genResp.CacheReadTokens
 
-		if genResp.StateHash != "" && genResp.StateHash == lastStateHash {
+		if genResp.StateHash != "" && (genResp.StateHash == lastStateHash || (prevStateHash != "" && genResp.StateHash == prevStateHash)) {
 			branch.StallCount++
 		} else {
 			branch.StallCount = 0
 		}
+		prevStateHash = lastStateHash
 		lastStateHash = genResp.StateHash
 
 		calls := genResp.ToolCalls
@@ -925,7 +947,18 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 		planned := make([]plannedCall, len(calls))
 		var allRefs []string
 		for idx, tc := range calls {
-			if tc.EffectClass == "" {
+			if tc.Name == "mcp_call" {
+				var mcpMgr *mcp.Manager
+				switch runner := e.Tools.(type) {
+				case *LocalToolRunner:
+					mcpMgr = runner.MCPManager
+				case *restrictedGUIToolRunner:
+					if runner.base != nil {
+						mcpMgr = runner.base.MCPManager
+					}
+				}
+				tc.EffectClass = resolveMCPCallEffectClass(mcpMgr, tc.ArgsJSON)
+			} else if tc.EffectClass == "" {
 				tc.EffectClass = inferToolEffectClass(tc.Name)
 			}
 			// The model only declares the pages it chooses to cite. For anything leaving the
@@ -1006,17 +1039,26 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 		var lastActionID, lastObsPageID, lastObsText string
 		var hasCommittedAction bool
 
-		for idx, pc := range planned {
-			tc := pc.spec
-			var obsText, obsPageID string
-			if pc.decision == taint.DecisionDeny {
-				obsText = "POLICY DENY: " + pc.reason
-			} else {
-				if hasCommittedAction {
-					if err := e.Store.MarkActionStatus(ctx, lastActionID, "committed", lastObsPageID, lastObsText, ""); err != nil {
-						return res, err
-					}
+		// Execute batched read-only tool calls concurrently while preserving deterministic
+		// journal/observation commit order (0..N-1).
+		canParallelReadOnly := len(planned) > 1 && e.AfterDispatchHook == nil
+		if canParallelReadOnly {
+			for _, pc := range planned {
+				if pc.decision == taint.DecisionDeny || pc.spec.EffectClass != taint.EffectReadOnly {
+					canParallelReadOnly = false
+					break
 				}
+			}
+		}
+
+		type batchExecOutcome struct {
+			out ToolOutput
+			err error
+		}
+		var parallelOutcomes []batchExecOutcome
+		if canParallelReadOnly {
+			for _, pc := range planned {
+				tc := pc.spec
 				entry := store.ActionJournalEntry{
 					ActionID:            pc.actionID,
 					RunID:               run.ID,
@@ -1038,23 +1080,91 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 				if err := e.Store.MarkActionDispatched(ctx, pc.actionID); err != nil {
 					return res, err
 				}
+			}
+			parallelOutcomes = make([]batchExecOutcome, len(planned))
+			sem := make(chan struct{}, 8)
+			var wg sync.WaitGroup
+			for idx, pc := range planned {
+				wg.Add(1)
+				go func(i int, p plannedCall) {
+					defer wg.Done()
+					sem <- struct{}{}
+					defer func() { <-sem }()
+					out, execErr := e.Tools.Execute(ctx, ToolCall{
+						ActionID:          p.actionID,
+						IdempotencyKey:    p.idemKey,
+						RunID:             run.ID,
+						BranchID:          branch.ID,
+						BranchLabel:       branch.Label,
+						Name:              p.spec.Name,
+						ArgsJSON:          p.spec.ArgsJSON,
+						EffectClass:       p.spec.EffectClass,
+						CapabilityScope:   p.spec.CapabilityScope,
+						WorkspaceDir:      branch.WorkspaceDir,
+						ReferencedPageIDs: p.spec.ReferencedPageIDs,
+					})
+					parallelOutcomes[i] = batchExecOutcome{out: out, err: execErr}
+				}(idx, pc)
+			}
+			wg.Wait()
+		}
 
-				out, execErr := e.Tools.Execute(ctx, ToolCall{
-					ActionID:          pc.actionID,
-					IdempotencyKey:    pc.idemKey,
-					RunID:             run.ID,
-					BranchID:          branch.ID,
-					BranchLabel:       branch.Label,
-					Name:              tc.Name,
-					ArgsJSON:          tc.ArgsJSON,
-					EffectClass:       tc.EffectClass,
-					CapabilityScope:   tc.CapabilityScope,
-					WorkspaceDir:      branch.WorkspaceDir,
-					ReferencedPageIDs: tc.ReferencedPageIDs,
-				})
-				if e.AfterDispatchHook != nil {
-					if hookErr := e.AfterDispatchHook(ctx, entry); hookErr != nil {
-						return res, hookErr
+		for idx, pc := range planned {
+			tc := pc.spec
+			var obsText, obsPageID string
+			if pc.decision == taint.DecisionDeny {
+				obsText = "POLICY DENY: " + pc.reason
+			} else {
+				if hasCommittedAction {
+					if err := e.Store.MarkActionStatus(ctx, lastActionID, "committed", lastObsPageID, lastObsText, ""); err != nil {
+						return res, err
+					}
+				}
+				var out ToolOutput
+				var execErr error
+				if canParallelReadOnly {
+					out = parallelOutcomes[idx].out
+					execErr = parallelOutcomes[idx].err
+				} else {
+					entry := store.ActionJournalEntry{
+						ActionID:            pc.actionID,
+						RunID:               run.ID,
+						BranchID:            branch.ID,
+						ParentStepID:        branch.HeadStepID,
+						Epoch:               snap.Epoch,
+						TurnIndex:           nextTurn,
+						ToolName:            tc.Name,
+						ArgsJSON:            tc.ArgsJSON,
+						ArgsHash:            pc.argsHash,
+						EffectClass:         string(tc.EffectClass),
+						IdempotencyKey:      pc.idemKey,
+						InputProvenanceJSON: pc.provJSON,
+						Status:              "prepared",
+					}
+					if err := e.Store.PrepareAction(ctx, entry); err != nil {
+						return res, err
+					}
+					if err := e.Store.MarkActionDispatched(ctx, pc.actionID); err != nil {
+						return res, err
+					}
+
+					out, execErr = e.Tools.Execute(ctx, ToolCall{
+						ActionID:          pc.actionID,
+						IdempotencyKey:    pc.idemKey,
+						RunID:             run.ID,
+						BranchID:          branch.ID,
+						BranchLabel:       branch.Label,
+						Name:              tc.Name,
+						ArgsJSON:          tc.ArgsJSON,
+						EffectClass:       tc.EffectClass,
+						CapabilityScope:   tc.CapabilityScope,
+						WorkspaceDir:      branch.WorkspaceDir,
+						ReferencedPageIDs: tc.ReferencedPageIDs,
+					})
+					if e.AfterDispatchHook != nil {
+						if hookErr := e.AfterDispatchHook(ctx, entry); hookErr != nil {
+							return res, hookErr
+						}
 					}
 				}
 				if execErr != nil {
@@ -1079,6 +1189,9 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 					} else {
 						obsText = obsRes.InlineText
 					}
+					if out.Viewport != nil {
+						currentViewport = out.Viewport
+					}
 				}
 				lastActionID = pc.actionID
 				lastObsPageID = obsPageID
@@ -1088,8 +1201,10 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 
 			entryReasoning := genResp.Reasoning
 			asstContent := ""
+			asstReasoningContent := ""
 			if idx == 0 {
 				asstContent = genResp.AssistantContent
+				asstReasoningContent = genResp.ReasoningContent
 			} else {
 				entryReasoning = fmt.Sprintf("batched tool call (%d/%d)", idx+1, len(planned))
 			}
@@ -1104,6 +1219,7 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 				ToolName:         tc.Name,
 				ArgsJSON:         tc.ArgsJSON,
 				AssistantContent: asstContent,
+				ReasoningContent: asstReasoningContent,
 				Reasoning:        entryReasoning,
 				Action:           fmt.Sprintf("%s(%s)", tc.Name, tc.ArgsJSON),
 				Observation:      obsText,
@@ -1647,11 +1763,12 @@ func (e *Executor) loadMemoryAndGraveyard(ctx context.Context, runID string) ([]
 	var grave []compiler.GraveyardEntry
 	for _, n := range nodes {
 		if n.Kind == "negative_path" {
+			approach, reason := parseGraveyardContent(n.Content)
 			grave = append(grave, compiler.GraveyardEntry{
 				ID:                n.ID,
 				SignatureHash:     n.SignatureHash,
-				AttemptedApproach: n.Content,
-				FailureReason:     n.Content,
+				AttemptedApproach: approach,
+				FailureReason:     reason,
 				EvidencePageID:    n.EvidencePageID,
 			})
 		} else {
@@ -1691,8 +1808,34 @@ func (e *Executor) loadMemoryAndGraveyard(ctx context.Context, runID string) ([]
 	return mem, grave, nil
 }
 
+func parseGraveyardContent(content string) (string, string) {
+	// Parse structured format written by AbandonBranch: approach="<label>" reason="<reason>"
+	if strings.HasPrefix(content, "approach=") {
+		if idx := strings.Index(content, " reason="); idx > len("approach=") {
+			rawApp := strings.TrimSpace(content[len("approach="):idx])
+			rawRea := strings.TrimSpace(content[idx+len(" reason="):])
+			if unq, err := strconvUnquote(rawApp); err == nil {
+				rawApp = unq
+			}
+			if unq, err := strconvUnquote(rawRea); err == nil {
+				rawRea = unq
+			}
+			return rawApp, rawRea
+		}
+	}
+	return "abandoned_path", content
+}
+
+func strconvUnquote(s string) (string, error) {
+	var out string
+	if err := json.Unmarshal([]byte(s), &out); err != nil {
+		return s, err
+	}
+	return out, nil
+}
+
 func defaultKernelSystemPrompt() string {
-	return "You are soma, executing inside an isolated branch workspace. Available workspace tools: fs_list, fs_read, fs_write, exec, page_grep, page_slice. When large outputs spill to @page_XXXX handles, inspect them using page_grep(page_id, pattern) or page_slice(page_id, start_line, end_line) instead of guessing. You may emit multiple tool calls in a single turn (e.g. reading or grepping multiple files/pages at once, or writing multiple required output files in one turn). Verify all edits before declaring completion."
+	return "You are soma, executing inside an isolated branch workspace. Available workspace tools: fs_list, fs_grep, fs_read(path, start_line?, end_line?), fs_write, fs_patch, exec(command, timeout_sec?), bg_exec, bg_poll(job_id, wait_seconds?), bg_kill, page_grep(page_id, pattern, context_lines?, ignore_case?), page_slice, page_search, memory_search, publish_finding, web_extract. Efficiency & rigor rules: (1) Batch independent read-only calls (fs_list, fs_grep, fs_read, page_grep, page_slice) in a single turn — they execute in parallel. (2) Use fs_grep to locate symbols, log lines, configs, or motifs across files instead of reading whole directories; use fs_read with start_line/end_line or page_grep/page_slice/page_search on spilled @page_XXXX handles instead of guessing. (3) Prefer fs_patch for targeted edits to existing files to preserve untouched code/configs. (4) For heavy compute, tests, or long-running processes, pass timeout_sec to exec (up to 300s) or use bg_exec + bg_poll(job_id, wait_seconds). (5) For difficult research and engineering tasks, form explicit hypotheses, verify edge cases, numerical/causal invariants, and boundary conditions with tests before declaring completion."
 }
 
 func (e *Executor) buildEpochInput(run store.Run, activeMem []compiler.MemoryEntry, grave []compiler.GraveyardEntry) compiler.EpochInput {
@@ -1729,7 +1872,10 @@ type LocalToolRunner struct {
 	Sandbox        *sandbox.Manager
 	Broker         *broker.Router
 	MCPCatalog     *mcp.EpochCatalog
+	MCPManager     *mcp.Manager
 	ForkBranchFunc func(ctx context.Context, runID, fromBranchID, label, reason string) (string, error)
+	GUITaskFunc    func(ctx context.Context, runID, parentBranchID, mode, goal, startURL string, maxSteps int) (ToolOutput, error)
+	SkillRoots     []string
 	Blackboard     *Blackboard
 	BgProcs        *BgProcessManager
 	HTTPClient     *http.Client
@@ -1795,8 +1941,11 @@ func (r *LocalToolRunner) Execute(ctx context.Context, call ToolCall) (ToolOutpu
 				return walkErr
 			}
 			base := d.Name()
-			if d.IsDir() && (base == ".git" || base == ".soma") {
-				return filepath.SkipDir
+			if base == ".git" || base == ".soma" {
+				if d.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
 			}
 			if p == root || d.IsDir() {
 				return nil
@@ -1816,6 +1965,193 @@ func (r *LocalToolRunner) Execute(ctx context.Context, call ToolCall) (ToolOutpu
 		}
 		return ToolOutput{NameHint: "fs_list.txt", Content: []byte(strings.Join(paths, "\n")), TrustTier: "trusted_repo"}, nil
 
+	case "fs_grep":
+		pattern, _ := args["pattern"].(string)
+		if strings.TrimSpace(pattern) == "" {
+			return ToolOutput{}, errors.New("fs_grep requires non-empty pattern")
+		}
+		ignoreCase, _ := args["ignore_case"].(bool)
+		ctxF, _ := args["context_lines"].(float64)
+		ctxLines := int(ctxF)
+		if ctxLines < 0 {
+			ctxLines = 0
+		}
+		if ctxLines > 5 {
+			ctxLines = 5
+		}
+		expr := pattern
+		if ignoreCase && !strings.HasPrefix(expr, "(?i)") {
+			expr = "(?i)" + expr
+		}
+		re, err := regexp.Compile(expr)
+		if err != nil {
+			return ToolOutput{}, fmt.Errorf("fs_grep invalid pattern: %w", err)
+		}
+		rel, _ := args["path"].(string)
+		root := call.WorkspaceDir
+		if strings.TrimSpace(rel) != "" && rel != "." {
+			target, err := resolveInsideWorkspace(call.WorkspaceDir, rel)
+			if err != nil {
+				return ToolOutput{}, err
+			}
+			root = target
+		}
+		globPat, _ := args["glob"].(string)
+		globPat = strings.TrimSpace(globPat)
+
+		const (
+			maxMatches      = 80
+			maxFileBytes    = 8 << 20 // 8 MiB per file cap
+			maxLineChars    = 400
+			maxScannedFiles = 2000
+		)
+		var outLines []string
+		totalMatches := 0
+		matchedFiles := 0
+		scannedFiles := 0
+
+		searchFile := func(p string) error {
+			info, sErr := os.Stat(p)
+			if sErr != nil || info.IsDir() || info.Size() > maxFileBytes {
+				return nil
+			}
+			relPath, rErr := filepath.Rel(call.WorkspaceDir, p)
+			if rErr != nil {
+				return nil
+			}
+			relSlash := filepath.ToSlash(relPath)
+			if globPat != "" {
+				mBase, _ := filepath.Match(globPat, filepath.Base(relSlash))
+				mFull, _ := filepath.Match(globPat, relSlash)
+				if !mBase && !mFull {
+					return nil
+				}
+			}
+			scannedFiles++
+			if scannedFiles > maxScannedFiles {
+				return fs.SkipAll
+			}
+			raw, rErr := os.ReadFile(p)
+			if rErr != nil {
+				return nil
+			}
+			// Skip binary files (NUL byte in first 4 KB).
+			sampleLen := len(raw)
+			if sampleLen > 4096 {
+				sampleLen = 4096
+			}
+			if bytes.IndexByte(raw[:sampleLen], 0) >= 0 {
+				return nil
+			}
+			lines := strings.Split(strings.ReplaceAll(string(raw), "\r\n", "\n"), "\n")
+			var fileMatchIdxs []int
+			for i, line := range lines {
+				if re.MatchString(line) {
+					totalMatches++
+					if len(outLines) < maxMatches*6 && totalMatches <= maxMatches {
+						fileMatchIdxs = append(fileMatchIdxs, i)
+					}
+				}
+			}
+			if len(fileMatchIdxs) == 0 {
+				return nil
+			}
+			matchedFiles++
+			if ctxLines == 0 {
+				for _, idx := range fileMatchIdxs {
+					line := lines[idx]
+					if len(line) > maxLineChars {
+						line = line[:maxLineChars-3] + "..."
+					}
+					outLines = append(outLines, fmt.Sprintf("%s:L%d: %s", relSlash, idx+1, line))
+				}
+			} else {
+				mSet := make(map[int]bool, len(fileMatchIdxs))
+				for _, idx := range fileMatchIdxs {
+					mSet[idx] = true
+				}
+				lastEmitted := -2
+				for _, idx := range fileMatchIdxs {
+					lo := idx - ctxLines
+					if lo < 0 {
+						lo = 0
+					}
+					hi := idx + ctxLines
+					if hi >= len(lines) {
+						hi = len(lines) - 1
+					}
+					if lastEmitted >= 0 && lo > lastEmitted+1 {
+						outLines = append(outLines, "--")
+					}
+					for j := lo; j <= hi; j++ {
+						if j <= lastEmitted {
+							continue
+						}
+						sep := "-"
+						if mSet[j] {
+							sep = ":"
+						}
+						line := lines[j]
+						if len(line) > maxLineChars {
+							line = line[:maxLineChars-3] + "..."
+						}
+						outLines = append(outLines, fmt.Sprintf("%s:L%d%s %s", relSlash, j+1, sep, line))
+						lastEmitted = j
+					}
+				}
+			}
+			return nil
+		}
+
+		var filePaths []string
+		if info, sErr := os.Stat(root); sErr == nil && !info.IsDir() {
+			filePaths = []string{root}
+		} else {
+			err = filepath.WalkDir(root, func(p string, d fs.DirEntry, walkErr error) error {
+				if walkErr != nil {
+					return walkErr
+				}
+				base := d.Name()
+				if base == ".git" || base == ".soma" || base == "node_modules" || base == "__pycache__" {
+					if d.IsDir() {
+						return filepath.SkipDir
+					}
+					return nil
+				}
+				if d.IsDir() {
+					return nil
+				}
+				filePaths = append(filePaths, p)
+				return nil
+			})
+			if err != nil {
+				return ToolOutput{}, err
+			}
+			sort.Strings(filePaths)
+		}
+		for _, fp := range filePaths {
+			if err := searchFile(fp); errors.Is(err, fs.SkipAll) {
+				break
+			}
+		}
+		if totalMatches == 0 {
+			return ToolOutput{
+				NameHint:  "fs_grep.txt",
+				Content:   []byte(fmt.Sprintf("fs_grep: 0 matches for %q across %d file(s)", pattern, scannedFiles)),
+				TrustTier: "trusted_repo",
+			}, nil
+		}
+		shown := totalMatches
+		if shown > maxMatches {
+			shown = maxMatches
+		}
+		header := fmt.Sprintf("fs_grep: %d match(es) in %d file(s) for %q (showing %d):", totalMatches, matchedFiles, pattern, shown)
+		return ToolOutput{
+			NameHint:  "fs_grep.txt",
+			Content:   []byte(header + "\n" + strings.Join(outLines, "\n")),
+			TrustTier: "trusted_repo",
+		}, nil
+
 	case "fs_read":
 		rel, _ := args["path"].(string)
 		target, err := resolveInsideWorkspace(call.WorkspaceDir, rel)
@@ -1825,6 +2161,42 @@ func (r *LocalToolRunner) Execute(ctx context.Context, call ToolCall) (ToolOutpu
 		data, err := os.ReadFile(target)
 		if err != nil {
 			return ToolOutput{}, err
+		}
+		startF, hasStart := args["start_line"].(float64)
+		endF, hasEnd := args["end_line"].(float64)
+		if hasStart || hasEnd {
+			lines := strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n")
+			if len(lines) > 0 && lines[len(lines)-1] == "" {
+				lines = lines[:len(lines)-1]
+			}
+			startLine := int(startF)
+			if startLine < 1 {
+				startLine = 1
+			}
+			endLine := int(endF)
+			if endLine < startLine {
+				endLine = startLine + 199
+			}
+			const maxReadRange = 400
+			if endLine-startLine+1 > maxReadRange {
+				endLine = startLine + maxReadRange - 1
+			}
+			if startLine > len(lines) {
+				return ToolOutput{
+					NameHint:  rel,
+					Content:   []byte(fmt.Sprintf("%s: start_line %d exceeds line_count %d", rel, startLine, len(lines))),
+					TrustTier: "trusted_repo",
+				}, nil
+			}
+			if endLine > len(lines) {
+				endLine = len(lines)
+			}
+			var sb strings.Builder
+			fmt.Fprintf(&sb, "%s lines %d..%d of %d:\n", rel, startLine, endLine, len(lines))
+			for i := startLine; i <= endLine; i++ {
+				fmt.Fprintf(&sb, "L%d: %s\n", i, lines[i-1])
+			}
+			return ToolOutput{NameHint: rel, Content: []byte(strings.TrimRight(sb.String(), "\n")), TrustTier: "trusted_repo"}, nil
 		}
 		return ToolOutput{NameHint: rel, Content: data, TrustTier: "trusted_repo"}, nil
 
@@ -1905,10 +2277,11 @@ func (r *LocalToolRunner) Execute(ctx context.Context, call ToolCall) (ToolOutpu
 
 	case "bg_poll":
 		jobID, _ := args["job_id"].(string)
+		waitSecs, _ := args["wait_seconds"].(float64)
 		if r.BgProcs == nil {
 			return ToolOutput{}, errors.New("bg_poll: no background jobs started")
 		}
-		out, err := r.BgProcs.Poll(ctx, r.vm, jobID, 3*1024)
+		out, err := r.BgProcs.PollWait(ctx, r.vm, jobID, 3*1024, waitSecs)
 		if err != nil {
 			return ToolOutput{}, err
 		}
@@ -1955,14 +2328,26 @@ func (r *LocalToolRunner) Execute(ctx context.Context, call ToolCall) (ToolOutpu
 		if strings.TrimSpace(command) == "" {
 			return ToolOutput{}, errors.New("exec requires non-empty command")
 		}
+		timeout := 20 * time.Second
+		if tsF, ok := args["timeout_sec"].(float64); ok && tsF > 0 {
+			sec := int(tsF)
+			if sec > 300 {
+				sec = 300
+			}
+			timeout = time.Duration(sec) * time.Second
+		}
 		if r.Sandbox != nil {
 			res, err := r.Sandbox.Exec(ctx, sandbox.ExecSpec{
 				WorkspaceDir: call.WorkspaceDir,
 				Command:      "/bin/sh",
 				Args:         []string{"-c", command},
-				Timeout:      20 * time.Second,
+				Timeout:      timeout,
 			})
 			if err != nil {
+				if errors.Is(err, sandbox.ErrCommandTimeout) {
+					body := fmt.Sprintf("exit_code=-1 (TIMEOUT after %s; use timeout_sec or bg_exec for longer commands)\n%s", timeout, string(res.Combined))
+					return ToolOutput{NameHint: "exec.log", Content: []byte(body), TrustTier: "trusted_repo"}, nil
+				}
 				return ToolOutput{}, err
 			}
 			body := fmt.Sprintf("exit_code=%d\n%s", res.ExitCode, string(res.Combined))
@@ -1971,13 +2356,17 @@ func (r *LocalToolRunner) Execute(ctx context.Context, call ToolCall) (ToolOutpu
 		if !r.AllowUnsandboxedExec {
 			return ToolOutput{}, ErrUnsandboxedExec
 		}
-		runCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		runCtx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 		cmd := exec.CommandContext(runCtx, "/bin/sh", "-c", command)
 		cmd.WaitDelay = 500 * time.Millisecond
 		cmd.Dir = call.WorkspaceDir
 		cmd.Env = sandbox.ScrubEnv(nil)
 		out, err := cmd.CombinedOutput()
+		if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
+			body := fmt.Sprintf("exit_code=-1 (TIMEOUT after %s; use timeout_sec or bg_exec for longer commands)\n%s", timeout, string(out))
+			return ToolOutput{NameHint: "exec.log", Content: []byte(body), TrustTier: "trusted_repo"}, nil
+		}
 		exitCode := 0
 		if err != nil {
 			var ee *exec.ExitError
@@ -2005,7 +2394,9 @@ func (r *LocalToolRunner) Execute(ctx context.Context, call ToolCall) (ToolOutpu
 		pid, _ := args["page_id"].(string)
 		pid = strings.TrimPrefix(strings.TrimSpace(pid), "@")
 		pat, _ := args["pattern"].(string)
-		out, err := r.vm.Grep(ctx, pid, pat, 40)
+		ctxF, _ := args["context_lines"].(float64)
+		ignoreCase, _ := args["ignore_case"].(bool)
+		out, err := r.vm.GrepWithOptions(ctx, pid, pat, 40, int(ctxF), ignoreCase)
 		if err != nil {
 			return ToolOutput{}, err
 		}
@@ -2175,6 +2566,344 @@ func (r *LocalToolRunner) Execute(ctx context.Context, call ToolCall) (ToolOutpu
 			Content:   []byte(header + strings.TrimRight(sb.String(), "\n")),
 			TrustTier: "trusted_repo",
 		}, nil
+
+	case "mcp_call":
+		if r.MCPManager == nil {
+			return ToolOutput{}, errors.New("mcp_call: no MCP manager attached (configure mcp_servers or pass --browser / --desktop)")
+		}
+		serverName, _ := args["server"].(string)
+		toolName, _ := args["tool"].(string)
+		var toolArgs map[string]any
+		if rawArgs, ok := args["arguments_json"].(string); ok && strings.TrimSpace(rawArgs) != "" {
+			if err := json.Unmarshal([]byte(rawArgs), &toolArgs); err != nil {
+				return ToolOutput{}, fmt.Errorf("mcp_call parse arguments_json: %w", err)
+			}
+		} else if rawMap, ok := args["arguments"].(map[string]any); ok {
+			toolArgs = rawMap
+		}
+		mcpOut, err := r.MCPManager.CallTool(ctx, serverName, toolName, toolArgs)
+		if err != nil {
+			return ToolOutput{}, err
+		}
+		var vp *compiler.ViewportFrame
+		text := mcpOut.Content
+		if len(mcpOut.Images) > 0 && r.vm != nil && r.vm.Store() != nil {
+			img := mcpOut.Images[len(mcpOut.Images)-1]
+			blobHash, _, bErr := r.vm.Store().Blobs().Put(img.Data)
+			if bErr == nil {
+				var w, h int
+				if cfg, _, dErr := image.DecodeConfig(bytes.NewReader(img.Data)); dErr == nil {
+					w, h = cfg.Width, cfg.Height
+				}
+				mime := img.MIMEType
+				if mime == "" {
+					mime = "image/png"
+				}
+				vp = &compiler.ViewportFrame{
+					BlobHash: blobHash,
+					MimeType: mime,
+					Width:    w,
+					Height:   h,
+					PHash:    blobHash[:16],
+					Summary:  fmt.Sprintf("%s.%s", serverName, toolName),
+					DataURI:  "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(img.Data),
+				}
+				note := fmt.Sprintf("[viewport updated: %s %dx%d sha256:%s]", mime, w, h, blobHash[:12])
+				if text == "" {
+					text = note
+				} else {
+					text = text + "\n" + note
+				}
+			}
+		}
+		return ToolOutput{
+			NameHint:  fmt.Sprintf("mcp_%s_%s.txt", serverName, toolName),
+			Content:   []byte(text),
+			TrustTier: "untrusted_external",
+			Viewport:  vp,
+		}, nil
+
+	case "browser_task":
+		if r.GUITaskFunc == nil {
+			return ToolOutput{}, errors.New("browser_task: GUI subagent runner not attached")
+		}
+		goal, _ := args["goal"].(string)
+		startURL, _ := args["start_url"].(string)
+		maxF, _ := args["max_steps"].(float64)
+		return r.GUITaskFunc(ctx, call.RunID, call.BranchID, "browser", goal, startURL, int(maxF))
+
+	case "desktop_task":
+		if r.GUITaskFunc == nil {
+			return ToolOutput{}, errors.New("desktop_task: GUI subagent runner not attached")
+		}
+		goal, _ := args["goal"].(string)
+		maxF, _ := args["max_steps"].(float64)
+		return r.GUITaskFunc(ctx, call.RunID, call.BranchID, "desktop", goal, "", int(maxF))
+
+	case "memory_write":
+		if r.vm == nil || r.vm.Store() == nil {
+			return ToolOutput{}, errors.New("memory_write: store not initialized")
+		}
+		content, _ := args["content"].(string)
+		content = strings.TrimSpace(content)
+		if content == "" {
+			return ToolOutput{}, errors.New("memory_write requires non-empty content")
+		}
+		kind, _ := args["kind"].(string)
+		kind = strings.TrimSpace(kind)
+		if kind == "" {
+			kind = "fact"
+		}
+		scope, _ := args["scope"].(string)
+		scope = strings.TrimSpace(scope)
+		if scope == "" {
+			scope = "global"
+		}
+		// Anti-poisoning (*MINJA*): if this run has observed untrusted external data, quarantine the
+		// written memory until reviewed instead of activating it silently.
+		tier := "trusted_operator"
+		if call.RunID != "" {
+			if untrusted, uErr := r.vm.Store().ListUntrustedPageIDs(ctx, call.RunID); uErr == nil && len(untrusted) > 0 {
+				tier = "untrusted_external"
+			}
+		}
+		memSvc := memory.NewService(r.vm.Store())
+		node, err := memSvc.Propose(ctx, memory.ProposeRequest{
+			Scope:     scope,
+			Kind:      kind,
+			Content:   content,
+			TrustTier: tier,
+		})
+		if err != nil {
+			return ToolOutput{}, err
+		}
+		return ToolOutput{
+			NameHint:  "memory_write.txt",
+			Content:   []byte(fmt.Sprintf("saved memory %s (scope=%s kind=%s status=%s trust=%s)", node.ID, node.Scope, node.Kind, node.Status, node.TrustTier)),
+			TrustTier: "trusted_repo",
+		}, nil
+
+	case "session_search":
+		if r.vm == nil || r.vm.Store() == nil {
+			return ToolOutput{}, errors.New("session_search: store not initialized")
+		}
+		query, _ := args["query"].(string)
+		q := strings.ToLower(strings.TrimSpace(query))
+		if q == "" {
+			return ToolOutput{}, errors.New("session_search requires non-empty query")
+		}
+		limitF, _ := args["limit"].(float64)
+		limit := int(limitF)
+		if limit <= 0 {
+			limit = 5
+		}
+		if limit > 20 {
+			limit = 20
+		}
+		runs, err := r.vm.Store().ListRuns(ctx)
+		if err != nil {
+			return ToolOutput{}, err
+		}
+		terms := strings.Fields(q)
+		type scoredRun struct {
+			run   store.Run
+			score int
+		}
+		var matches []scoredRun
+		for _, rn := range runs {
+			hay := strings.ToLower(rn.ID + " " + rn.Title + " " + rn.GoalSpec + " " + rn.Status)
+			sc := 0
+			for _, term := range terms {
+				if strings.Contains(hay, term) {
+					sc++
+				}
+			}
+			if sc > 0 {
+				matches = append(matches, scoredRun{run: rn, score: sc})
+			}
+		}
+		sort.SliceStable(matches, func(i, j int) bool {
+			if matches[i].score != matches[j].score {
+				return matches[i].score > matches[j].score
+			}
+			return matches[i].run.CreatedAt > matches[j].run.CreatedAt
+		})
+		if len(matches) == 0 {
+			return ToolOutput{
+				NameHint:  "session_search.txt",
+				Content:   []byte(fmt.Sprintf("session_search: 0 past runs matching %q", query)),
+				TrustTier: "trusted_repo",
+			}, nil
+		}
+		if len(matches) > limit {
+			matches = matches[:limit]
+		}
+		var sb strings.Builder
+		fmt.Fprintf(&sb, "session_search: top %d past run(s) matching %q:\n", len(matches), query)
+		for i, m := range matches {
+			goal := m.run.GoalSpec
+			if len(goal) > 160 {
+				goal = goal[:157] + "..."
+			}
+			fmt.Fprintf(&sb, "%d. [%s] status=%s title=%q goal=%q\n", i+1, m.run.ID, m.run.Status, m.run.Title, goal)
+		}
+		return ToolOutput{
+			NameHint:  "session_search.txt",
+			Content:   []byte(strings.TrimRight(sb.String(), "\n")),
+			TrustTier: "trusted_repo",
+		}, nil
+
+	case "skill_manage":
+		action, _ := args["action"].(string)
+		action = strings.ToLower(strings.TrimSpace(action))
+		name, _ := args["name"].(string)
+		content, _ := args["content"].(string)
+		roots := r.SkillRoots
+		if len(roots) == 0 && call.WorkspaceDir != "" {
+			roots = []string{filepath.Join(call.WorkspaceDir, ".soma", "skills")}
+		}
+		if len(roots) == 0 {
+			return ToolOutput{}, errors.New("skill_manage: no skill root configured")
+		}
+		switch action {
+		case "list":
+			idx, err := skills.LoadIndex(roots)
+			if err != nil {
+				return ToolOutput{}, err
+			}
+			if len(idx) == 0 {
+				return ToolOutput{NameHint: "skills.txt", Content: []byte("skill_manage: 0 skills installed"), TrustTier: "trusted_repo"}, nil
+			}
+			var sb strings.Builder
+			for _, sm := range idx {
+				fmt.Fprintf(&sb, "- %s: %s\n", sm.Name, sm.Description)
+			}
+			return ToolOutput{NameHint: "skills.txt", Content: []byte(strings.TrimRight(sb.String(), "\n")), TrustTier: "trusted_repo"}, nil
+		case "read":
+			for _, rt := range roots {
+				dir := filepath.Join(rt, strings.TrimSpace(name))
+				if _, sErr := os.Stat(filepath.Join(dir, "SKILL.md")); sErr == nil {
+					body, _, err := skills.ActivateBody(dir)
+					if err != nil {
+						return ToolOutput{}, err
+					}
+					return ToolOutput{NameHint: name + "_SKILL.md", Content: []byte(body.Body), TrustTier: "trusted_repo"}, nil
+				}
+			}
+			return ToolOutput{}, fmt.Errorf("skill_manage: skill %q not found", name)
+		case "create", "patch":
+			// Block silent skill mutation if the run has observed untrusted external data.
+			if r.vm != nil && r.vm.Store() != nil && call.RunID != "" {
+				if untrusted, uErr := r.vm.Store().ListUntrustedPageIDs(ctx, call.RunID); uErr == nil && len(untrusted) > 0 {
+					_ = skills.ProposeSkillPatch(ctx, r.vm.Store(), name, content, "Proposed during tainted run; requires operator review")
+					return ToolOutput{
+						NameHint:  "skill_manage.txt",
+						Content:   []byte(fmt.Sprintf("skill_manage: run has untrusted external provenance; staged %q in Inbox for operator review instead of writing directly", name)),
+						TrustTier: "trusted_repo",
+					}, nil
+				}
+			}
+			sk, _, err := skills.CreateOrPatchSkill(roots[0], name, content)
+			if err != nil {
+				return ToolOutput{}, err
+			}
+			return ToolOutput{
+				NameHint:  "skill_manage.txt",
+				Content:   []byte(fmt.Sprintf("skill_manage: validated, security-linted, and saved skill %q to %s", sk.Frontmatter.Name, sk.Dir)),
+				TrustTier: "trusted_repo",
+			}, nil
+		default:
+			return ToolOutput{}, fmt.Errorf("skill_manage: unsupported action %q (use list|read|create|patch)", action)
+		}
+
+	case "cronjob_manage":
+		action, _ := args["action"].(string)
+		action = strings.ToLower(strings.TrimSpace(action))
+		if call.WorkspaceDir == "" {
+			return ToolOutput{}, errors.New("cronjob_manage: empty workspace dir")
+		}
+		trigPath := filepath.Join(call.WorkspaceDir, ".soma", "triggers.yaml")
+		type cronTrigger struct {
+			ID       string `yaml:"id"`
+			Type     string `yaml:"type"`
+			Interval string `yaml:"interval,omitempty"`
+			Prompt   string `yaml:"prompt,omitempty"`
+		}
+		type cronFile struct {
+			Version  int           `yaml:"version"`
+			Triggers []cronTrigger `yaml:"triggers"`
+		}
+		var cfg cronFile
+		cfg.Version = 2
+		if raw, rErr := os.ReadFile(trigPath); rErr == nil {
+			_ = yaml.Unmarshal(raw, &cfg)
+		}
+		switch action {
+		case "list":
+			if len(cfg.Triggers) == 0 {
+				return ToolOutput{NameHint: "cron.txt", Content: []byte("cronjob_manage: 0 scheduled triggers"), TrustTier: "trusted_repo"}, nil
+			}
+			var sb strings.Builder
+			for _, tr := range cfg.Triggers {
+				fmt.Fprintf(&sb, "- [%s] type=%s interval=%q prompt=%q\n", tr.ID, tr.Type, tr.Interval, tr.Prompt)
+			}
+			return ToolOutput{NameHint: "cron.txt", Content: []byte(strings.TrimRight(sb.String(), "\n")), TrustTier: "trusted_repo"}, nil
+		case "add":
+			id, _ := args["id"].(string)
+			schedule, _ := args["schedule"].(string)
+			prompt, _ := args["prompt"].(string)
+			id = strings.TrimSpace(id)
+			schedule = strings.TrimSpace(schedule)
+			prompt = strings.TrimSpace(prompt)
+			if id == "" || schedule == "" || prompt == "" {
+				return ToolOutput{}, errors.New("cronjob_manage add requires id, schedule, and prompt")
+			}
+			updated := false
+			for i := range cfg.Triggers {
+				if cfg.Triggers[i].ID == id {
+					cfg.Triggers[i] = cronTrigger{ID: id, Type: "cron", Interval: schedule, Prompt: prompt}
+					updated = true
+					break
+				}
+			}
+			if !updated {
+				cfg.Triggers = append(cfg.Triggers, cronTrigger{ID: id, Type: "cron", Interval: schedule, Prompt: prompt})
+			}
+			if err := os.MkdirAll(filepath.Dir(trigPath), 0o755); err != nil {
+				return ToolOutput{}, err
+			}
+			outBytes, err := yaml.Marshal(&cfg)
+			if err != nil {
+				return ToolOutput{}, err
+			}
+			if err := os.WriteFile(trigPath, outBytes, 0o644); err != nil {
+				return ToolOutput{}, err
+			}
+			return ToolOutput{NameHint: "cron.txt", Content: []byte(fmt.Sprintf("cronjob_manage: saved cron trigger %q (%s) in .soma/triggers.yaml", id, schedule)), TrustTier: "trusted_repo"}, nil
+		case "remove":
+			id, _ := args["id"].(string)
+			id = strings.TrimSpace(id)
+			var kept []cronTrigger
+			removed := false
+			for _, tr := range cfg.Triggers {
+				if tr.ID == id {
+					removed = true
+					continue
+				}
+				kept = append(kept, tr)
+			}
+			if !removed {
+				return ToolOutput{}, fmt.Errorf("cronjob_manage: trigger %q not found", id)
+			}
+			cfg.Triggers = kept
+			outBytes, _ := yaml.Marshal(&cfg)
+			if err := os.WriteFile(trigPath, outBytes, 0o644); err != nil {
+				return ToolOutput{}, err
+			}
+			return ToolOutput{NameHint: "cron.txt", Content: []byte(fmt.Sprintf("cronjob_manage: removed trigger %q", id)), TrustTier: "trusted_repo"}, nil
+		default:
+			return ToolOutput{}, fmt.Errorf("cronjob_manage: unsupported action %q (use list|add|remove)", action)
+		}
 
 	case "branch_fork":
 		label, _ := args["label"].(string)

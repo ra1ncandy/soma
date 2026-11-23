@@ -4,6 +4,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"image"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -20,6 +24,7 @@ const (
 	TypeTabular ContentType = "tabular"
 	TypeDiff    ContentType = "diff"
 	TypeHTTP    ContentType = "http"
+	TypeImage   ContentType = "image"
 	TypeText    ContentType = "text"
 )
 
@@ -34,16 +39,22 @@ var (
 func DetectContentType(nameHint string, content []byte) ContentType {
 	ext := strings.ToLower(filepath.Ext(strings.TrimSpace(nameHint)))
 	switch ext {
-	case ".go", ".py", ".ts", ".tsx", ".js", ".jsx", ".rs", ".c", ".cpp", ".h", ".java", ".rb":
+	case ".go", ".py", ".ts", ".tsx", ".js", ".jsx", ".rs", ".c", ".cpp", ".h", ".hpp", ".java", ".rb", ".sh", ".sql", ".asm", ".s":
 		return TypeCode
-	case ".json", ".jsonl":
+	case ".json", ".jsonl", ".ndjson":
 		return TypeJSON
-	case ".csv", ".tsv", ".parquet":
+	case ".csv", ".tsv", ".parquet", ".bed", ".gff", ".gtf", ".vcf":
 		return TypeTabular
 	case ".diff", ".patch":
 		return TypeDiff
 	case ".log":
 		return TypeLog
+	case ".png", ".jpg", ".jpeg", ".gif", ".webp":
+		return TypeImage
+	}
+
+	if isImageMagic(content) {
+		return TypeImage
 	}
 
 	trimmed := bytes.TrimSpace(content)
@@ -95,6 +106,8 @@ func GeneratePreview(ct ContentType, content []byte, maxLines int) string {
 		out = previewDiff(lines, len(content), maxLines)
 	case TypeHTTP:
 		out = previewHTTP(lines, len(content), maxLines)
+	case TypeImage:
+		out = previewImage(content)
 	default:
 		out = previewText(lines, len(content), maxLines)
 	}
@@ -103,6 +116,30 @@ func GeneratePreview(ct ContentType, content []byte, maxLines int) string {
 		out = out[:maxLines]
 	}
 	return strings.Join(out, "\n")
+}
+
+func isImageMagic(b []byte) bool {
+	if len(b) >= 8 && bytes.Equal(b[:8], []byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a}) {
+		return true
+	}
+	if len(b) >= 3 && b[0] == 0xff && b[1] == 0xd8 && b[2] == 0xff {
+		return true
+	}
+	if len(b) >= 6 && (bytes.HasPrefix(b, []byte("GIF87a")) || bytes.HasPrefix(b, []byte("GIF89a"))) {
+		return true
+	}
+	if len(b) >= 12 && bytes.HasPrefix(b, []byte("RIFF")) && bytes.Equal(b[8:12], []byte("WEBP")) {
+		return true
+	}
+	return false
+}
+
+func previewImage(content []byte) []string {
+	cfg, format, err := image.DecodeConfig(bytes.NewReader(content))
+	if err != nil {
+		return []string{fmt.Sprintf("image summary: binary image (%d bytes)", len(content))}
+	}
+	return []string{fmt.Sprintf("image summary: %s %dx%d (%d bytes)", format, cfg.Width, cfg.Height, len(content))}
 }
 
 func previewLog(lines []string, byteLen, maxLines int) []string {
@@ -184,6 +221,31 @@ func detectCodeLang(lines []string) string {
 func previewJSON(content []byte, lineCount, byteLen, maxLines int) []string {
 	var v any
 	if err := json.Unmarshal(bytes.TrimSpace(content), &v); err != nil {
+		// Try JSONL (newline-delimited JSON records, common in ML/eval/bio/security logs).
+		rawLines := strings.Split(strings.ReplaceAll(string(content), "\r\n", "\n"), "\n")
+		var nonEmpty []string
+		for _, l := range rawLines {
+			if s := strings.TrimSpace(l); s != "" {
+				nonEmpty = append(nonEmpty, s)
+			}
+		}
+		if len(nonEmpty) > 0 {
+			var firstObj map[string]any
+			if json.Unmarshal([]byte(nonEmpty[0]), &firstObj) == nil {
+				out := []string{fmt.Sprintf("jsonl summary: %d records, %d bytes", len(nonEmpty), byteLen)}
+				keys := make([]string, 0, len(firstObj))
+				for k := range firstObj {
+					keys = append(keys, k)
+				}
+				sort.Strings(keys)
+				out = append(out, fmt.Sprintf("record[0] keys (%d): %s", len(keys), truncateLine(strings.Join(keys, ", "), 140)))
+				out = append(out, "first: "+truncateLine(nonEmpty[0], 140))
+				if len(nonEmpty) > 1 {
+					out = append(out, "last:  "+truncateLine(nonEmpty[len(nonEmpty)-1], 140))
+				}
+				return out
+			}
+		}
 		return previewText(strings.Split(string(content), "\n"), byteLen, maxLines)
 	}
 
@@ -231,15 +293,23 @@ func previewTabular(lines []string, byteLen, maxLines int) []string {
 	if len(lines) == 0 {
 		return []string{"tabular summary: empty"}
 	}
-	cols := strings.Split(lines[0], ",")
+	headerIdx := 0
+	for headerIdx < len(lines)-1 && strings.HasPrefix(lines[headerIdx], "##") {
+		headerIdx++
+	}
+	delim := ","
+	if strings.Count(lines[headerIdx], "\t") > strings.Count(lines[headerIdx], ",") {
+		delim = "\t"
+	}
+	cols := strings.Split(lines[headerIdx], delim)
 	out := []string{
 		fmt.Sprintf("tabular summary: %d rows (%d data), %d bytes, %d cols",
-			len(lines), maxInt(0, len(lines)-1), byteLen, len(cols)),
-		"header: " + truncateLine(lines[0], 140),
+			len(lines), maxInt(0, len(lines)-headerIdx-1), byteLen, len(cols)),
+		"header: " + truncateLine(lines[headerIdx], 140),
 	}
-	limit := minInt(len(lines), minInt(5, maxLines))
-	for i := 1; i < limit; i++ {
-		out = append(out, fmt.Sprintf("row %d: %s", i, truncateLine(lines[i], 140)))
+	limit := minInt(len(lines), headerIdx+minInt(5, maxLines))
+	for i := headerIdx + 1; i < limit; i++ {
+		out = append(out, fmt.Sprintf("row %d: %s", i-headerIdx, truncateLine(lines[i], 140)))
 	}
 	return out
 }

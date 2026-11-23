@@ -219,7 +219,7 @@ func newSearchCmd() *cobra.Command {
 	cmd.Flags().StringVar(&profileName, "profile", "worker", "Model profile (worker|frontier)")
 	cmd.Flags().BoolVar(&useMock, "mock", false, "Use deterministic local simulation provider")
 	cmd.Flags().IntVar(&maxBranches, "max-branches", 4, "Maximum branches to explore")
-	cmd.Flags().IntVar(&maxTurns, "max-turns", 8, "Maximum turns per branch")
+	cmd.Flags().IntVar(&maxTurns, "max-turns", 25, "Maximum turns per branch")
 	return cmd
 }
 
@@ -334,7 +334,7 @@ func newSwarmCmd() *cobra.Command {
 	cmd.Flags().StringVar(&modeStr, "mode", "cooperative", "Swarm mode (cooperative|competitive)")
 	cmd.Flags().StringVar(&profileName, "profile", "worker", "Model profile (worker|frontier)")
 	cmd.Flags().BoolVar(&useMock, "mock", false, "Use deterministic local simulation provider")
-	cmd.Flags().IntVar(&maxTurns, "max-turns", 8, "Maximum turns per worker")
+	cmd.Flags().IntVar(&maxTurns, "max-turns", 30, "Maximum turns per worker")
 	return cmd
 }
 

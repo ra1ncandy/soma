@@ -25,13 +25,14 @@ type bgJob struct {
 	cmd          *exec.Cmd
 	sandboxed    bool
 
-	mu       sync.Mutex
-	buf      bytes.Buffer
-	done     bool
-	exitCode int
-	exitErr  string
-	endedAt  time.Time
-	lastPage string
+	mu              sync.Mutex
+	buf             bytes.Buffer
+	done            bool
+	exitCode        int
+	exitErr         string
+	endedAt         time.Time
+	lastPage        string
+	lastPolledBytes int
 }
 
 func (j *bgJob) Write(p []byte) (int, error) {
@@ -163,6 +164,12 @@ func (m *BgProcessManager) Start(spec BgStartSpec) (string, error) {
 
 // Poll returns the current status and output of jobID, spilling outputs > inlineThreshold to @page.
 func (m *BgProcessManager) Poll(ctx context.Context, vm *vmem.Manager, jobID string, inlineThreshold int) (string, error) {
+	return m.PollWait(ctx, vm, jobID, inlineThreshold, 0)
+}
+
+// PollWait optionally waits up to waitSeconds (capped at 30s) for jobID to exit or emit new output
+// before returning the current status and output snapshot.
+func (m *BgProcessManager) PollWait(ctx context.Context, vm *vmem.Manager, jobID string, inlineThreshold int, waitSeconds float64) (string, error) {
 	m.mu.Lock()
 	job, ok := m.jobs[strings.TrimSpace(jobID)]
 	m.mu.Unlock()
@@ -170,11 +177,34 @@ func (m *BgProcessManager) Poll(ctx context.Context, vm *vmem.Manager, jobID str
 		return "", fmt.Errorf("bg_poll: unknown job_id %q", jobID)
 	}
 
+	if waitSeconds > 0 {
+		if waitSeconds > 30 {
+			waitSeconds = 30
+		}
+		deadline := time.Now().Add(time.Duration(waitSeconds * float64(time.Second)))
+		for time.Now().Before(deadline) {
+			job.mu.Lock()
+			isDone := job.done
+			curBytes := job.buf.Len()
+			prevBytes := job.lastPolledBytes
+			job.mu.Unlock()
+			if isDone || (curBytes > prevBytes && curBytes > 0) {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			case <-time.After(50 * time.Millisecond):
+			}
+		}
+	}
+
 	job.mu.Lock()
 	done := job.done
 	exitCode := job.exitCode
 	exitErr := job.exitErr
 	rawOut := append([]byte(nil), job.buf.Bytes()...)
+	job.lastPolledBytes = len(rawOut)
 	dur := time.Since(job.startedAt)
 	if done && !job.endedAt.IsZero() {
 		dur = job.endedAt.Sub(job.startedAt)

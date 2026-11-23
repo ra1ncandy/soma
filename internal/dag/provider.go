@@ -43,6 +43,7 @@ type GenerateRequest struct {
 // GenerateResponse represents the normalized model emission for one turn.
 type GenerateResponse struct {
 	Reasoning        string               `json:"reasoning"`
+	ReasoningContent string               `json:"reasoning_content,omitempty"`
 	AssistantContent string               `json:"assistant_content,omitempty"`
 	Done             bool                 `json:"done"`
 	FinalSummary     string               `json:"final_summary,omitempty"`
@@ -94,11 +95,13 @@ type ModelProvider interface {
 // OpenAICompatProvider talks to any OpenAI-compatible /v1/chat/completions endpoint
 // with deterministic tool schemas, KV-cache usage parsing, and OpenCode Go session routing.
 type OpenAICompatProvider struct {
-	BaseURL     string
-	APIKey      string
-	HTTPClient  *http.Client
-	MaxTokens   int
-	EnableTools bool
+	BaseURL              string
+	APIKey               string
+	HTTPClient           *http.Client
+	MaxTokens            int
+	ReasoningEffort      string
+	EnableTools          bool
+	PassReasoningContent bool // Opt-in: echo full reasoning_content on historical assistant tool turns (increases prompt tokens).
 }
 
 // NewOpenAICompatProvider creates a client targeting baseURL (e.g. https://opencode.ai/zen/go/v1).
@@ -106,10 +109,10 @@ func NewOpenAICompatProvider(baseURL, apiKey string) *OpenAICompatProvider {
 	return &OpenAICompatProvider{
 		BaseURL:     strings.TrimRight(baseURL, "/"),
 		APIKey:      apiKey,
-		MaxTokens:   2048,
+		MaxTokens:   16384,
 		EnableTools: true,
 		HTTPClient: &http.Client{
-			Timeout: 120 * time.Second,
+			Timeout: 240 * time.Second,
 		},
 	}
 }
@@ -150,11 +153,12 @@ func canonicalOpenAITools() []map[string]any {
 			"type": "function",
 			"function": map[string]any{
 				"name":        "bg_poll",
-				"description": "Check status and output of a background job (large outputs spill to @page handles).",
+				"description": "Check status and output of a background job (large outputs spill to @page handles). Optionally wait up to wait_seconds (max 30) for output or completion.",
 				"parameters": map[string]any{
 					"type": "object",
 					"properties": map[string]any{
-						"job_id": map[string]any{"type": "string", "description": "Background job ID (e.g. bg_0001)"},
+						"job_id":       map[string]any{"type": "string", "description": "Background job ID (e.g. bg_0001)"},
+						"wait_seconds": map[string]any{"type": "number", "description": "Optional seconds to wait for job exit or new output before returning (0-30)"},
 					},
 					"required": []string{"job_id"},
 				},
@@ -163,14 +167,81 @@ func canonicalOpenAITools() []map[string]any {
 		{
 			"type": "function",
 			"function": map[string]any{
-				"name":        "exec",
-				"description": "Execute a shell command inside the isolated branch workspace.",
+				"name":        "browser_task",
+				"description": "Delegate a multi-step web browser task to a dedicated fast GUI subagent (Playwright/CDP) without polluting main context.",
 				"parameters": map[string]any{
 					"type": "object",
 					"properties": map[string]any{
-						"command": map[string]any{"type": "string", "description": "Shell command to execute inside workspace"},
+						"goal":      map[string]any{"type": "string", "description": "Clear browser objective and completion condition"},
+						"max_steps": map[string]any{"type": "integer", "description": "Optional max subagent turns (default 30, max 80)"},
+						"start_url": map[string]any{"type": "string", "description": "Optional starting URL to navigate to first"},
+					},
+					"required": []string{"goal"},
+				},
+			},
+		},
+		{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "cronjob_manage",
+				"description": "List, add, or remove recurring Tier-0 daemon cron schedules in .soma/triggers.yaml.",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"action":   map[string]any{"type": "string", "description": "Action: list | add | remove"},
+						"id":       map[string]any{"type": "string", "description": "Trigger ID (required for add/remove)"},
+						"prompt":   map[string]any{"type": "string", "description": "Task prompt to run on schedule (required for add)"},
+						"schedule": map[string]any{"type": "string", "description": "Duration interval (e.g. '30m', '24h') or cron expression"},
+					},
+					"required": []string{"action"},
+				},
+			},
+		},
+		{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "desktop_task",
+				"description": "Delegate a GUI desktop task to a dedicated fast vision subagent operating inside soma's isolated virtual desktop.",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"goal":      map[string]any{"type": "string", "description": "Clear desktop GUI objective and completion condition"},
+						"max_steps": map[string]any{"type": "integer", "description": "Optional max subagent turns (default 40, max 100)"},
+					},
+					"required": []string{"goal"},
+				},
+			},
+		},
+		{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "exec",
+				"description": "Execute a shell command inside the isolated branch workspace. Returns exit_code and combined stdout/stderr (including partial output on timeout).",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"command":     map[string]any{"type": "string", "description": "Shell command to execute inside workspace"},
+						"timeout_sec": map[string]any{"type": "integer", "description": "Optional timeout in seconds (default 20, max 300; use bg_exec for long-running jobs)"},
 					},
 					"required": []string{"command"},
+				},
+			},
+		},
+		{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "fs_grep",
+				"description": "Fast regex search across workspace files (skips .git/.soma/binary files). Prefer this over reading many files when locating logs, symbols, configs, or motifs.",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"context_lines": map[string]any{"type": "integer", "description": "Optional context lines before/after each match (0-5)"},
+						"glob":          map[string]any{"type": "string", "description": "Optional filename glob filter (e.g. '*.py', '*.log')"},
+						"ignore_case":   map[string]any{"type": "boolean", "description": "Optional case-insensitive regex matching"},
+						"path":          map[string]any{"type": "string", "description": "Optional relative subdirectory or file path (default '.')"},
+						"pattern":       map[string]any{"type": "string", "description": "Go regular expression pattern to match"},
+					},
+					"required": []string{"pattern"},
 				},
 			},
 		},
@@ -208,11 +279,13 @@ func canonicalOpenAITools() []map[string]any {
 			"type": "function",
 			"function": map[string]any{
 				"name":        "fs_read",
-				"description": "Read a file inside the workspace (large files spill to @page handles).",
+				"description": "Read a file inside the workspace (large files spill to @page handles). Pass start_line/end_line to read a specific 1-indexed line range inline.",
 				"parameters": map[string]any{
 					"type": "object",
 					"properties": map[string]any{
-						"path": map[string]any{"type": "string", "description": "Relative path inside workspace"},
+						"end_line":   map[string]any{"type": "integer", "description": "Optional 1-indexed inclusive end line"},
+						"path":       map[string]any{"type": "string", "description": "Relative path inside workspace"},
+						"start_line": map[string]any{"type": "integer", "description": "Optional 1-indexed start line"},
 					},
 					"required": []string{"path"},
 				},
@@ -236,6 +309,22 @@ func canonicalOpenAITools() []map[string]any {
 		{
 			"type": "function",
 			"function": map[string]any{
+				"name":        "mcp_call",
+				"description": "Invoke a tool on a connected stdio or HTTP MCP server (use tool_search to discover available MCP tools).",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"arguments_json": map[string]any{"type": "string", "description": "JSON object string of arguments for the MCP tool"},
+						"server":         map[string]any{"type": "string", "description": "Connected MCP server name (e.g. 'playwright', 'desktop')"},
+						"tool":           map[string]any{"type": "string", "description": "Tool name exposed by the MCP server"},
+					},
+					"required": []string{"server", "tool"},
+				},
+			},
+		},
+		{
+			"type": "function",
+			"function": map[string]any{
 				"name":        "memory_search",
 				"description": "Search scoped bi-temporal memory rules, facts, and preferences using Hybrid BM25 + Matryoshka int8 Vector RRF.",
 				"parameters": map[string]any{
@@ -251,13 +340,31 @@ func canonicalOpenAITools() []map[string]any {
 		{
 			"type": "function",
 			"function": map[string]any{
+				"name":        "memory_write",
+				"description": "Persist a learned fact, rule, or user preference into soma's bi-temporal memory graph (quarantined automatically if the run has observed untrusted external data).",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"content": map[string]any{"type": "string", "description": "Concise fact, rule, or preference to remember"},
+						"kind":    map[string]any{"type": "string", "description": "Optional kind: fact | preference | rule (default 'fact')"},
+						"scope":   map[string]any{"type": "string", "description": "Optional scope (default 'global')"},
+					},
+					"required": []string{"content"},
+				},
+			},
+		},
+		{
+			"type": "function",
+			"function": map[string]any{
 				"name":        "page_grep",
 				"description": "Search a spilled @page virtual memory handle using a regex or substring pattern.",
 				"parameters": map[string]any{
 					"type": "object",
 					"properties": map[string]any{
-						"page_id": map[string]any{"type": "string", "description": "Page handle ID (e.g. page_0001)"},
-						"pattern": map[string]any{"type": "string", "description": "Regex pattern to match lines"},
+						"context_lines": map[string]any{"type": "integer", "description": "Optional context lines before/after each match (0-5)"},
+						"ignore_case":   map[string]any{"type": "boolean", "description": "Optional case-insensitive matching"},
+						"page_id":       map[string]any{"type": "string", "description": "Page handle ID (e.g. page_0001)"},
+						"pattern":       map[string]any{"type": "string", "description": "Regex pattern to match lines"},
 					},
 					"required": []string{"page_id", "pattern"},
 				},
@@ -306,6 +413,37 @@ func canonicalOpenAITools() []map[string]any {
 						"summary": map[string]any{"type": "string", "description": "Concise finding summary to deliver to sibling agents"},
 					},
 					"required": []string{"summary"},
+				},
+			},
+		},
+		{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "session_search",
+				"description": "Search past soma runs and goals to recall previous sessions, decisions, and outcomes.",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"limit": map[string]any{"type": "integer", "description": "Optional max results (default 5, max 20)"},
+						"query": map[string]any{"type": "string", "description": "Keyword search query over past runs"},
+					},
+					"required": []string{"query"},
+				},
+			},
+		},
+		{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "skill_manage",
+				"description": "List, read, create, or patch reusable AAIF SKILL.md skill packages (security-linted before activation).",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"action":  map[string]any{"type": "string", "description": "Action: list | read | create | patch"},
+						"content": map[string]any{"type": "string", "description": "Full SKILL.md content (required for create/patch)"},
+						"name":    map[string]any{"type": "string", "description": "Lowercase hyphenated skill name (required for read/create/patch)"},
+					},
+					"required": []string{"action"},
 				},
 			},
 		},
@@ -387,7 +525,7 @@ func appendUserMessage(msgs []map[string]any, text string) []map[string]any {
 	})
 }
 
-func buildOpenAIMessages(frame compiler.CompiledFrame) []map[string]any {
+func buildOpenAIMessages(frame compiler.CompiledFrame, passReasoning bool) []map[string]any {
 	if !frame.Structured {
 		return []map[string]any{
 			{"role": "system", "content": frame.Layer0 + "\n" + frame.Layer1},
@@ -413,6 +551,7 @@ func buildOpenAIMessages(frame compiler.CompiledFrame) []map[string]any {
 				content string
 			}
 			var asstContent string
+			var asstReasoning string
 			toolCalls := make([]map[string]any, 0, j-i)
 			toolResps := make([]toolResp, 0, j-i)
 			for k := i; k < j; k++ {
@@ -428,6 +567,9 @@ func buildOpenAIMessages(frame compiler.CompiledFrame) []map[string]any {
 				if asstContent == "" {
 					asstContent = ent.AssistantContent
 				}
+				if asstReasoning == "" {
+					asstReasoning = ent.ReasoningContent
+				}
 				toolCalls = append(toolCalls, map[string]any{
 					"id":   callID,
 					"type": "function",
@@ -442,11 +584,15 @@ func buildOpenAIMessages(frame compiler.CompiledFrame) []map[string]any {
 				}
 				toolResps = append(toolResps, toolResp{callID: callID, content: obs})
 			}
-			msgs = append(msgs, map[string]any{
+			asstMsg := map[string]any{
 				"role":       "assistant",
 				"content":    asstContent,
 				"tool_calls": toolCalls,
-			})
+			}
+			if passReasoning && asstReasoning != "" {
+				asstMsg["reasoning_content"] = asstReasoning
+			}
+			msgs = append(msgs, asstMsg)
 			for _, tr := range toolResps {
 				msgs = append(msgs, map[string]any{
 					"role":         "tool",
@@ -479,11 +625,31 @@ func buildOpenAIMessages(frame compiler.CompiledFrame) []map[string]any {
 	}
 
 	lastRole, _ := msgs[len(msgs)-1]["role"].(string)
-	if lastRole != "user" && (frame.Tail.StallCount > 0 || (frame.Tail.StepBudgetRemaining > 0 && frame.Tail.StepBudgetRemaining <= 2) || frame.Tail.GitDiffStat != "") {
-		msgs = append(msgs, map[string]any{
-			"role":    "user",
-			"content": frame.Layer3,
-		})
+	hasViewport := frame.Tail.Viewport != nil && frame.Tail.Viewport.DataURI != ""
+	needsTail := hasViewport || frame.Tail.StallCount > 0 || (frame.Tail.StepBudgetRemaining > 0 && frame.Tail.StepBudgetRemaining <= 2) || frame.Tail.GitDiffStat != ""
+	if needsTail {
+		if hasViewport {
+			parts := []map[string]any{
+				{"type": "text", "text": frame.Layer3},
+				{"type": "image_url", "image_url": map[string]string{"url": frame.Tail.Viewport.DataURI}},
+			}
+			if lastRole == "user" {
+				if prevText, ok := msgs[len(msgs)-1]["content"].(string); ok && strings.TrimSpace(prevText) != "" {
+					parts[0]["text"] = prevText + "\n\n" + frame.Layer3
+				}
+				msgs[len(msgs)-1]["content"] = parts
+			} else {
+				msgs = append(msgs, map[string]any{
+					"role":    "user",
+					"content": parts,
+				})
+			}
+		} else if lastRole != "user" {
+			msgs = append(msgs, map[string]any{
+				"role":    "user",
+				"content": frame.Layer3,
+			})
+		}
 	}
 	return msgs
 }
@@ -494,14 +660,17 @@ func (p *OpenAICompatProvider) Generate(ctx context.Context, req GenerateRequest
 	}
 	maxToks := p.MaxTokens
 	if maxToks <= 0 {
-		maxToks = 2048
+		maxToks = 16384
 	}
 
 	payload := map[string]any{
 		"model":       req.ModelID,
-		"messages":    buildOpenAIMessages(req.Frame),
+		"messages":    buildOpenAIMessages(req.Frame, p.PassReasoningContent),
 		"temperature": 0.0,
 		"max_tokens":  maxToks,
+	}
+	if effort := strings.TrimSpace(p.ReasoningEffort); effort != "" {
+		payload["reasoning_effort"] = effort
 	}
 	if p.EnableTools {
 		payload["tools"] = canonicalOpenAITools()
@@ -519,10 +688,13 @@ func (p *OpenAICompatProvider) Generate(ctx context.Context, req GenerateRequest
 		client = http.DefaultClient
 	}
 
-	const maxAttempts = 3
+	const maxAttempts = 4
 	var respBytes []byte
 	var statusCode int
 	var retryAfterHeader string
+	backoff := func(attempt int) time.Duration {
+		return time.Duration(1<<uint(attempt-1)) * 400 * time.Millisecond
+	}
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.BaseURL+"/chat/completions", bytes.NewReader(body))
 		if err != nil {
@@ -547,7 +719,7 @@ func (p *OpenAICompatProvider) Generate(ctx context.Context, req GenerateRequest
 		if err != nil {
 			tErr := &TransientError{AccountID: req.AccountID, Err: err}
 			if attempt < maxAttempts && ctx.Err() == nil {
-				if sleepErr := sleepWithContext(ctx, time.Duration(attempt)*300*time.Millisecond); sleepErr != nil {
+				if sleepErr := sleepWithContext(ctx, backoff(attempt)); sleepErr != nil {
 					return nil, tErr
 				}
 				continue
@@ -559,7 +731,7 @@ func (p *OpenAICompatProvider) Generate(ctx context.Context, req GenerateRequest
 		if readErr != nil {
 			tErr := &TransientError{AccountID: req.AccountID, Err: readErr}
 			if attempt < maxAttempts && ctx.Err() == nil {
-				if sleepErr := sleepWithContext(ctx, time.Duration(attempt)*300*time.Millisecond); sleepErr != nil {
+				if sleepErr := sleepWithContext(ctx, backoff(attempt)); sleepErr != nil {
 					return nil, tErr
 				}
 				continue
@@ -571,7 +743,7 @@ func (p *OpenAICompatProvider) Generate(ctx context.Context, req GenerateRequest
 		retryAfterHeader = resp.Header.Get("Retry-After")
 
 		if statusCode >= 500 && attempt < maxAttempts && ctx.Err() == nil {
-			if sleepErr := sleepWithContext(ctx, time.Duration(attempt)*300*time.Millisecond); sleepErr != nil {
+			if sleepErr := sleepWithContext(ctx, backoff(attempt)); sleepErr != nil {
 				break
 			}
 			continue
@@ -600,7 +772,8 @@ func (p *OpenAICompatProvider) Generate(ctx context.Context, req GenerateRequest
 
 	var parsed struct {
 		Choices []struct {
-			Message struct {
+			FinishReason string `json:"finish_reason"`
+			Message      struct {
 				Content          string `json:"content"`
 				ReasoningContent string `json:"reasoning_content"`
 				ToolCalls        []struct {
@@ -657,10 +830,14 @@ func (p *OpenAICompatProvider) Generate(ctx context.Context, req GenerateRequest
 
 	msg := parsed.Choices[0].Message
 	content := strings.TrimSpace(msg.Content)
+	if len(msg.ToolCalls) == 0 && content == "" && parsed.Choices[0].FinishReason == "length" {
+		return nil, fmt.Errorf("openai-compat provider: response truncated (finish_reason=length at max_tokens=%d) before emitting content or tool_calls", maxToks)
+	}
 	gen.AssistantContent = content
+	gen.ReasoningContent = strings.TrimSpace(msg.ReasoningContent)
 	reasoning := content
 	if reasoning == "" {
-		reasoning = strings.TrimSpace(msg.ReasoningContent)
+		reasoning = gen.ReasoningContent
 	}
 	if len(reasoning) > 280 {
 		reasoning = reasoning[:277] + "..."
@@ -720,9 +897,9 @@ func (p *OpenAICompatProvider) Generate(ctx context.Context, req GenerateRequest
 // the sandbox, so it is subject to taint checks instead of being waved through as read-only.
 func inferToolEffectClass(toolName string) taint.EffectClass {
 	switch toolName {
-	case "fs_read", "fs_list", "page_slice", "page_grep", "page_search", "memory_search", "publish_finding", "bg_poll", "web_search", "web_extract", "vision_analyze", "tool_search":
+	case "fs_read", "fs_list", "fs_grep", "page_slice", "page_grep", "page_search", "memory_search", "session_search", "publish_finding", "bg_poll", "web_search", "web_extract", "vision_analyze", "tool_search":
 		return taint.EffectReadOnly
-	case "fs_write", "fs_patch", "exec", "bg_exec", "bg_kill", "branch_fork":
+	case "fs_write", "fs_patch", "exec", "bg_exec", "bg_kill", "branch_fork", "browser_task", "desktop_task", "memory_write", "skill_manage", "cronjob_manage":
 		return taint.EffectWorkspaceWrite
 	default:
 		return taint.EffectExternalWrite

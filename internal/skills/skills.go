@@ -25,13 +25,33 @@ var (
 	aaifNameRe          = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
 )
 
+// StringOrList unmarshals either a YAML scalar string or a YAML string sequence (comma-joined).
+type StringOrList string
+
+func (s *StringOrList) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind == yaml.SequenceNode {
+		var items []string
+		if err := value.Decode(&items); err != nil {
+			return err
+		}
+		*s = StringOrList(strings.Join(items, ", "))
+		return nil
+	}
+	var single string
+	if err := value.Decode(&single); err != nil {
+		return err
+	}
+	*s = StringOrList(single)
+	return nil
+}
+
 // Frontmatter represents AAIF SKILL.md YAML frontmatter fields.
 type Frontmatter struct {
 	Name          string            `yaml:"name"`
 	Description   string            `yaml:"description"`
 	License       string            `yaml:"license,omitempty"`
 	Compatibility string            `yaml:"compatibility,omitempty"`
-	AllowedTools  string            `yaml:"allowed-tools,omitempty"`
+	AllowedTools  StringOrList      `yaml:"allowed-tools,omitempty"`
 	Metadata      map[string]string `yaml:"metadata,omitempty"`
 }
 
@@ -179,4 +199,49 @@ func ProposeSkillPatch(ctx context.Context, st *store.Store, skillName, unifiedD
 		ArtifactRef: skillName,
 		Urgency:     "normal",
 	})
+}
+
+// CreateOrPatchSkill validates AAIF frontmatter and runs pre-activation security lint on content
+// in a temporary staging directory before writing <rootDir>/<name>/SKILL.md.
+func CreateOrPatchSkill(rootDir, name, content string) (Skill, []LintFinding, error) {
+	name = strings.TrimSpace(name)
+	if !aaifNameRe.MatchString(name) || len(name) > 64 {
+		return Skill{}, nil, fmt.Errorf("%w: invalid skill name %q (must match ^[a-z0-9]+(-[a-z0-9]+)*$)", ErrInvalidSkill, name)
+	}
+	stageParent, err := os.MkdirTemp("", "soma-skill-stage-*")
+	if err != nil {
+		return Skill{}, nil, err
+	}
+	defer func() { _ = os.RemoveAll(stageParent) }()
+
+	stageDir := filepath.Join(stageParent, name)
+	if err := os.MkdirAll(stageDir, 0o755); err != nil {
+		return Skill{}, nil, err
+	}
+	if err := os.WriteFile(filepath.Join(stageDir, "SKILL.md"), []byte(content), 0o644); err != nil {
+		return Skill{}, nil, err
+	}
+	sk, err := ParseSkillMD(stageDir)
+	if err != nil {
+		return Skill{}, nil, err
+	}
+	findings, err := LintSkillDir(stageDir)
+	if err != nil {
+		return Skill{}, nil, err
+	}
+	for _, f := range findings {
+		if f.Severity == "critical" {
+			return Skill{}, findings, fmt.Errorf("%w: %s (%s:%d)", ErrSkillLintBlocked, f.Detail, f.File, f.Line)
+		}
+	}
+
+	targetDir := filepath.Join(rootDir, name)
+	if err := os.MkdirAll(targetDir, 0o755); err != nil {
+		return Skill{}, findings, err
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "SKILL.md"), []byte(content), 0o644); err != nil {
+		return Skill{}, findings, err
+	}
+	sk.Dir = targetDir
+	return sk, findings, nil
 }

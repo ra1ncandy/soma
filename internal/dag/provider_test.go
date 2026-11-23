@@ -123,8 +123,8 @@ func TestOpenAICompatProvider_ToolsSessionCacheAnd429(t *testing.T) {
 		t.Fatalf("expected sticky run-scoped x-opencode-session header, got %q", gotSess)
 	}
 	rawTools, ok := lastReqBody["tools"].([]any)
-	if !ok || len(rawTools) != 16 {
-		t.Fatalf("expected 16 canonical tools in request body, got %+v", lastReqBody["tools"])
+	if !ok || len(rawTools) != 24 {
+		t.Fatalf("expected 24 canonical tools in request body, got %d", len(rawTools))
 	}
 
 	// Call 2: normal completion without tool_calls -> Done=true.
@@ -784,5 +784,52 @@ func TestOpenAICompatProvider_MultiTurnPrefixMonotonicity(t *testing.T) {
 	rep, err := replay.NewReplayer(st).Replay(ctx, branchID, replay.ReplayOptions{Mode: replay.ModeExact})
 	if err != nil || rep.Diverged || rep.StepsChecked == 0 || rep.HashVerifiedCount != rep.StepsChecked {
 		t.Fatalf("ModeExact replay failed on run %s branch %s: rep=%+v err=%v", runID, branchID, rep, err)
+	}
+}
+
+func TestOpenAICompatProvider_ReasoningEffortAndTruncatedLengthError(t *testing.T) {
+	ctx := context.Background()
+	var gotBody map[string]any
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{
+				"finish_reason": "length",
+				"message": map[string]any{
+					"content":           "",
+					"reasoning_content": "still thinking...",
+				},
+			}},
+			"usage": map[string]any{
+				"prompt_tokens":     100,
+				"completion_tokens": 2048,
+			},
+		})
+	}))
+	defer srv.Close()
+
+	prov := dag.NewOpenAICompatProvider(srv.URL+"/v1", "secret")
+	prov.ReasoningEffort = "high"
+
+	_, err := prov.Generate(ctx, dag.GenerateRequest{
+		RunID:     "run_len",
+		BranchID:  "br_len",
+		AccountID: "acc_len",
+		ModelID:   "deepseek-v4.1-flash",
+		TurnIndex: 1,
+		Frame: compiler.CompiledFrame{
+			Epoch:  1,
+			Layer0: "sys",
+			Layer1: "mem",
+			Layer2: "log",
+			Layer3: "tail",
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "finish_reason=length") {
+		t.Fatalf("expected finish_reason=length error on truncated empty response, got err=%v", err)
+	}
+	if gotBody["reasoning_effort"] != "high" {
+		t.Fatalf("expected reasoning_effort=high in payload, got %v", gotBody["reasoning_effort"])
 	}
 }

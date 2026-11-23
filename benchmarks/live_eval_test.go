@@ -25,16 +25,21 @@ import (
 )
 
 type liveConfig struct {
-	BaseURL string
-	APIKey  string
-	ModelID string
+	BaseURL         string
+	APIKey          string
+	ModelID         string
+	MaxTokens       int
+	ReasoningEffort string
 }
 
 func loadLiveConfig(t *testing.T) liveConfig {
 	t.Helper()
 	apiKey := strings.TrimSpace(os.Getenv("SOMA_LIVE_API_KEY"))
 	if apiKey == "" {
-		t.Skip("SOMA_LIVE_API_KEY not set; skipping live LLM hypothesis evaluation")
+		apiKey = strings.TrimSpace(os.Getenv("OPENCODE_API_KEY"))
+	}
+	if apiKey == "" {
+		t.Skip("SOMA_LIVE_API_KEY / OPENCODE_API_KEY not set; skipping live LLM evaluation")
 	}
 	baseURL := strings.TrimSpace(os.Getenv("SOMA_LIVE_BASE_URL"))
 	if baseURL == "" {
@@ -42,13 +47,55 @@ func loadLiveConfig(t *testing.T) liveConfig {
 	}
 	model := strings.TrimSpace(os.Getenv("SOMA_LIVE_MODEL"))
 	if model == "" {
-		model = "beam-free"
+		model = "deepseek-v4.1-flash"
 	}
+	maxTokens := 16384
+	if mt, err := strconv.Atoi(strings.TrimSpace(os.Getenv("SOMA_LIVE_MAX_TOKENS"))); err == nil && mt > 0 {
+		maxTokens = mt
+	}
+	effort := strings.TrimSpace(os.Getenv("SOMA_LIVE_REASONING_EFFORT"))
 	return liveConfig{
-		BaseURL: strings.TrimRight(baseURL, "/"),
-		APIKey:  apiKey,
-		ModelID: model,
+		BaseURL:         strings.TrimRight(baseURL, "/"),
+		APIKey:          apiKey,
+		ModelID:         model,
+		MaxTokens:       maxTokens,
+		ReasoningEffort: effort,
 	}
+}
+
+func loadLiveConfigs(t *testing.T) []liveConfig {
+	t.Helper()
+	base := loadLiveConfig(t)
+	rawModels := strings.TrimSpace(os.Getenv("SOMA_LIVE_MODELS"))
+	if rawModels == "" {
+		return []liveConfig{base}
+	}
+	var out []liveConfig
+	for _, part := range strings.Split(rawModels, ",") {
+		m := strings.TrimSpace(part)
+		if m == "" {
+			continue
+		}
+		cfg := base
+		cfg.ModelID = m
+		out = append(out, cfg)
+	}
+	if len(out) == 0 {
+		return []liveConfig{base}
+	}
+	return out
+}
+
+func newLiveProvider(cfg liveConfig) *dag.OpenAICompatProvider {
+	prov := dag.NewOpenAICompatProvider(cfg.BaseURL, cfg.APIKey)
+	if cfg.MaxTokens > 0 {
+		prov.MaxTokens = cfg.MaxTokens
+	} else {
+		prov.MaxTokens = 16384
+	}
+	prov.ReasoningEffort = cfg.ReasoningEffort
+	prov.HTTPClient = &http.Client{Timeout: 240 * time.Second}
+	return prov
 }
 
 type abRunMetrics struct {
@@ -63,6 +110,7 @@ type abRunMetrics struct {
 	Compactions     int
 	SummaryFailures int
 	Branches        int
+	Rollovers       int
 	GraveyardNodes  int
 	ReplayVerified  bool
 	WallMS          int64
@@ -71,9 +119,9 @@ type abRunMetrics struct {
 }
 
 func (m abRunMetrics) Format() string {
-	return fmt.Sprintf("%-8s pass=%-5v turns=%2d prompt=%7d cached=%7d (%5.1f%%) out=%5d compactions=%d branches=%d graveyard=%d replay=%v wall=%dms detail=%s",
+	return fmt.Sprintf("%-8s pass=%-5v turns=%2d prompt=%7d cached=%7d (%5.1f%%) out=%5d compactions=%d branches=%d rollovers=%d graveyard=%d replay=%v wall=%dms detail=%s",
 		m.System, m.Passed, m.Turns, m.PromptTokens, m.CachedTokens, m.CacheHitPct, m.OutputTokens,
-		m.Compactions, m.Branches, m.GraveyardNodes, m.ReplayVerified, m.WallMS, m.PassDetail)
+		m.Compactions, m.Branches, m.Rollovers, m.GraveyardNodes, m.ReplayVerified, m.WallMS, m.PassDetail)
 }
 
 // extractAssistantText returns choices[0].message.content from a chat-completions response,
@@ -155,7 +203,7 @@ func runTrials(t *testing.T, cfg liveConfig, name string, trial func(t *testing.
 
 func runLinearBaseline(ctx context.Context, cfg liveConfig, wsDir, systemPrompt, goal string, maxTurns int, compactCharThreshold int) abRunMetrics {
 	start := time.Now()
-	client := &http.Client{Timeout: 90 * time.Second}
+	client := &http.Client{Timeout: 240 * time.Second}
 	sessID := fmt.Sprintf("soma-linear-%d", time.Now().UnixNano())
 
 	tools := []map[string]any{
@@ -224,12 +272,20 @@ func runLinearBaseline(ctx context.Context, cfg liveConfig, wsDir, systemPrompt,
 	res.System = "linear"
 	res.Branches = 1
 
+	maxTok := cfg.MaxTokens
+	if maxTok <= 0 {
+		maxTok = 16384
+	}
+
 	callModel := func(msgs []map[string]any, useTools bool) (map[string]any, int, int, int, error) {
 		payload := map[string]any{
 			"model":       cfg.ModelID,
 			"messages":    msgs,
 			"temperature": 0.0,
-			"max_tokens":  2048,
+			"max_tokens":  maxTok,
+		}
+		if effort := strings.TrimSpace(cfg.ReasoningEffort); effort != "" {
+			payload["reasoning_effort"] = effort
 		}
 		if useTools {
 			payload["tools"] = tools
@@ -386,6 +442,11 @@ func runLinearBaseline(ctx context.Context, cfg liveConfig, wsDir, systemPrompt,
 		tcs, _ := msg["tool_calls"].([]any)
 		if len(tcs) == 0 {
 			content, _ := msg["content"].(string)
+			finishReason, _ := c0["finish_reason"].(string)
+			if finishReason == "length" && strings.TrimSpace(content) == "" {
+				res.ErrorText = fmt.Sprintf("response truncated (finish_reason=length at max_tokens=%d)", maxTok)
+				break
+			}
 			res.LastSummary = strings.TrimSpace(content)
 			break
 		}
@@ -438,11 +499,18 @@ func collectSomaMetrics(ctx context.Context, st *store.Store, runID string, bran
 		if err != nil || len(steps) == 0 {
 			continue
 		}
+		prevEpoch := 0
 		for _, s := range steps {
 			res.Turns++
 			res.PromptTokens += s.InputTokens + s.CacheReadTokens
 			res.CachedTokens += s.CacheReadTokens
 			res.OutputTokens += s.OutputTokens
+			if prevEpoch > 0 && s.Epoch > prevEpoch {
+				res.Rollovers++
+			}
+			if s.Epoch > prevEpoch {
+				prevEpoch = s.Epoch
+			}
 		}
 		rep, rErr := replayer.Replay(ctx, bID, replay.ReplayOptions{Mode: replay.ModeExact})
 		if rErr != nil || rep.Diverged || rep.StepsChecked == 0 || rep.HashVerifiedCount != rep.StepsChecked {
@@ -527,7 +595,7 @@ func TestLiveEvaluation_HypothesisAB(t *testing.T) {
 			ID: "live", Provider: "opencode-go", ModelID: cfg.ModelID, BillingMode: "subscription", MaxConcurrent: 2,
 		})
 
-		prov := dag.NewOpenAICompatProvider(cfg.BaseURL, cfg.APIKey)
+		prov := newLiveProvider(cfg)
 		sbx := sandbox.NewManager()
 		tools := dag.NewSandboxedToolRunner(vmem.NewManager(st), sbx)
 		execDag := dag.NewExecutor(st, prov, tools, compiler.WorkerProfile())
@@ -642,7 +710,7 @@ print("HELD_OUT_ORACLE_OK")
 			ID: "live", Provider: "opencode-go", ModelID: cfg.ModelID, BillingMode: "subscription", MaxConcurrent: 2,
 		})
 
-		prov := dag.NewOpenAICompatProvider(cfg.BaseURL, cfg.APIKey)
+		prov := newLiveProvider(cfg)
 		sbx := sandbox.NewManager()
 		tools := dag.NewSandboxedToolRunner(vmem.NewManager(st), sbx)
 		execDag := dag.NewExecutor(st, prov, tools, compiler.WorkerProfile())
@@ -762,7 +830,7 @@ Select the best model configuration maximizing dev quality without violating dep
 			ID: "live", Provider: "opencode-go", ModelID: cfg.ModelID, BillingMode: "subscription", MaxConcurrent: 2,
 		})
 
-		prov := dag.NewOpenAICompatProvider(cfg.BaseURL, cfg.APIKey)
+		prov := newLiveProvider(cfg)
 		sbx := sandbox.NewManager()
 		tools := dag.NewSandboxedToolRunner(vmem.NewManager(st), sbx)
 		prof := compiler.WorkerProfile()

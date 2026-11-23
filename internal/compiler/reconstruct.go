@@ -2,6 +2,7 @@ package compiler
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -76,6 +77,16 @@ func ReconstructFrame(ctx context.Context, st *store.Store, stepID string, profi
 		}
 		l2 = append(l2, delta.AppendedL2...)
 		finalTail = delta.LiveTail
+	}
+
+	if finalTail.Viewport != nil && finalTail.Viewport.BlobHash != "" {
+		if imgBytes, bErr := st.Blobs().Get(finalTail.Viewport.BlobHash); bErr == nil {
+			mime := finalTail.Viewport.MimeType
+			if mime == "" {
+				mime = "image/png"
+			}
+			finalTail.Viewport.DataURI = "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(imgBytes)
+		}
 	}
 
 	frame := Compile(snap, l2, finalTail, effectiveProfile)

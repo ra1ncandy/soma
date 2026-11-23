@@ -105,8 +105,8 @@ func TestObserveThresholdsAndPreviewers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Slice cap: %v", err)
 	}
-	if !strings.Contains(slCap, "lines 1..200") {
-		t.Fatalf("expected 200-line cap in slice header, got:\n%s", slCap)
+	if !strings.Contains(slCap, "lines 1..300") {
+		t.Fatalf("expected 300-line cap in slice header, got:\n%s", slCap)
 	}
 
 	// Grep finds exact line.

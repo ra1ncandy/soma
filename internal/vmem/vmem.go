@@ -14,7 +14,7 @@ import (
 
 const (
 	// MaxSliceLines caps a single page_slice syscall to avoid blowing context back up.
-	MaxSliceLines = 200
+	MaxSliceLines = 300
 	// DefaultPreviewLines bounds structural previews in Layer 2 manifests.
 	DefaultPreviewLines = 15
 )
@@ -177,10 +177,25 @@ func (m *Manager) Slice(ctx context.Context, pageID string, startLine, endLine i
 
 // Grep searches a spilled @page with a Go regex and returns up to maxMatches numbered lines.
 func (m *Manager) Grep(ctx context.Context, pageID, pattern string, maxMatches int) (string, error) {
+	return m.GrepWithOptions(ctx, pageID, pattern, maxMatches, 0, false)
+}
+
+// GrepWithOptions searches a spilled @page with optional context lines and case-insensitive matching.
+func (m *Manager) GrepWithOptions(ctx context.Context, pageID, pattern string, maxMatches, contextLines int, ignoreCase bool) (string, error) {
 	if maxMatches <= 0 {
 		maxMatches = 40
 	}
-	re, err := regexp.Compile(pattern)
+	if contextLines < 0 {
+		contextLines = 0
+	}
+	if contextLines > 5 {
+		contextLines = 5
+	}
+	expr := pattern
+	if ignoreCase && !strings.HasPrefix(expr, "(?i)") {
+		expr = "(?i)" + expr
+	}
+	re, err := regexp.Compile(expr)
 	if err != nil {
 		return "", fmt.Errorf("invalid grep pattern: %w", err)
 	}
@@ -190,21 +205,58 @@ func (m *Manager) Grep(ctx context.Context, pageID, pattern string, maxMatches i
 	}
 	lines := splitLines(raw)
 
-	var matches []string
+	var matchIdxs []int
 	total := 0
 	for i, line := range lines {
 		if re.MatchString(line) {
 			total++
-			if len(matches) < maxMatches {
-				matches = append(matches, fmt.Sprintf("L%d: %s", i+1, truncateLine(line, 200)))
+			if len(matchIdxs) < maxMatches {
+				matchIdxs = append(matchIdxs, i)
 			}
 		}
 	}
 	if total == 0 {
 		return fmt.Sprintf("@%s: 0 matches for %q (%d lines)", page.ID, pattern, len(lines)), nil
 	}
-	header := fmt.Sprintf("@%s: %d match(es) for %q (showing %d):", page.ID, total, pattern, len(matches))
-	return header + "\n" + strings.Join(matches, "\n"), nil
+
+	var out []string
+	if contextLines == 0 {
+		for _, idx := range matchIdxs {
+			out = append(out, fmt.Sprintf("L%d: %s", idx+1, truncateLine(lines[idx], 400)))
+		}
+	} else {
+		matchSet := make(map[int]bool, len(matchIdxs))
+		for _, idx := range matchIdxs {
+			matchSet[idx] = true
+		}
+		lastEmitted := -2
+		for _, idx := range matchIdxs {
+			lo := idx - contextLines
+			if lo < 0 {
+				lo = 0
+			}
+			hi := idx + contextLines
+			if hi >= len(lines) {
+				hi = len(lines) - 1
+			}
+			if lastEmitted >= 0 && lo > lastEmitted+1 {
+				out = append(out, "--")
+			}
+			for j := lo; j <= hi; j++ {
+				if j <= lastEmitted {
+					continue
+				}
+				sep := "-"
+				if matchSet[j] {
+					sep = ":"
+				}
+				out = append(out, fmt.Sprintf("L%d%s %s", j+1, sep, truncateLine(lines[j], 400)))
+				lastEmitted = j
+			}
+		}
+	}
+	header := fmt.Sprintf("@%s: %d match(es) for %q (showing %d):", page.ID, total, pattern, len(matchIdxs))
+	return header + "\n" + strings.Join(out, "\n"), nil
 }
 
 // Search performs Hybrid BM25 + Matryoshka int8 Vector RRF search across 40-line chunks of spilled @page blobs

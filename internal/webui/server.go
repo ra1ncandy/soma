@@ -23,6 +23,7 @@ import (
 
 	"github.com/ra1ncandy/soma/internal/compiler"
 	"github.com/ra1ncandy/soma/internal/dag"
+	"github.com/ra1ncandy/soma/internal/desktop"
 	"github.com/ra1ncandy/soma/internal/inbox"
 	"github.com/ra1ncandy/soma/internal/memory"
 	"github.com/ra1ncandy/soma/internal/oracle"
@@ -350,9 +351,13 @@ func (s *Server) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "no-referrer")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self' ws: wss:; frame-src 'self'")
 
 		path := r.URL.Path
+		if path == "/desktop-vnc" || strings.HasPrefix(path, "/desktop-vnc/") {
+			s.handleDesktopVNCProxy(w, r)
+			return
+		}
 		if r.Method == http.MethodGet && (path == "/" || path == "/index.html") {
 			s.serveIndex(w)
 			return
@@ -376,6 +381,33 @@ func (s *Server) Handler() http.Handler {
 		}
 
 		switch {
+		case r.Method == http.MethodGet && path == "/api/desktop/status":
+			s.handleDesktopStatus(w, r)
+		case r.Method == http.MethodPost && path == "/api/desktop/start":
+			s.handleDesktopStart(w, r)
+		case r.Method == http.MethodPost && path == "/api/desktop/stop":
+			s.handleDesktopStop(w, r)
+		case r.Method == http.MethodGet && path == "/api/harness":
+			s.handleGetHarness(w, r)
+		case r.Method == http.MethodPost && path == "/api/harness/provider":
+			s.handleSaveProvider(w, r)
+		case r.Method == http.MethodPost && path == "/api/harness/triggers":
+			s.handleSaveTriggers(w, r)
+		case r.Method == http.MethodPost && path == "/api/harness/accounts":
+			s.handleUpsertAccount(w, r)
+		case r.Method == http.MethodPost && path == "/api/connectors/mcp":
+			s.handleUpsertMCP(w, r)
+		case r.Method == http.MethodPost && strings.HasPrefix(path, "/api/connectors/mcp/") && strings.HasSuffix(path, "/toggle"):
+			name := strings.TrimSuffix(strings.TrimPrefix(path, "/api/connectors/mcp/"), "/toggle")
+			s.handleToggleMCP(w, r, name)
+		case r.Method == http.MethodPost && strings.HasPrefix(path, "/api/connectors/mcp/") && strings.HasSuffix(path, "/test"):
+			name := strings.TrimSuffix(strings.TrimPrefix(path, "/api/connectors/mcp/"), "/test")
+			s.handleTestMCP(w, r, name)
+		case r.Method == http.MethodPost && strings.HasPrefix(path, "/api/connectors/mcp/") && strings.HasSuffix(path, "/delete"):
+			name := strings.TrimSuffix(strings.TrimPrefix(path, "/api/connectors/mcp/"), "/delete")
+			s.handleDeleteMCP(w, r, name)
+		case r.Method == http.MethodPost && path == "/api/connectors/bridges":
+			s.handleSaveBridges(w, r)
 		case r.Method == http.MethodGet && path == "/api/state":
 			s.handleState(w, r)
 		case r.Method == http.MethodGet && path == "/api/events":
@@ -451,6 +483,44 @@ func (s *Server) validateMutation(r *http.Request) error {
 		return errors.New("invalid or missing X-Soma-CSRF token")
 	}
 	return nil
+}
+
+func (s *Server) handleDesktopStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.desktopStatusDTO(r.Context()))
+}
+
+func (s *Server) handleDesktopStart(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Resolution  string `json:"resolution"`
+		NetworkMode string `json:"network_mode"`
+		Image       string `json:"image"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req)
+	}
+	mgr := desktop.NewManager()
+	_, err := mgr.Start(r.Context(), desktop.Config{
+		WorkspaceDir: s.cfg.WorkspaceDir,
+		Resolution:   strings.TrimSpace(req.Resolution),
+		NetworkMode:  strings.TrimSpace(req.NetworkMode),
+		Image:        strings.TrimSpace(req.Image),
+	})
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	s.notify()
+	writeJSON(w, http.StatusOK, s.desktopStatusDTO(r.Context()))
+}
+
+func (s *Server) handleDesktopStop(w http.ResponseWriter, r *http.Request) {
+	mgr := desktop.NewManager()
+	if err := mgr.Stop(r.Context(), s.cfg.WorkspaceDir); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	s.notify()
+	writeJSON(w, http.StatusOK, s.desktopStatusDTO(r.Context()))
 }
 
 func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
@@ -776,13 +846,28 @@ func (s *Server) handleMemoryActivate(w http.ResponseWriter, r *http.Request, no
 }
 
 func (s *Server) newExecutor(prof compiler.ModelProfile) *dag.Executor {
+	s.mu.Lock()
+	prov := s.cfg.Provider
+	modelID := s.cfg.ModelID
+	s.mu.Unlock()
+
 	sbx := sandbox.NewManager()
 	vm := vmem.NewManager(s.store)
 	tools := dag.NewSandboxedToolRunner(vm, sbx)
-	exec := dag.NewExecutor(s.store, s.cfg.Provider, tools, prof)
+	if mcpMgr := s.connectConfiguredMCP(context.Background()); mcpMgr != nil {
+		tools.MCPManager = mcpMgr
+	}
+	exec := dag.NewExecutor(s.store, prov, tools, prof)
 	exec.VM = vm
 	exec.Verifier = oracle.NewVerifier(s.store, sbx)
 	exec.AllowFailover = true
+	if tools.MCPManager != nil {
+		exec.GUIConfig = &dag.GUISubagentConfig{
+			Provider:   prov,
+			ModelID:    modelID,
+			MCPManager: tools.MCPManager,
+		}
+	}
 	return exec
 }
 

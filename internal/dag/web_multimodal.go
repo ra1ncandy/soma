@@ -399,7 +399,7 @@ func ExecuteVisionAnalyze(
 		return ToolOutput{
 			NameHint:  "vision_analyze.txt",
 			Content:   []byte(fmt.Sprintf("%s\nprompt: %s\nstatus: local structural image inspection complete (set SOMA_VISION_URL for remote VLM captioning)", metaHeader, prompt)),
-			TrustTier: "trusted_repo",
+			TrustTier: "untrusted_external",
 		}, nil
 	}
 
@@ -455,7 +455,7 @@ func ExecuteVisionAnalyze(
 	return ToolOutput{
 		NameHint:  "vision_analyze.txt",
 		Content:   []byte(fmt.Sprintf("%s\nanalysis:\n%s", metaHeader, analysis)),
-		TrustTier: "trusted_repo",
+		TrustTier: "untrusted_external",
 	}, nil
 }
 

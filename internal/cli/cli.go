@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -42,6 +43,10 @@ func NewRootCmd() *cobra.Command {
 	root.AddCommand(
 		newVersionCmd(),
 		newInitCmd(),
+		newAskCmd(),
+		newChatCmd(),
+		newDesktopCmd(),
+		newImportHermesCmd(),
 		newRunCmd(),
 		newResumeCmd(),
 		newForkCmd(),
@@ -197,7 +202,7 @@ func newRunCmd() *cobra.Command {
 	cmd.Flags().StringVar(&goal, "goal", "", "Task goal specification")
 	cmd.Flags().StringVar(&profileName, "profile", "worker", "Model profile (worker|frontier)")
 	cmd.Flags().BoolVar(&useMock, "mock", false, "Use deterministic local simulation provider")
-	cmd.Flags().IntVar(&maxTurns, "max-turns", 20, "Maximum turns to execute")
+	cmd.Flags().IntVar(&maxTurns, "max-turns", 60, "Maximum turns to execute")
 	return cmd
 }
 
@@ -251,7 +256,7 @@ func newResumeCmd() *cobra.Command {
 	cmd.Flags().StringVar(&dir, "dir", ".", "Workspace directory")
 	cmd.Flags().StringVar(&profileName, "profile", "worker", "Model profile (worker|frontier)")
 	cmd.Flags().BoolVar(&useMock, "mock", false, "Use deterministic local simulation provider")
-	cmd.Flags().IntVar(&maxTurns, "max-turns", 20, "Maximum turns to execute")
+	cmd.Flags().IntVar(&maxTurns, "max-turns", 60, "Maximum turns to execute")
 	return cmd
 }
 
@@ -558,10 +563,14 @@ func openStore(workspaceDir string) (*store.Store, error) {
 }
 
 func selectProfile(name string) compiler.ModelProfile {
-	if strings.EqualFold(name, "frontier") {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "frontier":
 		return compiler.FrontierProfile()
+	case "research":
+		return compiler.ResearchProfile()
+	default:
+		return compiler.WorkerProfile()
 	}
-	return compiler.WorkerProfile()
 }
 
 func selectProvider(workspaceDir string, useMock bool) (dag.ModelProvider, string, error) {
@@ -570,15 +579,20 @@ func selectProvider(workspaceDir string, useMock bool) (dag.ModelProvider, strin
 	}
 	baseURL := os.Getenv("SOMA_API_BASE")
 	model := os.Getenv("SOMA_MODEL")
-	cfgPath := filepath.Join(workspaceDir, ".soma", "config.yaml")
-	if raw, err := os.ReadFile(cfgPath); err == nil {
-		var cfg projectConfig
-		if yaml.Unmarshal(raw, &cfg) == nil {
-			if baseURL == "" {
-				baseURL = cfg.APIBaseURL
-			}
-			if model == "" {
-				model = cfg.DefaultModel
+	cfgPaths := []string{filepath.Join(workspaceDir, ".soma", "config.yaml")}
+	if home, hErr := os.UserHomeDir(); hErr == nil && home != "" {
+		cfgPaths = append(cfgPaths, filepath.Join(home, ".soma", "config.yaml"))
+	}
+	for _, cfgPath := range cfgPaths {
+		if raw, err := os.ReadFile(cfgPath); err == nil {
+			var cfg projectConfig
+			if yaml.Unmarshal(raw, &cfg) == nil {
+				if baseURL == "" {
+					baseURL = cfg.APIBaseURL
+				}
+				if model == "" {
+					model = cfg.DefaultModel
+				}
 			}
 		}
 	}
@@ -588,7 +602,18 @@ func selectProvider(workspaceDir string, useMock bool) (dag.ModelProvider, strin
 	if model == "" {
 		model = "gpt-6.2-sol"
 	}
-	return dag.NewOpenAICompatProvider(baseURL, os.Getenv("SOMA_API_KEY")), model, nil
+	prov := dag.NewOpenAICompatProvider(baseURL, os.Getenv("SOMA_API_KEY"))
+	if mt, err := strconv.Atoi(strings.TrimSpace(os.Getenv("SOMA_MAX_TOKENS"))); err == nil && mt > 0 {
+		prov.MaxTokens = mt
+	}
+	if eff := strings.TrimSpace(os.Getenv("SOMA_REASONING_EFFORT")); eff != "" {
+		prov.ReasoningEffort = eff
+	}
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("SOMA_PASS_REASONING")), "1") ||
+		strings.EqualFold(strings.TrimSpace(os.Getenv("SOMA_PASS_REASONING")), "true") {
+		prov.PassReasoningContent = true
+	}
+	return prov, model, nil
 }
 
 func ensureDefaultAccount(ctx context.Context, st *store.Store, modelID string) error {

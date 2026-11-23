@@ -32,11 +32,12 @@ type SwarmTask struct {
 
 // SwarmRequest configures a concurrent multi-agent swarm run.
 type SwarmRequest struct {
-	RunRequest       RunRequest
-	Mode             SwarmMode
-	Tasks            []SwarmTask
-	DefaultMaxTurns  int
-	CancelOnFirstWin bool
+	RunRequest             RunRequest
+	Mode                   SwarmMode
+	Tasks                  []SwarmTask
+	DefaultMaxTurns        int
+	CancelOnFirstWin       bool
+	IntegrationRepairTurns int // Optional post-merge repair turns on root branch if cooperative root oracle fails.
 }
 
 // SwarmWorkerResult captures the outcome of a single concurrent worker branch.
@@ -109,7 +110,7 @@ func (c *SwarmCoordinator) RunExisting(ctx context.Context, runID, rootBranchID 
 	}
 	defaultMaxTurns := req.DefaultMaxTurns
 	if defaultMaxTurns <= 0 {
-		defaultMaxTurns = 10
+		defaultMaxTurns = 30
 	}
 	if c.Executor.Blackboard == nil {
 		c.Executor.Blackboard = NewBlackboard()
@@ -304,6 +305,30 @@ func (c *SwarmCoordinator) RunExisting(ctx context.Context, runID, rootBranchID 
 			return out, vErr
 		}
 		if !vSum.AllPassed {
+			if req.IntegrationRepairTurns > 0 {
+				_, _ = c.Executor.Blackboard.Publish(ctx, c.Executor.Store, PeerFinding{
+					ID:              fmt.Sprintf("integ-repair-%s", rootBranchID),
+					RunID:           runID,
+					FromBranch:      rootBranchID,
+					FromLabel:       "coordinator",
+					TargetBranch:    rootBranchID,
+					Kind:            "rule_notice",
+					Summary:         "Cooperative workers merged into workspace, but the root integration oracle failed. Diagnose and fix the integration issue:\n" + vSum.Counterexample,
+					PersistToMemory: false,
+				})
+				repRes, repErr := c.Executor.ExecuteBranch(ctx, rootBranchID, req.IntegrationRepairTurns)
+				if repRes != nil {
+					out.TotalTurns += repRes.TurnsExecuted
+				}
+				if repErr == nil && repRes != nil && repRes.Status == StatusCompleted {
+					out.OracleSummary = VerifySummary{AllPassed: true}
+					_ = c.Executor.Store.UpdateBranchStatus(ctx, rootBranchID, string(StatusCompleted), rootBr.ActiveAccountID, 0)
+					_ = c.Executor.Store.UpdateRunStatus(ctx, runID, string(StatusCompleted))
+					out.WinningBranchID = rootBranchID
+					out.Completed = true
+					return out, nil
+				}
+			}
 			_ = c.Executor.Store.UpdateBranchStatus(ctx, rootBranchID, string(StatusFailed), rootBr.ActiveAccountID, 0)
 			_ = c.Executor.Store.UpdateRunStatus(ctx, runID, string(StatusFailed))
 			return out, &VerificationFailedError{BranchID: rootBranchID, Counterexample: vSum.Counterexample}

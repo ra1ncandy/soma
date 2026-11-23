@@ -2,11 +2,14 @@ package dag
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/ra1ncandy/soma/internal/store"
+	"github.com/ra1ncandy/soma/internal/vmem"
 )
 
 // SearchConfig configures bounded speculative branching and Graveyard backtracking.
@@ -21,7 +24,7 @@ func (c SearchConfig) withDefaults() SearchConfig {
 		c.MaxBranches = 4
 	}
 	if c.MaxTurnsPerBranch <= 0 {
-		c.MaxTurnsPerBranch = 8
+		c.MaxTurnsPerBranch = 25
 	}
 	if c.AnchorTurn <= 0 {
 		c.AnchorTurn = 1
@@ -136,7 +139,8 @@ func (s *BranchSearcher) SearchExistingRun(ctx context.Context, runID, rootBranc
 			break
 		}
 
-		_ = s.Executor.AbandonBranch(ctx, curBranchID, reason, "")
+		enrichedReason, evidencePageID := s.summarizeAbandonedBranch(ctx, runID, curBranchID, reason)
+		_ = s.Executor.AbandonBranch(ctx, curBranchID, enrichedReason, evidencePageID)
 
 		if attempt == cfg.MaxBranches {
 			break
@@ -190,4 +194,78 @@ func (s *BranchSearcher) SearchExistingRun(ctx context.Context, runID, rootBranc
 		out.GraveyardCount = len(grave)
 	}
 	return out, nil
+}
+
+// summarizeAbandonedBranch extracts a concise approach fingerprint (modified files + last hypothesis)
+// and spills detailed step/failure evidence into an @page so sibling branches do not repeat dead ends.
+func (s *BranchSearcher) summarizeAbandonedBranch(ctx context.Context, runID, branchID, reason string) (string, string) {
+	steps, err := s.Executor.Store.ListBranchSteps(ctx, branchID)
+	if err != nil || len(steps) == 0 {
+		return reason, ""
+	}
+
+	var editedFiles []string
+	seenFiles := make(map[string]bool)
+	var lastReasoning string
+	var detail strings.Builder
+	fmt.Fprintf(&detail, "Abandoned branch %s (%d steps)\nFailure reason: %s\n\nSteps:\n", branchID, len(steps), reason)
+
+	for _, stp := range steps {
+		raw, rErr := s.Executor.Store.Blobs().Get(stp.EmittedBlobHash)
+		if rErr != nil {
+			continue
+		}
+		var em EmittedPayload
+		if json.Unmarshal(raw, &em) != nil {
+			continue
+		}
+		if r := strings.TrimSpace(em.Response.Reasoning); r != "" {
+			lastReasoning = r
+		}
+		var callNames []string
+		for _, le := range em.ResultingLogEntries {
+			if le.ToolName != "" {
+				callNames = append(callNames, le.ToolName)
+				if le.ToolName == "fs_write" || le.ToolName == "fs_patch" {
+					var m map[string]any
+					if json.Unmarshal([]byte(le.ArgsJSON), &m) == nil {
+						if p, _ := m["path"].(string); p != "" && !seenFiles[p] {
+							seenFiles[p] = true
+							editedFiles = append(editedFiles, p)
+						}
+					}
+				}
+			}
+		}
+		fmt.Fprintf(&detail, "- t%d: tools=[%s] thought=%q\n", stp.TurnIndex, strings.Join(callNames, ","), em.Response.Reasoning)
+	}
+
+	var parts []string
+	if len(editedFiles) > 0 {
+		parts = append(parts, "edited="+strings.Join(editedFiles, ","))
+	}
+	if lastReasoning != "" {
+		lr := lastReasoning
+		if len(lr) > 140 {
+			lr = lr[:137] + "..."
+		}
+		parts = append(parts, "last_hypothesis="+lr)
+	}
+	enriched := reason
+	if len(parts) > 0 {
+		enriched = fmt.Sprintf("[%s] %s", strings.Join(parts, "; "), reason)
+	}
+
+	var evidencePageID string
+	if s.Executor.VM != nil && detail.Len() > 0 {
+		if pid, pErr := s.Executor.VM.RecordProvenance(ctx, vmem.ObserveRequest{
+			RunID:     runID,
+			NameHint:  fmt.Sprintf("graveyard_%s.log", branchID),
+			Content:   []byte(detail.String()),
+			TrustTier: "trusted_repo",
+		}); pErr == nil {
+			evidencePageID = pid
+		}
+	}
+	return enriched, evidencePageID
 }

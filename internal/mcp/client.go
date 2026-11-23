@@ -20,11 +20,43 @@ import (
 
 const ProtocolVersion20260728 = "2026-07-28"
 
-// ServerEndpoint configures a remote or local stateless MCP 2026-07-28 server.
+// ServerEndpoint configures a remote HTTP or local stdio MCP server.
 type ServerEndpoint struct {
-	Name      string
-	URL       string
-	AuthToken string
+	Name            string            `yaml:"name" json:"name"`
+	Transport       string            `yaml:"transport,omitempty" json:"transport,omitempty"` // "http" (default if URL set) | "stdio" (default if Command set)
+	URL             string            `yaml:"url,omitempty" json:"url,omitempty"`
+	AuthToken       string            `yaml:"auth_token,omitempty" json:"auth_token,omitempty"`
+	Command         string            `yaml:"command,omitempty" json:"command,omitempty"`
+	Args            []string          `yaml:"args,omitempty" json:"args,omitempty"`
+	Env             map[string]string `yaml:"env,omitempty" json:"env,omitempty"`
+	Enabled         *bool             `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	IsolatedDesktop bool              `yaml:"isolated_desktop,omitempty" json:"isolated_desktop,omitempty"`
+}
+
+// IsEnabled reports whether this MCP server endpoint is active (defaults to true).
+func (ep ServerEndpoint) IsEnabled() bool {
+	if ep.Enabled == nil {
+		return true
+	}
+	return *ep.Enabled
+}
+
+// EffectiveTransport resolves "stdio" vs "http".
+func (ep ServerEndpoint) EffectiveTransport() string {
+	t := strings.ToLower(strings.TrimSpace(ep.Transport))
+	if t != "" {
+		return t
+	}
+	if strings.TrimSpace(ep.Command) != "" {
+		return "stdio"
+	}
+	return "http"
+}
+
+// ImageAttachment carries a decoded image block returned by a multimodal MCP tool (e.g. screenshot).
+type ImageAttachment struct {
+	MIMEType string
+	Data     []byte
 }
 
 // SkillEntry describes a skill served via io.modelcontextprotocol/skills (SEP-2640).
@@ -39,6 +71,7 @@ type ToolCallOutput struct {
 	Server    string
 	Tool      string
 	Content   string
+	Images    []ImageAttachment
 	TrustTier string
 }
 
@@ -230,6 +263,46 @@ func SnapshotCatalog(ctx context.Context, client *Client, endpoints []ServerEndp
 		servers: sortedEps,
 		tools:   pinned,
 	}, nil
+}
+
+// NewEpochCatalog creates an empty EpochCatalog ready for PinServer calls.
+func NewEpochCatalog() *EpochCatalog {
+	return &EpochCatalog{}
+}
+
+// PinServer adds or replaces a server's tools in the catalog, maintaining lexicographical order.
+func (ec *EpochCatalog) PinServer(serverName string, tools []sdkmcp.Tool) {
+	ec.mu.Lock()
+	defer ec.mu.Unlock()
+	kept := ec.tools[:0]
+	for _, pt := range ec.tools {
+		if pt.Server != serverName {
+			kept = append(kept, pt)
+		}
+	}
+	ec.tools = kept
+	foundSrv := false
+	for _, s := range ec.servers {
+		if s.Name == serverName {
+			foundSrv = true
+			break
+		}
+	}
+	if !foundSrv {
+		ec.servers = append(ec.servers, ServerEndpoint{Name: serverName})
+		sort.Slice(ec.servers, func(i, j int) bool { return ec.servers[i].Name < ec.servers[j].Name })
+	}
+	for _, t := range tools {
+		schemaBytes, _ := json.Marshal(t.InputSchema)
+		ec.tools = append(ec.tools, PinnedTool{
+			QualifiedName: serverName + "." + t.Name,
+			Server:        serverName,
+			Tool:          t,
+			SchemaJSON:    string(schemaBytes),
+			TrustTier:     "untrusted_external",
+		})
+	}
+	sort.Slice(ec.tools, func(i, j int) bool { return ec.tools[i].QualifiedName < ec.tools[j].QualifiedName })
 }
 
 // Layer0Summaries returns sorted 1-line summaries per MCP server for Layer 0.

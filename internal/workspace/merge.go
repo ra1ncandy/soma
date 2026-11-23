@@ -194,8 +194,14 @@ func snapshotDirFiles(root string) (map[string]fileState, error) {
 			return nil
 		}
 		base := d.Name()
+		if base == ".soma" || base == ".git" {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
 		if d.IsDir() {
-			if base == ".soma" || base == ".git" {
+			if base == "__pycache__" || base == ".pytest_cache" {
 				return filepath.SkipDir
 			}
 			return nil

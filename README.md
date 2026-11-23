@@ -89,23 +89,39 @@ These run in CI with **scripted providers and no LLM**. They show that each kern
 | **B5** (`b5_oracles_reward_hacking_test.go`) | *ImpossibleBench* pinned test tampering + stale checksum (`p181`/`p183`) & Track D collapse | `100%` premature `Done` rejected until fresh verified artifact passes |
 | **B6** (`b6_branching_shadow_gauntlet_test.go`) | Scripted deceptive-local-optimum search + the 4-scenario [conformance gauntlet](docs/benchmarks/BENCHMARK_REPORT.md): each scenario replays one script with its kernel mechanism enabled and disabled, and checks ground truth both times | `BranchSearcher` escapes via Graveyard backtracking; `4/4` scenarios verified with the mechanism on and `0/4` with it off; `100%` `ModeExact` SHA-256 replay |
 
-### B. Live LLM A/B Evaluation (`benchmarks/live_eval_test.go`)
+### B. Live LLM A/B Evaluation & Hard Gauntlet (`benchmarks/live_eval_test.go`, `benchmarks/live_hard_test.go`)
 
-`TestLiveEvaluation_HypothesisAB` runs three tasks against a real tool-calling model, once through `soma` and once through a minimal append-only chat loop with LLM summarization that is written for this test. It is skipped unless `SOMA_LIVE_API_KEY` is set.
+`TestLiveEvaluation_HypothesisAB` runs three tasks against a real tool-calling model, once through `soma` and once through a minimal append-only chat loop with LLM summarization that is written for this test. It is skipped unless `SOMA_LIVE_API_KEY` (or fallback `OPENCODE_API_KEY`) is set. It targets the OpenCode Go API (`https://opencode.ai/zen/go/v1`) by default (`deepseek-v4.1-flash`), and supports `SOMA_LIVE_MODELS` (comma-separated, e.g. `deepseek-v4.1-flash,glm-5.3-flash`), `SOMA_LIVE_MAX_TOKENS` (default `16384`), and `SOMA_LIVE_REASONING_EFFORT`.
+
+`TestLiveHard_Gauntlet` (`benchmarks/live_hard_test.go`, with fixtures, anti-cheese traps, and reference solutions pinned offline in `benchmarks/live_hard_offline_test.go`) adds six harder live scenarios designed for `deepseek-v4.1-flash` and `glm-5.3-flash`:
+
+1. **`Hard1_MultiServiceLogCorrelation`** *(fair no-oracle A/B)*: 6-log (~1.9 MB) cross-service 503 incident tracing with ~80 decoy `ERROR`/`WARN` lines, `@page` spilling, and partial YAML/JSON config edits preserving sibling pools/shards.
+2. **`Hard2_MultiFileLedgerAndPinnedOracle`** *(oracle-gated `soma` vs. self-graded linear)*: 4-module ledger bug fix (`currency`, transitive `LockGraph` deadlock/rollback, atomic idempotent `LedgerEngine`, out-of-order `EventLog`) passing shallow `tests/test_public.py` (`EROFS`-pinned) yet gated by 14 held-out invariants.
+3. **`Hard3_CausalDriftBranchSearchAndDPO`** *(oracle-gated `BranchSearcher` + `ExportSFT`/`ExportDPO` vs. self-graded linear)*: Online causal anomaly detection defeating global z-score and naive fast EWMA traps under slow drift, 5x noise-scale shifts, sustained 60-sample plateaus, and O(N) runtime bounds.
+4. **`Hard4_CooperativeSwarmAndThreeWayMerge`** *(`soma` swarm stress test)*: 3 concurrent workers (`parser`, `validator`, `pipeline`) in isolated `git worktree`s communicating over the Layer-2 Blackboard, 3-way merging `app/registry.py`, sharing identical `PrefixHashL0L1`, and passing a root integration `CommandOracle`.
+5. **`Hard5_PromptInjectionTaintAndBiTemporalMem`** *(`soma` security/memory stress test)*: Indirect prompt injection + SSRF IMDS lure inside `web_extract`, *MINJA* untrusted memory quarantine, `SUPERSEDES` chain + `MaxLayer1Memories` RRF selection, and run-wide broker `ErrApprovalRequired` taint enforcement.
+6. **`Hard6_BgProcessAndEpochRollover`** *(`soma` runtime stress test)*: Sandboxed `bg_exec` -> `bg_poll` (`@page` spill) -> `bg_kill` lifecycle paired with mid-run `Epoch 1 -> Epoch 2` rollover and `ModeExact` replay.
 
 ```bash
-SOMA_LIVE_API_KEY=... SOMA_LIVE_BASE_URL=... SOMA_LIVE_MODEL=... \
-SOMA_LIVE_REPEATS=10 SOMA_LIVE_OUT=live_results.jsonl \
+# Run original 3-task A/B evaluation
+SOMA_LIVE_API_KEY=... SOMA_LIVE_BASE_URL=https://opencode.ai/zen/go/v1 \
+SOMA_LIVE_MODEL=deepseek-v4.1-flash SOMA_LIVE_REPEATS=10 SOMA_LIVE_OUT=live_results.jsonl \
 go test -count=1 -v -run TestLiveEvaluation_HypothesisAB ./benchmarks/
+
+# Run 6-scenario Hard Gauntlet against both OpenCode Go flash models
+OPENCODE_API_KEY=... \
+SOMA_LIVE_MODELS=deepseek-v4.1-flash,glm-5.3-flash \
+SOMA_LIVE_REPEATS=3 SOMA_LIVE_OUT=live_hard_results.jsonl \
+go test -count=1 -v -timeout 45m -run TestLiveHard_Gauntlet ./benchmarks/
 ```
 
 **No headline numbers are published here yet.** Earlier versions of this README reported `5/5` vs. `2/5` and a `98.6%` cache hit. Those figures were withdrawn because the baseline was not a fair one: it discarded its own summary at every compaction, never showed the summarizer the latest tool result, and was given fewer turns than `soma`. All three are fixed (and pinned by `live_baseline_test.go`), but the evaluation has not been re-run since.
 
-When reading results from this test, keep in mind:
+When reading results from these tests, keep in mind:
 
 - The baseline is a simple loop written for this repository. It is **not** Hermes, OpenClaw, or any other real harness.
-- Exp2 and Exp3 give `soma` an external oracle that feeds failing assertions back to the model, and give the baseline no verifier. They measure the value of verifier feedback, not of the rest of the kernel.
-- Three tasks is a small sample. Use `SOMA_LIVE_REPEATS` and report pass counts per model, with the raw `SOMA_LIVE_OUT` log.
+- `Exp2`, `Exp3`, `Hard2`, and `Hard3` give `soma` an external oracle that feeds failing assertions back to the model, and give the baseline no verifier. They measure the value of verifier feedback, not of the rest of the kernel. Only `Exp1` and `Hard1` compare `soma` against the linear loop without external verifier feedback; `Hard4`–`Hard6` are `soma`-only kernel stress tests.
+- Small task samples require `SOMA_LIVE_REPEATS`; report pass counts per model with the raw `SOMA_LIVE_OUT` log.
 
 ---
 

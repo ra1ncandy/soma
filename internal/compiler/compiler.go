@@ -93,6 +93,10 @@ type LogEntry struct {
 	ToolName         string `json:"tool_name,omitempty"`
 	ArgsJSON         string `json:"args_json,omitempty"`
 	AssistantContent string `json:"assistant_content,omitempty"`
+	// ReasoningContent carries the model's full chain-of-thought for the first tool call of a turn so
+	// interleaved-thinking models (DeepSeek, GLM, Kimi) keep their reasoning across tool round-trips.
+	// It is append-only within an epoch (cache-stable) and dropped at rollover.
+	ReasoningContent string `json:"reasoning_content,omitempty"`
 	Action           string `json:"action,omitempty"`
 	Reasoning        string `json:"reasoning,omitempty"`
 	Observation      string `json:"observation,omitempty"`
@@ -100,16 +104,30 @@ type LogEntry struct {
 	Masked           bool   `json:"masked,omitempty"`
 }
 
+// ViewportFrame describes the single ephemeral visual frame attached to Layer 3 (LiveTailState).
+// Only the content-addressed BlobHash and metadata are serialized in FrameDelta for O(T) storage
+// and ModeExact replay; DataURI is hydrated from BlobStore before wire serialization.
+type ViewportFrame struct {
+	BlobHash string `json:"blob_hash"`
+	MimeType string `json:"mime_type"`
+	Width    int    `json:"width,omitempty"`
+	Height   int    `json:"height,omitempty"`
+	PHash    string `json:"phash,omitempty"`
+	Summary  string `json:"summary,omitempty"`
+	DataURI  string `json:"-"`
+}
+
 // LiveTailState represents uncached Layer 3 telemetry rebuilt every turn.
 type LiveTailState struct {
-	WorkspaceKind       string `json:"workspace_kind"`
-	GitDiffStat         string `json:"git_diff_stat,omitempty"`
-	ResearchStatus      string `json:"research_status,omitempty"`
-	LastOracleError     string `json:"last_oracle_error,omitempty"`
-	StepBudgetRemaining int    `json:"step_budget_remaining"`
-	AccountQuotaSummary string `json:"account_quota_summary,omitempty"`
-	StallCount          int    `json:"stall_count"`
-	MaxStalls           int    `json:"max_stalls"`
+	WorkspaceKind       string         `json:"workspace_kind"`
+	GitDiffStat         string         `json:"git_diff_stat,omitempty"`
+	ResearchStatus      string         `json:"research_status,omitempty"`
+	LastOracleError     string         `json:"last_oracle_error,omitempty"`
+	StepBudgetRemaining int            `json:"step_budget_remaining"`
+	AccountQuotaSummary string         `json:"account_quota_summary,omitempty"`
+	StallCount          int            `json:"stall_count"`
+	MaxStalls           int            `json:"max_stalls"`
+	Viewport            *ViewportFrame `json:"viewport,omitempty"`
 }
 
 // FrameDelta is the incremental per-turn delta persisted to BlobStore for O(T) storage.
@@ -153,6 +171,9 @@ type canonicalWireFrame struct {
 	Layer2      string            `json:"layer2"`
 	Layer3      string            `json:"layer3"`
 	Breakpoints []CacheBreakpoint `json:"breakpoints"`
+	// ReasoningDigest covers preserved reasoning_content that is sent on the wire but not rendered
+	// into the Layer 2 text. Omitted when no entry carries reasoning so legacy hashes are unchanged.
+	ReasoningDigest string `json:"reasoning_digest,omitempty"`
 }
 
 // WireBytes returns the canonical deterministic JSON bytes sent over the wire.
@@ -165,6 +186,16 @@ func (f CompiledFrame) WireBytes() []byte {
 		Layer3:      f.Layer3,
 		Breakpoints: f.Breakpoints,
 	}
+	var rh []byte
+	for _, e := range f.Layer2Entries {
+		if e.ReasoningContent != "" && !e.Masked {
+			rh = append(rh, fmt.Sprintf("%d:%s:%d\x00", e.TurnIndex, e.ToolCallID, len(e.ReasoningContent))...)
+			rh = append(rh, e.ReasoningContent...)
+		}
+	}
+	if len(rh) > 0 {
+		w.ReasoningDigest = sha256Hex(rh)
+	}
 	b, _ := json.Marshal(w)
 	return b
 }
@@ -174,19 +205,27 @@ func DefaultCoreSyscalls() []SyscallDef {
 	return []SyscallDef{
 		{Name: "bg_exec", Signature: "bg_exec(command, label?)"},
 		{Name: "bg_kill", Signature: "bg_kill(job_id)"},
-		{Name: "bg_poll", Signature: "bg_poll(job_id)"},
+		{Name: "bg_poll", Signature: "bg_poll(job_id, wait_seconds?)"},
 		{Name: "branch_fork", Signature: "branch_fork(label, reason)"},
 		{Name: "broker_call", Signature: "broker_call(capability, op, params_json)"},
-		{Name: "exec", Signature: "exec(cmd, args_json)"},
+		{Name: "browser_task", Signature: "browser_task(goal, start_url?, max_steps?)"},
+		{Name: "cronjob_manage", Signature: "cronjob_manage(action, id?, schedule?, prompt?)"},
+		{Name: "desktop_task", Signature: "desktop_task(goal, max_steps?)"},
+		{Name: "exec", Signature: "exec(command, timeout_sec?)"},
+		{Name: "fs_grep", Signature: "fs_grep(pattern, path?, glob?, context_lines?, ignore_case?)"},
 		{Name: "fs_list", Signature: "fs_list(path?)"},
 		{Name: "fs_patch", Signature: "fs_patch(path, patch)"},
-		{Name: "fs_read", Signature: "fs_read(path)"},
+		{Name: "fs_read", Signature: "fs_read(path, start_line?, end_line?)"},
 		{Name: "fs_write", Signature: "fs_write(path, content)"},
+		{Name: "mcp_call", Signature: "mcp_call(server, tool, arguments_json?)"},
 		{Name: "memory_search", Signature: "memory_search(query, scope?)"},
-		{Name: "page_grep", Signature: "page_grep(page_id, pattern)"},
+		{Name: "memory_write", Signature: "memory_write(content, kind?, scope?)"},
+		{Name: "page_grep", Signature: "page_grep(page_id, pattern, context_lines?, ignore_case?)"},
 		{Name: "page_search", Signature: "page_search(query, page_id?)"},
 		{Name: "page_slice", Signature: "page_slice(page_id, start_line, end_line)"},
 		{Name: "publish_finding", Signature: "publish_finding(summary, page_id?)"},
+		{Name: "session_search", Signature: "session_search(query, limit?)"},
+		{Name: "skill_manage", Signature: "skill_manage(action, name?, content?)"},
 		{Name: "tool_search", Signature: "tool_search(query)"},
 		{Name: "vision_analyze", Signature: "vision_analyze(image_path, prompt)"},
 		{Name: "web_extract", Signature: "web_extract(url)"},
@@ -296,9 +335,13 @@ func NewEpochSnapshot(epoch int, in EpochInput) EpochSnapshot {
 func Compile(snap EpochSnapshot, l2 []LogEntry, tail LiveTailState, profile ModelProfile) CompiledFrame {
 	var l2Buf strings.Builder
 	l2Buf.WriteString("=== [LAYER 2: APPEND-ONLY WORKING LOG] ===\n")
+	reasoningBytes := 0
 	for _, entry := range l2 {
 		l2Buf.WriteString(formatLogEntry(entry))
 		l2Buf.WriteByte('\n')
+		if !entry.Masked {
+			reasoningBytes += len(entry.ReasoningContent)
+		}
 	}
 
 	var l3Buf strings.Builder
@@ -312,6 +355,19 @@ func Compile(snap EpochSnapshot, l2 []LogEntry, tail LiveTailState, profile Mode
 	}
 	if tail.LastOracleError != "" {
 		fmt.Fprintf(&l3Buf, "last_oracle_error: %s\n", strings.TrimSpace(tail.LastOracleError))
+	}
+	visionTokens := 0
+	if tail.Viewport != nil && tail.Viewport.BlobHash != "" {
+		shortHash := tail.Viewport.BlobHash
+		if len(shortHash) > 12 {
+			shortHash = shortHash[:12]
+		}
+		fmt.Fprintf(&l3Buf, "viewport: %s %dx%d sha256:%s", tail.Viewport.MimeType, tail.Viewport.Width, tail.Viewport.Height, shortHash)
+		if tail.Viewport.Summary != "" {
+			fmt.Fprintf(&l3Buf, " (%s)", strings.TrimSpace(tail.Viewport.Summary))
+		}
+		l3Buf.WriteByte('\n')
+		visionTokens = 1200
 	}
 	fmt.Fprintf(&l3Buf, "budget_remaining: %d | stalls: %d/%d | quota: %s\n",
 		tail.StepBudgetRemaining, tail.StallCount, tail.MaxStalls, tail.AccountQuotaSummary)
@@ -332,8 +388,8 @@ func Compile(snap EpochSnapshot, l2 []LogEntry, tail LiveTailState, profile Mode
 		PrefixHashL0L1: snap.PrefixHashL0L1,
 		L0Tokens:       EstimateTokens(l0),
 		L1Tokens:       EstimateTokens(l1),
-		L2Tokens:       EstimateTokens(l2Str),
-		L3Tokens:       EstimateTokens(l3Str),
+		L2Tokens:       EstimateTokens(l2Str) + (reasoningBytes+3)/4,
+		L3Tokens:       EstimateTokens(l3Str) + visionTokens,
 		Structured:     true,
 		Layer2Entries:  append([]LogEntry(nil), l2...),
 		Tail:           tail,
@@ -416,6 +472,26 @@ func Rollover(
 		mcpMap[m.Name] = m
 	}
 
+	// Keep the last 2 turns unmasked when rolling over a long log so the model does not suffer
+	// immediate short-term amnesia at an epoch boundary, while dropping reasoning_content to stay compact.
+	keepRecentTurnMin := -1
+	if len(l2) > 4 {
+		seenTurns := make(map[int]struct{})
+		var uniqueTurns []int
+		for _, e := range l2 {
+			if e.Kind == "turn" || e.Kind == "" {
+				if _, ok := seenTurns[e.TurnIndex]; !ok {
+					seenTurns[e.TurnIndex] = struct{}{}
+					uniqueTurns = append(uniqueTurns, e.TurnIndex)
+				}
+			}
+		}
+		if len(uniqueTurns) > 4 {
+			sort.Ints(uniqueTurns)
+			keepRecentTurnMin = uniqueTurns[len(uniqueTurns)-2]
+		}
+	}
+
 	var skeleton []LogEntry
 	for _, e := range l2 {
 		switch e.Kind {
@@ -436,6 +512,15 @@ func Rollover(
 				})
 			}
 		default:
+			if keepRecentTurnMin >= 0 && e.TurnIndex >= keepRecentTurnMin && !e.Masked {
+				recent := e
+				recent.ReasoningContent = ""
+				if len(recent.Observation) > 2048 {
+					recent.Observation = recent.Observation[:2045] + "..."
+				}
+				skeleton = append(skeleton, recent)
+				continue
+			}
 			maskedObs := e.Observation
 			if e.PageID == "" && len(maskedObs) > 160 {
 				maskedObs = maskedObs[:157] + "..."

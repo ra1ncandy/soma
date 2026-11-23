@@ -1,4 +1,5 @@
 .soma/
+.playwright-mcp/
 bin/
 *.db
 *.db-wal
