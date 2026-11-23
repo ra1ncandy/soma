@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="soma-csrf" content="__SOMA_CSRF__">
+  <title>soma</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="sidebar-top">
+        <div class="brand">
+          <span class="brand-dot" id="brandDot"></span>
+          <span class="brand-name">soma</span>
+        </div>
+        <button class="icon-btn" id="themeBtn" type="button" title="Toggle Light/Dark theme" aria-label="Toggle Light/Dark theme">◐</button>
+      </div>
+
+      <button class="new-task-btn" id="newTaskBtn" type="button">+ New Task</button>
+
+      <div class="sidebar-section-label">Tasks</div>
+      <div class="task-list" id="taskList" role="list"></div>
+
+      <nav class="nav-links" aria-label="Primary">
+        <button class="nav-item active" data-view="tasks" type="button">
+          <span>Tasks</span>
+        </button>
+        <button class="nav-item" data-view="approvals" type="button">
+          <span>Approvals</span>
+          <span class="nav-badge hidden" id="approvalsBadge">0</span>
+        </button>
+        <button class="nav-item" data-view="memory" type="button">
+          <span>Memory</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <span class="status-dot" id="sandboxDot"></span>
+        <span id="sandboxFooter">Connecting…</span>
+      </div>
+    </aside>
+
+    <main class="main">
+      <section class="view" id="viewTasks">
+        <header class="topbar">
+          <div class="topbar-left">
+            <h1 class="task-title" id="taskTitle">Select or start a task</h1>
+            <span class="pill hidden" id="taskStatusPill"></span>
+          </div>
+          <div class="topbar-actions" id="taskActions">
+            <button class="btn-secondary hidden" id="resumeBtn" type="button">Resume</button>
+            <button class="btn-secondary hidden" id="detailsBtn" type="button">Details ▾</button>
+            <button class="btn-secondary hidden" id="forkBtn" type="button">Fork</button>
+            <button class="btn-secondary hidden" id="verifyBtn" type="button">Verify</button>
+          </div>
+        </header>
+
+        <div class="details-drawer hidden" id="detailsDrawer"></div>
+
+        <div class="scroll-area" id="timelineScroll">
+          <div class="feed" id="timeline"></div>
+        </div>
+
+        <footer class="composer-wrap">
+          <form class="composer" id="goalForm">
+            <input
+              id="goalInput"
+              class="composer-input"
+              type="text"
+              placeholder="What should soma work on?"
+              autocomplete="off"
+              aria-label="Task goal"
+            >
+            <button class="btn-primary" id="startBtn" type="submit">Start</button>
+          </form>
+          <div class="composer-hint hidden" id="composerHint"></div>
+        </footer>
+      </section>
+
+      <section class="view hidden" id="viewApprovals">
+        <header class="topbar">
+          <div class="topbar-left">
+            <h1 class="task-title">Approvals</h1>
+          </div>
+        </header>
+        <div class="scroll-area">
+          <div class="feed" id="approvalsFeed"></div>
+        </div>
+      </section>
+
+      <section class="view hidden" id="viewMemory">
+        <header class="topbar">
+          <div class="topbar-left">
+            <h1 class="task-title">Memory &amp; Skills</h1>
+          </div>
+          <div class="topbar-actions">
+            <input
+              id="memorySearch"
+              class="search-input"
+              type="search"
+              placeholder="Filter rules and skills…"
+              aria-label="Filter rules and skills"
+            >
+          </div>
+        </header>
+        <div class="scroll-area">
+          <div class="feed" id="memoryFeed"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div class="toast hidden" id="toast" role="status" aria-live="polite"></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

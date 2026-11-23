@@ -54,6 +54,7 @@ func NewRootCmd() *cobra.Command {
 		newOracleCmd(),
 		newSandboxCmd(),
 		newUICmd(),
+		newWebCmd(),
 		newDaemonCmd(),
 		newBridgeCmd(),
 		newAccountCmd(),
