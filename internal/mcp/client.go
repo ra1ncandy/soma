@@ -20,15 +20,20 @@ import (
 
 const ProtocolVersion20260728 = "2026-07-28"
 
-// ServerEndpoint configures a remote HTTP or local stdio MCP server.
+// ServerEndpoint configures a remote HTTP/SSE/Streamable HTTP or local stdio MCP server.
 type ServerEndpoint struct {
 	Name            string            `yaml:"name" json:"name"`
-	Transport       string            `yaml:"transport,omitempty" json:"transport,omitempty"` // "http" (default if URL set) | "stdio" (default if Command set)
+	Transport       string            `yaml:"transport,omitempty" json:"transport,omitempty"` // "http" | "streamable_http" | "sse" | "stdio"
 	URL             string            `yaml:"url,omitempty" json:"url,omitempty"`
 	AuthToken       string            `yaml:"auth_token,omitempty" json:"auth_token,omitempty"`
+	Headers         map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
 	Command         string            `yaml:"command,omitempty" json:"command,omitempty"`
 	Args            []string          `yaml:"args,omitempty" json:"args,omitempty"`
 	Env             map[string]string `yaml:"env,omitempty" json:"env,omitempty"`
+	IncludeTools    []string          `yaml:"include_tools,omitempty" json:"include_tools,omitempty"`
+	ExcludeTools    []string          `yaml:"exclude_tools,omitempty" json:"exclude_tools,omitempty"`
+	TimeoutSeconds  int               `yaml:"timeout_seconds,omitempty" json:"timeout_seconds,omitempty"`
+	OAuth           *OAuthConfig      `yaml:"oauth,omitempty" json:"oauth,omitempty"`
 	Enabled         *bool             `yaml:"enabled,omitempty" json:"enabled,omitempty"`
 	IsolatedDesktop bool              `yaml:"isolated_desktop,omitempty" json:"isolated_desktop,omitempty"`
 }
@@ -41,16 +46,34 @@ func (ep ServerEndpoint) IsEnabled() bool {
 	return *ep.Enabled
 }
 
-// EffectiveTransport resolves "stdio" vs "http".
+// EffectiveTransport resolves "stdio", "sse", "streamable_http", or "http".
 func (ep ServerEndpoint) EffectiveTransport() string {
 	t := strings.ToLower(strings.TrimSpace(ep.Transport))
-	if t != "" {
-		return t
+	switch t {
+	case "streamable", "streamable_http", "streamable-http", "http-streamable":
+		return "streamable_http"
+	case "sse":
+		return "sse"
+	case "stdio":
+		return "stdio"
+	case "http":
+		return "http"
 	}
 	if strings.TrimSpace(ep.Command) != "" {
 		return "stdio"
 	}
+	if ep.OAuth != nil && ep.OAuth.Enabled {
+		return "streamable_http"
+	}
 	return "http"
+}
+
+// EffectiveTimeout returns the configured per-server timeout, defaulting to 30s.
+func (ep ServerEndpoint) EffectiveTimeout() time.Duration {
+	if ep.TimeoutSeconds > 0 {
+		return time.Duration(ep.TimeoutSeconds) * time.Second
+	}
+	return 30 * time.Second
 }
 
 // ImageAttachment carries a decoded image block returned by a multimodal MCP tool (e.g. screenshot).
@@ -73,6 +96,31 @@ type ToolCallOutput struct {
 	Content   string
 	Images    []ImageAttachment
 	TrustTier string
+}
+
+// ResourceReadOutput represents an MCP resources/read result tagged untrusted_external.
+type ResourceReadOutput struct {
+	Server    string
+	URI       string
+	MIMEType  string
+	Text      string
+	Blob      []byte
+	TrustTier string
+}
+
+// PromptMessage represents a single message returned by MCP prompts/get.
+type PromptMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+// PromptGetOutput represents an MCP prompts/get result tagged untrusted_external.
+type PromptGetOutput struct {
+	Server      string
+	Prompt      string
+	Description string
+	Messages    []PromptMessage
+	TrustTier   string
 }
 
 // PinnedTool ties a qualified tool name (server.tool) to its canonical JSON schema.
@@ -122,7 +170,13 @@ func (c *Client) rpcCall(ctx context.Context, ep ServerEndpoint, method, mcpName
 		req.Header.Set("Mcp-Name", mcpName)
 	}
 	if ep.AuthToken != "" {
-		req.Header.Set("Authorization", "Bearer "+ep.AuthToken)
+		req.Header.Set("Authorization", "Bearer "+expandEnvVars(ep.AuthToken))
+	}
+	for k, v := range ResolveHeaders(ep) {
+		if strings.EqualFold(k, "Authorization") && ep.AuthToken != "" {
+			continue
+		}
+		req.Header.Set(k, v)
 	}
 
 	client := c.HTTPClient
@@ -226,6 +280,98 @@ func (c *Client) GetSkill(ctx context.Context, ep ServerEndpoint, name string) (
 		return SkillEntry{}, err
 	}
 	return res, nil
+}
+
+// ListResources queries resources/list on ep.
+func (c *Client) ListResources(ctx context.Context, ep ServerEndpoint) ([]sdkmcp.Resource, error) {
+	var res struct {
+		Resources []sdkmcp.Resource `json:"resources"`
+	}
+	if err := c.rpcCall(ctx, ep, "resources/list", "", map[string]any{}, &res); err != nil {
+		return nil, err
+	}
+	return res.Resources, nil
+}
+
+// ReadResource reads a resource URI via resources/read on ep, tagged untrusted_external.
+func (c *Client) ReadResource(ctx context.Context, ep ServerEndpoint, uri string) (ResourceReadOutput, error) {
+	var res struct {
+		Contents []struct {
+			URI      string `json:"uri"`
+			MIMEType string `json:"mimeType,omitempty"`
+			Text     string `json:"text,omitempty"`
+			Blob     string `json:"blob,omitempty"`
+		} `json:"contents"`
+	}
+	if err := c.rpcCall(ctx, ep, "resources/read", uri, map[string]any{"uri": uri}, &res); err != nil {
+		return ResourceReadOutput{}, err
+	}
+	out := ResourceReadOutput{
+		Server:    ep.Name,
+		URI:       uri,
+		TrustTier: "untrusted_external",
+	}
+	var texts []string
+	for _, item := range res.Contents {
+		if out.MIMEType == "" && item.MIMEType != "" {
+			out.MIMEType = item.MIMEType
+		}
+		if item.Text != "" {
+			texts = append(texts, item.Text)
+		}
+		if len(out.Blob) == 0 && item.Blob != "" {
+			out.Blob = []byte(item.Blob)
+		}
+	}
+	out.Text = strings.Join(texts, "\n")
+	return out, nil
+}
+
+// ListPrompts queries prompts/list on ep.
+func (c *Client) ListPrompts(ctx context.Context, ep ServerEndpoint) ([]sdkmcp.Prompt, error) {
+	var res struct {
+		Prompts []sdkmcp.Prompt `json:"prompts"`
+	}
+	if err := c.rpcCall(ctx, ep, "prompts/list", "", map[string]any{}, &res); err != nil {
+		return nil, err
+	}
+	return res.Prompts, nil
+}
+
+// GetPrompt fetches a prompt via prompts/get on ep, tagged untrusted_external.
+func (c *Client) GetPrompt(ctx context.Context, ep ServerEndpoint, name string, args map[string]string) (PromptGetOutput, error) {
+	if args == nil {
+		args = map[string]string{}
+	}
+	var res struct {
+		Description string `json:"description,omitempty"`
+		Messages    []struct {
+			Role    string `json:"role"`
+			Content struct {
+				Type string `json:"type"`
+				Text string `json:"text,omitempty"`
+			} `json:"content"`
+		} `json:"messages"`
+	}
+	if err := c.rpcCall(ctx, ep, "prompts/get", name, map[string]any{
+		"name":      name,
+		"arguments": args,
+	}, &res); err != nil {
+		return PromptGetOutput{}, err
+	}
+	out := PromptGetOutput{
+		Server:      ep.Name,
+		Prompt:      name,
+		Description: res.Description,
+		TrustTier:   "untrusted_external",
+	}
+	for _, m := range res.Messages {
+		out.Messages = append(out.Messages, PromptMessage{
+			Role:    m.Role,
+			Content: m.Content.Text,
+		})
+	}
+	return out, nil
 }
 
 // EpochCatalog holds an alphabetically sorted, epoch-pinned snapshot of MCP tools for deterministic prefix caching.

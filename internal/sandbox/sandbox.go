@@ -64,6 +64,25 @@ func NewManager() *Manager {
 	}
 }
 
+// NewManagerForMode builds a fail-closed sandbox Manager honoring a preferred backend ("auto" | "bwrap" | "seatbelt").
+// It never disables FailIfUnavailable, preserving soma's fail-closed security invariant.
+func NewManagerForMode(mode string) *Manager {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "bwrap", "bubblewrap":
+		return &Manager{
+			FailIfUnavailable: true,
+			Backends:          []Backend{newBwrapBackend()},
+		}
+	case "seatbelt":
+		return &Manager{
+			FailIfUnavailable: true,
+			Backends:          []Backend{newSeatbeltBackend()},
+		}
+	default:
+		return NewManager()
+	}
+}
+
 // ActiveBackend returns the first backend able to isolate a default (no-network) spec, if any.
 func (m *Manager) ActiveBackend() Backend {
 	for _, b := range m.Backends {

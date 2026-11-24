@@ -47,6 +47,7 @@ func NewRootCmd() *cobra.Command {
 		newChatCmd(),
 		newDesktopCmd(),
 		newImportHermesCmd(),
+		newMCPCmd(),
 		newRunCmd(),
 		newResumeCmd(),
 		newForkCmd(),

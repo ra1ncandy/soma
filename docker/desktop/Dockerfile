@@ -30,11 +30,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium \
     fonts-dejavu-core \
     fonts-liberation \
+    git \
     nodejs \
     npm \
+    python3-pip \
+    python3-venv \
+    sudo \
+    unzip \
+    wget \
+    xdg-utils \
     && rm -rf /var/lib/apt/lists/*
 
 RUN useradd -ms /bin/bash -u 1000 soma && \
+    echo "soma ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/soma && \
+    chmod 0440 /etc/sudoers.d/soma && \
     mkdir -p /opt/soma-desktop /workspace /home/soma/.vnc && \
     chown -R soma:soma /opt/soma-desktop /workspace /home/soma
 

@@ -13,7 +13,7 @@
 
     <aside class="sidebar" id="sidebar" aria-label="Navigation">
       <div class="sidebar-top">
-        <button class="brand-btn" id="brandHomeBtn" type="button" title="New Task">
+        <button class="brand-btn" id="brandHomeBtn" type="button" title="soma Home">
           <svg class="sparkle-icon" viewBox="0 0 24 24" aria-hidden="true">
             <path d="M12 2L14.4 9.6L22 12L14.4 14.4L12 22L9.6 14.4L2 12L9.6 9.6L12 2Z" fill="url(#somaSparkle)"/>
             <defs>
@@ -37,41 +37,20 @@
         </div>
       </div>
 
-      <button class="new-task-btn" id="newTaskBtn" type="button">
-        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+      <button class="new-task-btn" id="newTaskBtn" type="button" title="Start a new task">
+        <svg class="nav-ico" viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2">
           <path d="M12 5v14M5 12h14"/>
         </svg>
         <span class="nav-label">New task</span>
       </button>
 
       <nav class="nav-links" aria-label="Primary">
-        <button class="nav-item active" data-view="tasks" type="button" title="Tasks">
+        <button class="nav-item active" id="tasksNavBtn" data-view="tasks" type="button" title="Tasks &amp; Chat">
           <svg class="nav-ico" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8">
             <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
           </svg>
           <span class="nav-label">Tasks</span>
-        </button>
-        <button class="nav-item" data-view="desktop" type="button" title="Virtual Desktop">
-          <svg class="nav-ico" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8">
-            <rect x="2" y="3" width="20" height="14" rx="2"/>
-            <path d="M8 21h8M12 17v4"/>
-          </svg>
-          <span class="nav-label">Virtual Desktop</span>
-          <span class="status-dot nav-dot" id="desktopNavDot"></span>
-        </button>
-        <button class="nav-item" data-view="connectors" type="button" title="Connectors">
-          <svg class="nav-ico" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8">
-            <path d="M12 2v6M12 16v6M4.93 4.93l4.24 4.24M14.83 14.83l4.24 4.24M2 12h6M16 12h6M4.93 19.07l4.24-4.24M14.83 9.17l4.24-4.24"/>
-          </svg>
-          <span class="nav-label">Connectors</span>
-          <span class="nav-pill" id="connectorsCountPill">0</span>
-        </button>
-        <button class="nav-item" data-view="harness" type="button" title="Harness Setup">
-          <svg class="nav-ico" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8">
-            <circle cx="12" cy="12" r="3"/>
-            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.6.77 1.02 1.4 1.13H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
-          </svg>
-          <span class="nav-label">Harness</span>
+          <span class="status-dot nav-dot hidden" id="activeTaskNavDot"></span>
         </button>
         <button class="nav-item" data-view="approvals" type="button" title="Approvals">
           <svg class="nav-ico" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8">
@@ -81,12 +60,34 @@
           <span class="nav-label">Approvals</span>
           <span class="nav-badge hidden" id="approvalsBadge">0</span>
         </button>
-        <button class="nav-item" data-view="memory" type="button" title="Memory & Skills">
+        <button class="nav-item" data-view="desktop" type="button" title="Virtual Desktop">
+          <svg class="nav-ico" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8">
+            <rect x="2" y="3" width="20" height="14" rx="2"/>
+            <path d="M8 21h8M12 17v4"/>
+          </svg>
+          <span class="nav-label">Virtual Desktop</span>
+          <span class="status-dot nav-dot" id="desktopNavDot"></span>
+        </button>
+        <button class="nav-item" data-view="connectors" type="button" title="Connectors &amp; Bridges">
+          <svg class="nav-ico" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8">
+            <path d="M12 2v6M12 16v6M4.93 4.93l4.24 4.24M14.83 14.83l4.24 4.24M2 12h6M16 12h6M4.93 19.07l4.24-4.24M14.83 9.17l4.24-4.24"/>
+          </svg>
+          <span class="nav-label">Connectors</span>
+          <span class="nav-pill" id="connectorsCountPill">0</span>
+        </button>
+        <button class="nav-item" data-view="memory" type="button" title="Memory &amp; Skills">
           <svg class="nav-ico" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8">
             <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>
             <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
           </svg>
           <span class="nav-label">Memory &amp; Skills</span>
+        </button>
+        <button class="nav-item" data-view="harness" type="button" title="Settings">
+          <svg class="nav-ico" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8">
+            <circle cx="12" cy="12" r="3"/>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.6.77 1.02 1.4 1.13H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+          </svg>
+          <span class="nav-label">Settings</span>
         </button>
       </nav>
 
@@ -94,11 +95,14 @@
       <div class="task-list" id="taskList" role="list"></div>
 
       <div class="sidebar-footer">
-        <div class="footer-status" title="Sandbox &amp; Provider status">
+        <div class="footer-status" title="Active model &amp; OS sandbox">
           <span class="status-dot" id="sandboxDot"></span>
           <span class="nav-label" id="sandboxFooter">Connecting…</span>
         </div>
-        <button class="icon-btn" id="themeBtn" type="button" title="Toggle Light/Dark theme" aria-label="Toggle Light/Dark theme">◐</button>
+        <div class="footer-actions">
+          <button class="icon-btn hidden" id="logoutBtn" type="button" title="Sign out" aria-label="Sign out">⎋</button>
+          <button class="icon-btn" id="themeBtn" type="button" title="Toggle Light/Dark theme" aria-label="Toggle Light/Dark theme">◐</button>
+        </div>
       </div>
     </aside>
 
@@ -111,124 +115,181 @@
             <line x1="4" y1="16" x2="20" y2="16"/>
           </svg>
         </button>
-        <button class="mobile-model-pill" id="mobileModelPill" type="button">
+        <button class="mobile-model-pill" id="mobileModelPill" type="button" title="Choose model and execution profile">
           <span id="mobileModelLabel">soma</span>
           <span class="muted">▾</span>
         </button>
         <div class="mobile-header-right">
-          <button class="icon-btn" id="mobileDesktopBtn" type="button" title="Virtual Desktop" aria-label="Virtual Desktop">
-            <span class="status-dot" id="mobileDesktopDot"></span>
+          <button class="icon-btn mobile-desktop-btn" id="mobileDesktopBtn" type="button" title="Virtual Desktop" aria-label="Virtual Desktop">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8">
+              <rect x="2" y="3" width="20" height="14" rx="2"/>
+              <path d="M8 21h8M12 17v4"/>
+            </svg>
+            <span class="status-dot mobile-corner-dot" id="mobileDesktopDot"></span>
           </button>
-          <button class="icon-btn" id="mobileNewTaskBtn" type="button" title="New task" aria-label="New task">+</button>
+          <button class="icon-btn" id="mobileNewTaskBtn" type="button" title="New task" aria-label="New task">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M12 5v14M5 12h14"/>
+            </svg>
+          </button>
         </div>
       </header>
 
-      <!-- View: Tasks (Gemini-inspired home & timeline) -->
+      <!-- View: Tasks -->
       <section class="view" id="viewTasks">
-        <header class="topbar" id="taskTopbar">
+        <header class="topbar hidden" id="taskTopbar">
           <div class="topbar-left">
-            <h1 class="task-title" id="taskTitle">New Task</h1>
+            <h1 class="task-title" id="taskTitle">Task</h1>
+            <button class="icon-btn icon-btn-sm" id="renameTaskBtn" type="button" title="Rename task" aria-label="Rename task">✎</button>
             <span class="pill hidden" id="taskStatusPill"></span>
+            <select class="select-input select-compact hidden" id="branchSelect" aria-label="Select branch version"></select>
           </div>
           <div class="topbar-actions" id="taskActions">
-            <button class="btn-secondary hidden" id="resumeBtn" type="button">Resume</button>
-            <button class="btn-secondary hidden" id="detailsBtn" type="button">Details ▾</button>
-            <button class="btn-secondary hidden" id="forkBtn" type="button">Fork</button>
-            <button class="btn-secondary hidden" id="verifyBtn" type="button">Verify</button>
+            <button class="btn-danger hidden" id="stopBtn" type="button" title="Stop running task">Stop</button>
+            <button class="btn-primary hidden" id="resumeBtn" type="button" title="Resume paused or stopped task">Resume</button>
+            <button class="btn-secondary hidden" id="detailsBtn" type="button" title="Show token cache &amp; workspace details">Details ▾</button>
+            <button class="btn-secondary hidden" id="forkBtn" type="button" title="Create an isolated branch from the latest step">Branch</button>
+            <button class="btn-secondary hidden" id="verifyBtn" type="button" title="Cryptographically verify every recorded step hash">Audit Replay</button>
+            <button class="btn-secondary" id="splitDesktopBtn" type="button" title="Toggle Live Virtual Desktop split view">
+              <span class="status-dot" id="splitDesktopDot"></span>
+              <span>Desktop</span>
+            </button>
           </div>
         </header>
 
         <div class="details-drawer hidden" id="detailsDrawer"></div>
+        <div class="task-banner hidden" id="workspaceChangesBar"></div>
+        <div class="task-banner warn-banner hidden" id="inlineApprovalsBar"></div>
 
-        <div class="tasks-stage empty-mode" id="tasksStage">
-          <div class="hero-empty" id="heroEmpty">
-            <div class="hero-sparkle" aria-hidden="true">
-              <svg viewBox="0 0 36 36" width="38" height="38">
-                <path d="M18 3L21.6 14.4L33 18L21.6 21.6L18 33L14.4 21.6L3 18L14.4 14.4L18 3Z" fill="url(#heroSparkleGrad)"/>
-                <defs>
-                  <linearGradient id="heroSparkleGrad" x1="3" y1="3" x2="33" y2="33" gradientUnits="userSpaceOnUse">
-                    <stop offset="0%" stop-color="#4285f4"/>
-                    <stop offset="50%" stop-color="#a855f7"/>
-                    <stop offset="100%" stop-color="#38bdf8"/>
-                  </linearGradient>
-                </defs>
-              </svg>
+        <div class="tasks-workspace" id="tasksWorkspace">
+          <div class="tasks-stage empty-mode" id="tasksStage">
+            <button class="floating-desktop-pill" id="floatingDesktopBtn" type="button" title="Toggle Virtual Desktop split view">
+              <span class="status-dot" id="floatingDesktopDot"></span>
+              <span>Virtual Desktop</span>
+            </button>
+
+            <div class="hero-empty" id="heroEmpty">
+              <div class="hero-sparkle mobile-only" aria-hidden="true">
+                <svg viewBox="0 0 36 36" width="38" height="38">
+                  <path d="M18 3L21.6 14.4L33 18L21.6 21.6L18 33L14.4 21.6L3 18L14.4 14.4L18 3Z" fill="url(#heroSparkleGrad)"/>
+                  <defs>
+                    <linearGradient id="heroSparkleGrad" x1="3" y1="3" x2="33" y2="33" gradientUnits="userSpaceOnUse">
+                      <stop offset="0%" stop-color="#4285f4"/>
+                      <stop offset="50%" stop-color="#a855f7"/>
+                      <stop offset="100%" stop-color="#38bdf8"/>
+                    </linearGradient>
+                  </defs>
+                </svg>
+              </div>
+              <h2 class="hero-title">Where should we start?</h2>
+              <p class="hero-sub" id="heroSubtitle">Run coding, research, or browser tasks safely inside an isolated sandbox.</p>
+              <div class="hero-setup-callout hidden" id="heroSetupCallout"></div>
+              <div class="starter-chips" id="starterChips">
+                <button class="starter-chip" type="button" data-prompt="Explore this workspace and summarize how it is structured.">Summarize this project</button>
+                <button class="starter-chip" type="button" data-prompt="Run the test suite, diagnose any failures, and propose a fix.">Run &amp; fix tests</button>
+                <button class="starter-chip" type="button" data-prompt="Audit recent changes for bugs, edge cases, or security issues.">Review code &amp; security</button>
+                <button class="starter-chip" type="button" data-prompt="Build a clean prototype feature in an isolated workspace so I can review the diff.">Prototype a feature</button>
+              </div>
             </div>
-            <h2 class="hero-title">Where should we start?</h2>
-            <p class="hero-subtitle" id="heroSubtitle">Sandboxed agent harness with virtual desktop &amp; MCP connectors.</p>
+
+            <div class="scroll-area hidden" id="timelineScroll">
+              <div class="feed" id="timeline"></div>
+            </div>
+
+            <footer class="composer-wrap" id="composerWrap">
+              <div class="composer-shell">
+                <div class="composer-popover hidden" id="composerToolsMenu">
+                  <div class="popover-section-label">Tools &amp; Workspace</div>
+                  <button class="popover-item" id="quickDesktopToggle" type="button">
+                    <span>Virtual Desktop</span>
+                    <span class="muted" id="quickDesktopState">Stopped</span>
+                  </button>
+                  <button class="popover-item" id="quickOpenConnectors" type="button">
+                    <span>Connectors &amp; Bridges</span>
+                    <span class="muted" id="quickConnectorsCount">0 active</span>
+                  </button>
+                  <button class="popover-item" id="quickOpenHarness" type="button">
+                    <span>Settings</span>
+                    <span class="muted">→</span>
+                  </button>
+                </div>
+
+                <div class="composer-popover composer-popover-right hidden" id="composerModeMenu">
+                  <div class="popover-section-label">Execution Depth</div>
+                  <button class="popover-item" data-profile="worker" type="button">
+                    <span>Worker</span>
+                    <span class="muted">Fast, scoped</span>
+                  </button>
+                  <button class="popover-item" data-profile="frontier" type="button">
+                    <span>Frontier</span>
+                    <span class="muted">Deep reasoning</span>
+                  </button>
+                </div>
+
+                <form class="composer" id="goalForm">
+                  <button class="composer-icon-btn" id="composerPlusBtn" type="button" title="Tools &amp; connectors" aria-label="Tools and connectors">
+                    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+                      <path d="M12 5v14M5 12h14"/>
+                    </svg>
+                  </button>
+                  <textarea
+                    id="goalInput"
+                    class="composer-input"
+                    rows="1"
+                    placeholder="Ask soma to build, debug, or browse… (Shift+Enter for new line)"
+                    aria-label="Task goal"
+                  ></textarea>
+                  <select class="mode-pill model-select-pill" id="composerAccountSel" title="Choose AI model (or Auto by role)" aria-label="Select model profile"></select>
+                  <button class="mode-pill" id="composerModeBtn" type="button" title="Choose execution depth">
+                    <span class="mode-dot"></span>
+                    <span id="composerModeLabel">Worker</span>
+                    <span class="muted">▾</span>
+                  </button>
+                  <button class="send-pill-btn" id="startBtn" type="submit" title="Send (Enter)" aria-label="Send">
+                    <svg id="sendBtnIcon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.2">
+                      <path d="M5 12h14M13 5l7 7-7 7"/>
+                    </svg>
+                  </button>
+                </form>
+              </div>
+              <div class="composer-hint hidden" id="composerHint"></div>
+            </footer>
           </div>
 
-          <div class="scroll-area hidden" id="timelineScroll">
-            <div class="feed" id="timeline"></div>
-          </div>
-
-          <footer class="composer-wrap" id="composerWrap">
-            <div class="composer-shell">
-              <div class="composer-popover hidden" id="composerToolsMenu">
-                <div class="popover-section-label">Quick Tools &amp; Connectors</div>
-                <button class="popover-item" id="quickDesktopToggle" type="button">
-                  <span>Virtual Desktop</span>
-                  <span class="muted" id="quickDesktopState">Stopped</span>
-                </button>
-                <button class="popover-item" id="quickOpenConnectors" type="button">
-                  <span>Manage MCP Connectors</span>
-                  <span class="muted" id="quickConnectorsCount">0 active</span>
-                </button>
-                <button class="popover-item" id="quickOpenHarness" type="button">
-                  <span>Harness &amp; Provider Setup</span>
-                  <span class="muted">→</span>
-                </button>
+          <!-- Live Virtual Desktop Split Panel -->
+          <aside class="desktop-split hidden" id="desktopSplitPane">
+            <div class="desktop-split-head">
+              <div class="connector-title-row">
+                <span class="status-dot" id="splitPaneDot"></span>
+                <span class="connector-name">Agent Virtual Desktop</span>
               </div>
-
-              <div class="composer-popover composer-popover-right hidden" id="composerModeMenu">
-                <div class="popover-section-label">Execution Profile</div>
-                <button class="popover-item" data-profile="worker" type="button">
-                  <span>Worker</span>
-                  <span class="muted">Fast, scoped</span>
-                </button>
-                <button class="popover-item" data-profile="frontier" type="button">
-                  <span>Frontier</span>
-                  <span class="muted">Deep reasoning</span>
-                </button>
+              <div class="connector-actions">
+                <button class="btn-secondary btn-sm hidden" id="splitTakeOverBtn" type="button" title="Take over mouse &amp; keyboard control">Take Over</button>
+                <button class="btn-secondary btn-sm" id="splitExpandDesktopBtn" type="button" title="Open full view">Full View</button>
+                <button class="icon-btn" id="splitCloseBtn" type="button" title="Close split view">✕</button>
               </div>
-
-              <form class="composer" id="goalForm">
-                <button class="composer-icon-btn" id="composerPlusBtn" type="button" title="Tools &amp; connectors" aria-label="Tools and connectors">
-                  <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
-                    <path d="M12 5v14M5 12h14"/>
-                  </svg>
-                </button>
-                <input
-                  id="goalInput"
-                  class="composer-input"
-                  type="text"
-                  placeholder="Ask soma to build or browse…"
-                  autocomplete="off"
-                  aria-label="Task goal"
-                >
-                <button class="mode-pill" id="composerModeBtn" type="button" title="Select profile">
-                  <span class="mode-dot"></span>
-                  <span id="composerModeLabel">Worker</span>
-                  <span class="muted">▾</span>
-                </button>
-                <button class="send-pill-btn" id="startBtn" type="submit" title="Start task" aria-label="Start task">
-                  <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.2">
-                    <path d="M5 12h14M13 5l7 7-7 7"/>
-                  </svg>
-                </button>
-              </form>
             </div>
-            <div class="composer-hint hidden" id="composerHint"></div>
-          </footer>
+            <div class="desktop-split-body">
+              <div class="desktop-placeholder compact hidden" id="splitPlaceholder">
+                <p>Virtual Desktop is stopped.</p>
+                <button class="btn-primary btn-sm" id="splitLaunchCta" type="button">Launch Desktop</button>
+              </div>
+              <iframe id="splitDesktopFrame" class="desktop-frame hidden" title="Live Agent Virtual Desktop"></iframe>
+              <div class="desktop-shield hidden" id="splitDesktopShield" title="View-only mode — click Take Over to control">
+                <span class="desktop-shield-pill">View-Only (Agent Control)</span>
+              </div>
+            </div>
+          </aside>
         </div>
       </section>
 
-      <!-- View: Virtual Desktop (Grokbot-style live interactive desktop) -->
+      <!-- View: Virtual Desktop -->
       <section class="view hidden" id="viewDesktop">
         <header class="topbar">
           <div class="topbar-left">
             <h1 class="task-title">Agent Virtual Desktop</h1>
             <span class="pill" id="desktopStatusPill">Stopped</span>
+            <span class="pill hidden" id="desktopControlPill">View-Only (Agent Control)</span>
           </div>
           <div class="topbar-actions">
             <select class="select-input" id="desktopResSelect" aria-label="Resolution">
@@ -237,11 +298,12 @@
               <option value="1024x768">1024×768</option>
             </select>
             <select class="select-input" id="desktopNetSelect" aria-label="Network mode">
-              <option value="bridge">Bridge Net</option>
-              <option value="none">Airgapped (none)</option>
+              <option value="bridge">Internet Access (Bridge)</option>
+              <option value="none">Offline / Airgapped</option>
             </select>
+            <button class="btn-secondary hidden" id="desktopTakeOverBtn" type="button">Take Over</button>
             <button class="btn-primary" id="desktopStartBtn" type="button">Launch Desktop</button>
-            <button class="btn-secondary hidden" id="desktopStopBtn" type="button">Stop</button>
+            <button class="btn-danger hidden" id="desktopStopBtn" type="button">Stop Desktop</button>
             <a class="btn-secondary hidden" id="desktopPopoutLink" href="#" target="_blank" rel="noopener">Pop Out ↗</a>
           </div>
         </header>
@@ -250,7 +312,7 @@
           <div class="desktop-placeholder" id="desktopPlaceholder">
             <div class="desktop-placeholder-icon">🖥️</div>
             <h2>Isolated Agent Virtual Desktop</h2>
-            <p>Spin up a sandboxed Ubuntu XFCE desktop with noVNC, Chromium, and Playwright. Watch and interact with the agent's screen in real time — from desktop or mobile.</p>
+            <p>Spin up a sandboxed Ubuntu XFCE desktop with Chromium and Playwright. Once running, soma automatically connects desktop control tools so it can see and interact with the screen.</p>
             <div class="desktop-meta-row" id="desktopMetaRow"></div>
           </div>
           <iframe
@@ -259,22 +321,29 @@
             title="Agent Virtual Desktop (noVNC)"
             allow="clipboard-read; clipboard-write"
           ></iframe>
+          <div class="desktop-shield hidden" id="desktopShield" title="View-only mode — click Take Over to control">
+            <span class="desktop-shield-pill">View-Only · Click Take Over to control</span>
+          </div>
         </div>
       </section>
 
-      <!-- View: Connectors (Gemini /customize/connectors style) -->
+      <!-- View: Connectors -->
       <section class="view hidden" id="viewConnectors">
         <header class="topbar">
           <div class="topbar-left">
+            <h1 class="task-title">Connectors</h1>
             <div class="subtabs" role="tablist">
-              <button class="subtab active" data-conn-tab="all" type="button">Discover</button>
-              <button class="subtab" data-conn-tab="mcp" type="button">MCP Servers</button>
+              <button class="subtab active" data-conn-tab="installed" type="button">Installed MCPs</button>
+              <button class="subtab" data-conn-tab="presets" type="button">Browse Catalog</button>
               <button class="subtab" data-conn-tab="bridges" type="button">Channel Bridges</button>
             </div>
           </div>
           <div class="topbar-actions">
             <input id="connectorSearch" class="search-input" type="search" placeholder="Search connectors…" aria-label="Search connectors">
-            <button class="btn-primary" id="addCustomMcpBtn" type="button">+ Custom MCP</button>
+            <div class="topbar-actions" id="mcpHeaderActions">
+              <button class="btn-secondary" id="importMcpBtn" type="button">Import Config</button>
+              <button class="btn-primary" id="addCustomMcpBtn" type="button">+ Custom MCP</button>
+            </div>
           </div>
         </header>
 
@@ -283,15 +352,16 @@
         </div>
       </section>
 
-      <!-- View: Harness Setup & Control -->
+      <!-- View: Settings (Harness Setup & Control) -->
       <section class="view hidden" id="viewHarness">
         <header class="topbar">
           <div class="topbar-left">
-            <h1 class="task-title">Harness Control</h1>
+            <h1 class="task-title">Settings</h1>
             <div class="subtabs" role="tablist">
-              <button class="subtab active" data-harness-tab="provider" type="button">Provider &amp; Sandbox</button>
-              <button class="subtab" data-harness-tab="accounts" type="button">Accounts &amp; Quotas</button>
-              <button class="subtab" data-harness-tab="triggers" type="button">Triggers &amp; Daemon</button>
+              <button class="subtab active" data-harness-tab="provider" type="button">Models &amp; Providers</button>
+              <button class="subtab" data-harness-tab="sandbox" type="button">Sandbox &amp; Embeddings</button>
+              <button class="subtab" data-harness-tab="remote" type="button">Remote Access</button>
+              <button class="subtab" data-harness-tab="triggers" type="button">Automations</button>
             </div>
           </div>
         </header>
@@ -306,6 +376,11 @@
         <header class="topbar">
           <div class="topbar-left">
             <h1 class="task-title">Approvals</h1>
+            <div class="subtabs" role="tablist">
+              <button class="subtab active" data-app-tab="pending" type="button">Pending</button>
+              <button class="subtab" data-app-tab="resolved" type="button">Resolved</button>
+              <button class="subtab" data-app-tab="all" type="button">All</button>
+            </div>
           </div>
         </header>
         <div class="scroll-area">
@@ -327,10 +402,12 @@
               placeholder="Filter rules and skills…"
               aria-label="Filter rules and skills"
             >
+            <button class="btn-secondary" id="addMemoryBtn" type="button">+ Add Memory</button>
+            <button class="btn-primary" id="newSkillBtn" type="button">+ New Skill</button>
           </div>
         </header>
         <div class="scroll-area">
-          <div class="feed" id="memoryFeed"></div>
+          <div class="feed wide-feed" id="memoryFeed"></div>
         </div>
       </section>
     </main>
@@ -340,7 +417,10 @@
     <div class="modal-card" id="modalCard" role="dialog" aria-modal="true"></div>
   </div>
 
-  <div class="toast hidden" id="toast" role="status" aria-live="polite"></div>
+  <div class="toast hidden" id="toast" role="status" aria-live="polite">
+    <span id="toastText"></span>
+    <button class="toast-close" id="toastCloseBtn" type="button" aria-label="Dismiss notification">✕</button>
+  </div>
 
   <script src="/static/app.js"></script>
 </body>

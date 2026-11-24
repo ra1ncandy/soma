@@ -27,12 +27,18 @@ type HermesConfig struct {
 
 // HermesMCPServerCfg mirrors an entry under mcp_servers in ~/.hermes/config.yaml.
 type HermesMCPServerCfg struct {
-	Enabled   *bool             `yaml:"enabled,omitempty"`
-	Transport string            `yaml:"transport,omitempty"`
-	URL       string            `yaml:"url,omitempty"`
-	Command   string            `yaml:"command,omitempty"`
-	Args      []string          `yaml:"args,omitempty"`
-	Env       map[string]string `yaml:"env,omitempty"`
+	Enabled        *bool             `yaml:"enabled,omitempty"`
+	Transport      string            `yaml:"transport,omitempty"`
+	URL            string            `yaml:"url,omitempty"`
+	AuthToken      string            `yaml:"auth_token,omitempty"`
+	Headers        map[string]string `yaml:"headers,omitempty"`
+	Command        string            `yaml:"command,omitempty"`
+	Args           []string          `yaml:"args,omitempty"`
+	Env            map[string]string `yaml:"env,omitempty"`
+	IncludeTools   []string          `yaml:"include_tools,omitempty"`
+	ExcludeTools   []string          `yaml:"exclude_tools,omitempty"`
+	TimeoutSeconds int               `yaml:"timeout_seconds,omitempty"`
+	OAuth          *mcp.OAuthConfig  `yaml:"oauth,omitempty"`
 }
 
 // HermesCronJob mirrors an entry in ~/.hermes/cron/jobs.json.
@@ -94,13 +100,19 @@ func Import(ctx context.Context, st *store.Store, opts ImportOptions) (ImportRep
 			}
 			for name, sc := range hc.MCPServers {
 				rep.MCPServers = append(rep.MCPServers, mcp.ServerEndpoint{
-					Name:      name,
-					Transport: sc.Transport,
-					URL:       sc.URL,
-					Command:   sc.Command,
-					Args:      sc.Args,
-					Env:       sc.Env,
-					Enabled:   sc.Enabled,
+					Name:           name,
+					Transport:      sc.Transport,
+					URL:            sc.URL,
+					AuthToken:      sc.AuthToken,
+					Headers:        sc.Headers,
+					Command:        sc.Command,
+					Args:           sc.Args,
+					Env:            sc.Env,
+					IncludeTools:   sc.IncludeTools,
+					ExcludeTools:   sc.ExcludeTools,
+					TimeoutSeconds: sc.TimeoutSeconds,
+					OAuth:          sc.OAuth,
+					Enabled:        sc.Enabled,
 				})
 			}
 		}

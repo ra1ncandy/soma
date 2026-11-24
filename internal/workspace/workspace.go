@@ -19,7 +19,25 @@ const (
 	StrategyGitWorktree  = "git_worktree"
 	StrategyCopySnapshot = "copy_snapshot"
 	StrategyArtifactDir  = "artifact_dir"
+	StrategyDirect       = "direct"
 )
+
+// NormalizeStrategy maps UI/CLI aliases ("worktree", "copy", "direct") to canonical strategy constants.
+// An empty or unrecognized value returns "" so PrepareBranchWorkspace can auto-select.
+func NormalizeStrategy(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "worktree", StrategyGitWorktree:
+		return StrategyGitWorktree
+	case "copy", StrategyCopySnapshot:
+		return StrategyCopySnapshot
+	case StrategyDirect, "in_place", "inplace":
+		return StrategyDirect
+	case StrategyArtifactDir:
+		return StrategyArtifactDir
+	default:
+		return ""
+	}
+}
 
 // ErrRemoteResourceBusy indicates another active branch holds a lease on the remote resource.
 var ErrRemoteResourceBusy = errors.New("workspace: remote resource held by another active branch")
@@ -35,12 +53,28 @@ func NewManager(somaDir string) *Manager {
 }
 
 // PrepareBranchWorkspace isolates a working directory for branch using git worktree when clean,
-// or an isolated copy-snapshot (with an artifacts/ subdir) for dirty git or non-git workspaces.
+// an isolated copy-snapshot (with an artifacts/ subdir) for dirty git or non-git workspaces,
+// or run.WorkspacePath directly when StrategyDirect is requested on a root (non-fork) branch.
 func (m *Manager) PrepareBranchWorkspace(ctx context.Context, st *store.Store, run store.Run, branch store.Branch) (string, string, error) {
+	reqStrat := NormalizeStrategy(branch.WorkspaceStrategy)
+	if reqStrat == StrategyDirect && branch.ParentBranchID == "" && strings.TrimSpace(run.WorkspacePath) != "" {
+		absWS, err := filepath.Abs(run.WorkspacePath)
+		if err != nil {
+			absWS = run.WorkspacePath
+		}
+		if err := os.MkdirAll(absWS, 0o755); err != nil {
+			return "", "", fmt.Errorf("mkdir direct workspace: %w", err)
+		}
+		if st != nil {
+			_ = st.UpdateBranchWorkspace(ctx, branch.ID, absWS, StrategyDirect)
+		}
+		return absWS, StrategyDirect, nil
+	}
+
 	wsDir := filepath.Join(m.somaDir, "workspaces", branch.ID)
 	if info, err := os.Stat(wsDir); err == nil && info.IsDir() {
-		strategy := branch.WorkspaceStrategy
-		if strategy == "" {
+		strategy := reqStrat
+		if strategy == "" || strategy == StrategyDirect {
 			strategy = StrategyCopySnapshot
 		}
 		return wsDir, strategy, nil
@@ -51,7 +85,7 @@ func (m *Manager) PrepareBranchWorkspace(ctx context.Context, st *store.Store, r
 	}
 
 	var strategy string
-	if isCleanGitRepoWithHead(ctx, run.WorkspacePath) {
+	if reqStrat != StrategyCopySnapshot && isCleanGitRepoWithHead(ctx, run.WorkspacePath) {
 		cmd := exec.CommandContext(ctx, "git", "-C", run.WorkspacePath, "worktree", "add", "--detach", wsDir, "HEAD")
 		if out, err := cmd.CombinedOutput(); err == nil {
 			strategy = StrategyGitWorktree
@@ -77,9 +111,17 @@ func (m *Manager) PrepareBranchWorkspace(ctx context.Context, st *store.Store, r
 }
 
 // CleanupBranchWorkspace removes an isolated branch worktree or snapshot directory.
+// Direct workspaces pointing at run.WorkspacePath are never removed.
 func (m *Manager) CleanupBranchWorkspace(ctx context.Context, run store.Run, branch store.Branch) error {
-	if branch.WorkspaceDir == "" {
+	if branch.WorkspaceDir == "" || branch.WorkspaceStrategy == StrategyDirect {
 		return nil
+	}
+	if run.WorkspacePath != "" {
+		absRun, err1 := filepath.Abs(run.WorkspacePath)
+		absBr, err2 := filepath.Abs(branch.WorkspaceDir)
+		if err1 == nil && err2 == nil && filepath.Clean(absRun) == filepath.Clean(absBr) {
+			return nil
+		}
 	}
 	if branch.WorkspaceStrategy == StrategyGitWorktree && run.WorkspacePath != "" {
 		cmd := exec.CommandContext(ctx, "git", "-C", run.WorkspacePath, "worktree", "remove", "--force", branch.WorkspaceDir)

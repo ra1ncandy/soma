@@ -205,6 +205,9 @@ func ProposeSkillPatch(ctx context.Context, st *store.Store, skillName, unifiedD
 // in a temporary staging directory before writing <rootDir>/<name>/SKILL.md.
 func CreateOrPatchSkill(rootDir, name, content string) (Skill, []LintFinding, error) {
 	name = strings.TrimSpace(name)
+	if name != "" {
+		content = SyncTemplateFrontmatterName(content, name)
+	}
 	if !aaifNameRe.MatchString(name) || len(name) > 64 {
 		return Skill{}, nil, fmt.Errorf("%w: invalid skill name %q (must match ^[a-z0-9]+(-[a-z0-9]+)*$)", ErrInvalidSkill, name)
 	}
@@ -244,4 +247,14 @@ func CreateOrPatchSkill(rootDir, name, content string) (Skill, []LintFinding, er
 	}
 	sk.Dir = targetDir
 	return sk, findings, nil
+}
+
+// SyncTemplateFrontmatterName replaces a placeholder `name: my-skill` in SKILL.md frontmatter
+// with the requested skill name, or prepends minimal YAML frontmatter when omitted entirely.
+func SyncTemplateFrontmatterName(content, name string) string {
+	trimmed := strings.TrimSpace(content)
+	if !strings.HasPrefix(trimmed, "---\n") && !strings.HasPrefix(trimmed, "---\r\n") {
+		return fmt.Sprintf("---\nname: %s\ndescription: %s\n---\n\n%s\n", name, name, trimmed)
+	}
+	return strings.Replace(content, "\nname: my-skill\n", "\nname: "+name+"\n", 1)
 }

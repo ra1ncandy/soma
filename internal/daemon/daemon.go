@@ -57,10 +57,12 @@ type Daemon struct {
 	WorkspaceDir  string
 	Provider      dag.ModelProvider
 	Profile       compiler.ModelProfile
-	CommandRunner CommandRunner
-	Handler       TriggerHandler
-	Coalescer     *Coalescer
-	Now           func() time.Time
+	CommandRunner  CommandRunner
+	Handler        TriggerHandler
+	OutboundNotify func(ctx context.Context, channel, target, text string) error
+	OnOutcome      func(outcome TriggerOutcome)
+	Coalescer      *Coalescer
+	Now            func() time.Time
 
 	SkippedZeroToken atomic.Int64
 	CoalescedCount   atomic.Int64
@@ -150,22 +152,31 @@ func (d *Daemon) defaultTriggerHandler(ctx context.Context, spec TriggerSpec, ev
 	if goal == "" {
 		goal = fmt.Sprintf("Tier-0 trigger %s (%s)", spec.ID, spec.Type)
 	}
-	if spec.Capability == "notify_only" || d.Provider == nil {
-		urgency := spec.Urgency
-		if urgency == "" {
-			urgency = "normal"
-		}
+	urgency := spec.Urgency
+	if urgency == "" {
+		urgency = "normal"
+	}
+	capMode := strings.ToLower(strings.TrimSpace(spec.Capability))
+
+	if capMode == "alert_only" || d.Provider == nil || (capMode == "notify_only" && strings.TrimSpace(spec.Prompt) == "") {
 		summary := fmt.Sprintf("Trigger=%s source=%s coalesced=%d key=%s\n%s",
 			spec.ID, ev.Source, ev.Count, ev.IdempotencyKey, truncateStr(string(ev.Payload), 500))
+		kind := "draft_pr"
+		if capMode == "alert_only" {
+			kind = "alert"
+		}
 		if err := d.Store.InsertInboxItem(ctx, store.InboxItem{
 			ID:        fmt.Sprintf("inb_trig_%d_%s", d.now().UnixNano(), spec.ID),
 			TriggerID: spec.ID,
-			ItemKind:  "draft_pr",
+			ItemKind:  kind,
 			Title:     fmt.Sprintf("[%s] %s", spec.ID, goal),
 			Summary:   summary,
 			Urgency:   urgency,
 		}); err != nil {
 			return "", 0, err
+		}
+		if spec.NotifyChannel != "" && d.OutboundNotify != nil {
+			_ = d.OutboundNotify(ctx, spec.NotifyChannel, spec.NotifyTarget, fmt.Sprintf("[%s] %s\n%s", spec.ID, goal, summary))
 		}
 		return "", 0, nil
 	}
@@ -175,11 +186,12 @@ func (d *Daemon) defaultTriggerHandler(ctx context.Context, spec TriggerSpec, ev
 		maxTurns = 12
 	}
 	exec := dag.NewExecutor(d.Store, d.Provider, nil, d.Profile)
+	var runID string
 	branchID := warmBranchID
 	if branchID == "" {
 		var err error
-		_, branchID, err = exec.StartRun(ctx, dag.RunRequest{
-			Title:         fmt.Sprintf("trigger:%s", spec.ID),
+		runID, branchID, err = exec.StartRun(ctx, dag.RunRequest{
+			Title:         fmt.Sprintf("Automation: %s", spec.ID),
 			WorkspacePath: d.WorkspaceDir,
 			GoalSpec:      fmt.Sprintf("%s\n\nEvent payload:\n%s", goal, truncateStr(string(ev.Payload), 1200)),
 			Profile:       d.Profile,
@@ -187,11 +199,48 @@ func (d *Daemon) defaultTriggerHandler(ctx context.Context, spec TriggerSpec, ev
 		if err != nil {
 			return "", 0, err
 		}
+	} else if br, bErr := d.Store.GetBranch(ctx, branchID); bErr == nil {
+		runID = br.RunID
 	}
-	if _, err := exec.ExecuteBranch(ctx, branchID, maxTurns); err != nil {
+	res, err := exec.ExecuteBranch(ctx, branchID, maxTurns)
+	if err != nil {
 		return branchID, 0, err
 	}
+	summary := fmt.Sprintf("Completed automation %s (%d turns)", spec.ID, res.TurnsExecuted)
+	if res != nil && strings.TrimSpace(res.FinalSummary) != "" {
+		summary = res.FinalSummary
+	}
+	if capMode == "draft_only" || capMode == "notify_only" || capMode == "read_only" {
+		kind := "draft_pr"
+		if capMode == "notify_only" || capMode == "read_only" {
+			kind = "report"
+		}
+		_ = d.Store.InsertInboxItem(ctx, store.InboxItem{
+			ID:        fmt.Sprintf("inb_trig_%d_%s", d.now().UnixNano(), spec.ID),
+			RunID:     runID,
+			BranchID:  branchID,
+			TriggerID: spec.ID,
+			ItemKind:  kind,
+			Title:     fmt.Sprintf("[%s] %s", spec.ID, firstLineSummary(goal, 72)),
+			Summary:   truncateStr(summary, 800),
+			Urgency:   urgency,
+		})
+	}
+	if spec.NotifyChannel != "" && d.OutboundNotify != nil {
+		_ = d.OutboundNotify(ctx, spec.NotifyChannel, spec.NotifyTarget, fmt.Sprintf("[%s] %s", spec.ID, summary))
+	}
 	return branchID, 0, nil
+}
+
+func firstLineSummary(s string, max int) string {
+	s = strings.TrimSpace(s)
+	if idx := strings.IndexAny(s, "\r\n"); idx >= 0 {
+		s = s[:idx]
+	}
+	if len(s) > max {
+		return s[:max-1] + "…"
+	}
+	return s
 }
 
 // EvaluateSentinel runs a zero-token command/watch probe and only invokes Handler on configured changes.
@@ -369,14 +418,18 @@ func (d *Daemon) HandleEvent(ctx context.Context, spec TriggerSpec, ev Coalesced
 	}
 	_ = d.Store.UpdateTriggerRun(ctx, idemKey, "done", branchID, sentinelHash, costUSD)
 	d.DispatchedCount.Add(1)
-	return TriggerOutcome{
+	out := TriggerOutcome{
 		TriggerID:      spec.ID,
 		IdempotencyKey: idemKey,
 		Status:         "done",
 		BranchID:       branchID,
 		SentinelHash:   sentinelHash,
 		CostUSD:        costUSD,
-	}, nil
+	}
+	if d.OnOutcome != nil {
+		d.OnOutcome(out)
+	}
+	return out, nil
 }
 
 func (d *Daemon) lookupWarmBranch(spec TriggerSpec, now time.Time) string {
@@ -480,11 +533,73 @@ func (d *Daemon) WebhookHandler() http.Handler {
 
 func (d *Daemon) findTrigger(id string) (TriggerSpec, bool) {
 	for _, t := range d.Config.Triggers {
-		if t.ID == id {
+		if t.ID == id && t.IsEnabled() {
 			return t, true
 		}
 	}
 	return TriggerSpec{}, false
+}
+
+// StartWorkers runs background TTL GC, sentinel/watch/cron pollers, and fsnotify watchers until ctx cancels
+// without binding a standalone TCP webhook listener (used when webhooks are mounted on soma web).
+func (d *Daemon) StartWorkers(ctx context.Context) error {
+	d.mu.Lock()
+	d.runCtx = ctx
+	d.mu.Unlock()
+
+	var wg sync.WaitGroup
+	d.launchWorkers(ctx, &wg)
+	<-ctx.Done()
+	d.Coalescer.Stop()
+	wg.Wait()
+	return nil
+}
+
+func (d *Daemon) launchWorkers(ctx context.Context, wg *sync.WaitGroup) {
+	gcDur, err := ParseDurationExtended(d.Config.GCInterval)
+	if err != nil || gcDur <= 0 {
+		gcDur = 5 * time.Minute
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(gcDur)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				_, _ = d.RunGC(ctx)
+			}
+		}
+	}()
+
+	var fsTriggers []TriggerSpec
+	for _, spec := range d.Config.Triggers {
+		if !spec.IsEnabled() {
+			continue
+		}
+		switch spec.Type {
+		case "sentinel", "watch", "cron":
+			sp := spec
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				d.runPoller(ctx, sp)
+			}()
+		case "fsnotify":
+			fsTriggers = append(fsTriggers, spec)
+		}
+	}
+
+	if len(fsTriggers) > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			d.runFSNotify(ctx, fsTriggers)
+		}()
+	}
 }
 
 // Start runs webhook HTTP server, fsnotify watchers, sentinel/watch/cron tickers, and TTL GC until ctx cancels.
@@ -518,49 +633,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 		}
 	}()
 
-	// Start periodic TTL GC loop.
-	gcDur, err := ParseDurationExtended(d.Config.GCInterval)
-	if err != nil || gcDur <= 0 {
-		gcDur = 5 * time.Minute
-	}
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		ticker := time.NewTicker(gcDur)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				_, _ = d.RunGC(ctx)
-			}
-		}
-	}()
-
-	// Start sentinel / watch / cron pollers.
-	var fsTriggers []TriggerSpec
-	for _, spec := range d.Config.Triggers {
-		switch spec.Type {
-		case "sentinel", "watch", "cron":
-			sp := spec
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				d.runPoller(ctx, sp)
-			}()
-		case "fsnotify":
-			fsTriggers = append(fsTriggers, spec)
-		}
-	}
-
-	if len(fsTriggers) > 0 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			d.runFSNotify(ctx, fsTriggers)
-		}()
-	}
+	d.launchWorkers(ctx, &wg)
 
 	var runErr error
 	select {
@@ -578,25 +651,29 @@ func (d *Daemon) Start(ctx context.Context) error {
 }
 
 func (d *Daemon) runPoller(ctx context.Context, spec TriggerSpec) {
-	interval, err := ParseDurationExtended(spec.Interval)
-	if err != nil || interval <= 0 {
-		interval = time.Minute
+	sched, err := ParseSchedule(spec.Interval)
+	if err != nil {
+		sched = Schedule{Interval: time.Minute}
 	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	timer := time.NewTimer(sched.NextDelay(d.now()))
+	defer timer.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-timer.C:
 			if spec.Type == "cron" {
 				now := d.now()
+				bucketSec := int64(60)
+				if !sched.IsCron && sched.Interval > 0 {
+					bucketSec = maxInt64(int64(sched.Interval.Seconds()), 1)
+				}
 				ev := Event{
 					TriggerID:   spec.ID,
 					Source:      "cron",
 					Payload:     []byte(spec.Prompt),
-					PayloadHash: sha256Hex([]byte(fmt.Sprintf("%s|%d", spec.ID, now.Unix()/int64(maxInt64(int64(interval.Seconds()), 1))))),
+					PayloadHash: sha256Hex([]byte(fmt.Sprintf("%s|%d", spec.ID, now.Unix()/bucketSec))),
 					Fields:      map[string]any{"trigger_id": spec.ID},
 					ReceivedAt:  now,
 				}
@@ -605,12 +682,14 @@ func (d *Daemon) runPoller(ctx context.Context, spec TriggerSpec) {
 					Count:          1,
 					IdempotencyKey: DeriveIdempotencyKey(spec, ev, now),
 				})
+				timer.Reset(sched.NextDelay(d.now()))
 				continue
 			}
 			out, _ := d.EvaluateSentinel(ctx, spec)
 			if out.Status == "stopped" {
 				return
 			}
+			timer.Reset(sched.NextDelay(d.now()))
 		}
 	}
 }
@@ -750,7 +829,10 @@ func matchesFilter(filter string, fields map[string]any) bool {
 		} else if strings.Contains(clause, "==") {
 			op = "=="
 		} else {
-			return false
+			if !matchesShorthandEvent(clause, fields) {
+				return false
+			}
+			continue
 		}
 		parts := strings.SplitN(clause, op, 2)
 		key := strings.TrimSpace(parts[0])
@@ -791,6 +873,32 @@ func lookupField(fields map[string]any, dotted string) (any, bool) {
 		cur = nxt
 	}
 	return cur, true
+}
+
+func matchesShorthandEvent(want string, fields map[string]any) bool {
+	want = strings.Trim(strings.TrimSpace(want), `'"`)
+	if want == "" {
+		return true
+	}
+	for _, k := range []string{"event", "event_type", "type", "action"} {
+		if v, ok := fields[k]; ok && fmt.Sprintf("%v", v) == want {
+			return true
+		}
+	}
+	if dot := strings.IndexByte(want, '.'); dot > 0 {
+		prefix, action := want[:dot], want[dot+1:]
+		if actVal, ok := fields["action"]; ok && fmt.Sprintf("%v", actVal) == action {
+			if _, hasPrefixObj := fields[prefix]; hasPrefixObj {
+				return true
+			}
+			for _, k := range []string{"event", "event_type", "type"} {
+				if v, ok2 := fields[k]; ok2 && fmt.Sprintf("%v", v) == prefix {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func verifyHMACSHA256(secret, header string, body []byte) bool {

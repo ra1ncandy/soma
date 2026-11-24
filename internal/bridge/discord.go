@@ -33,6 +33,7 @@ type DiscordConfig struct {
 type DiscordAdapter struct {
 	Client     *KernelClient
 	Config     DiscordConfig
+	Pairing    *PairingStore
 	HTTPClient *http.Client
 
 	mu        sync.Mutex
@@ -75,14 +76,25 @@ func VerifyInteractionSignature(pubKeyHex, timestamp, signatureHex string, body 
 	return ed25519.Verify(ed25519.PublicKey(pub), msg, sig)
 }
 
+// Name returns "discord" to satisfy ChannelAdapter.
+func (a *DiscordAdapter) Name() string { return "discord" }
+
+// Send delivers an OutboundMessage to Discord via SendMessage.
+func (a *DiscordAdapter) Send(ctx context.Context, msg OutboundMessage) error {
+	return a.SendMessage(ctx, msg.Target, msg.Text)
+}
+
 func (a *DiscordAdapter) isUserAllowed(userID string) bool {
-	if userID == "" || len(a.Config.AllowedUserIDs) == 0 {
+	if userID == "" {
 		return false
 	}
 	for _, allowed := range a.Config.AllowedUserIDs {
 		if allowed == userID {
 			return true
 		}
+	}
+	if a.Pairing != nil && a.Pairing.IsApproved("discord", userID) {
+		return true
 	}
 	return false
 }

@@ -118,6 +118,69 @@ func (s *Store) UpdateRunStatus(ctx context.Context, id, status string) error {
 	})
 }
 
+// UpdateRunTitle updates a run's human-readable title and updated_at timestamp.
+func (s *Store) UpdateRunTitle(ctx context.Context, id, title string) error {
+	title = strings.TrimSpace(title)
+	if title == "" {
+		return errors.New("store: title is required")
+	}
+	now := time.Now().Unix()
+	return s.WithWriteTx(ctx, func(conn *sql.Conn) error {
+		res, err := conn.ExecContext(ctx, `UPDATE runs SET title = ?, updated_at = ? WHERE id = ?`, title, now, id)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return ErrNotFound
+		}
+		return nil
+	})
+}
+
+// DeleteRun removes a run and all cascaded child records, detaching any memory provenance references first.
+func (s *Store) DeleteRun(ctx context.Context, id string) (bool, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return false, nil
+	}
+	var deleted bool
+	err := s.WithWriteTx(ctx, func(conn *sql.Conn) error {
+		if _, err := conn.ExecContext(ctx, `
+			UPDATE memory_nodes
+			SET provenance_step_id = NULL
+			WHERE provenance_step_id IN (SELECT id FROM steps WHERE run_id = ?)`, id); err != nil {
+			return err
+		}
+		if _, err := conn.ExecContext(ctx, `
+			UPDATE memory_nodes
+			SET evidence_page_id = NULL
+			WHERE evidence_page_id IN (SELECT id FROM pages WHERE run_id = ?)`, id); err != nil {
+			return err
+		}
+		if _, err := conn.ExecContext(ctx, `
+			UPDATE memory_edges
+			SET provenance_step_id = NULL
+			WHERE provenance_step_id IN (SELECT id FROM steps WHERE run_id = ?)`, id); err != nil {
+			return err
+		}
+		res, err := conn.ExecContext(ctx, `DELETE FROM runs WHERE id = ?`, id)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		deleted = n > 0
+		return nil
+	})
+	return deleted, err
+}
+
 // --- Branches ---
 
 // CreateBranch inserts a new Branch row.
@@ -1194,6 +1257,20 @@ func (s *Store) ListAccounts(ctx context.Context) ([]Account, error) {
 	return out, rows.Err()
 }
 
+// DeleteAccount removes an Account record by ID.
+func (s *Store) DeleteAccount(ctx context.Context, id string) (bool, error) {
+	var affected int64
+	err := s.WithWriteTx(ctx, func(conn *sql.Conn) error {
+		res, execErr := conn.ExecContext(ctx, `DELETE FROM accounts WHERE id = ?`, strings.TrimSpace(id))
+		if execErr != nil {
+			return execErr
+		}
+		affected, _ = res.RowsAffected()
+		return nil
+	})
+	return affected > 0, err
+}
+
 // AcquireLease atomically increments active_leases if off cooldown (in Unix milliseconds) and below max_concurrent.
 func (s *Store) AcquireLease(ctx context.Context, id string, nowUnixMs int64) error {
 	nowSec := time.Now().Unix()
@@ -1686,6 +1763,23 @@ func (s *Store) UpdateMemoryContent(ctx context.Context, id, content string) err
 		}
 		return nil
 	})
+}
+
+// DeleteMemoryNode deletes a memory node and its connected edges.
+func (s *Store) DeleteMemoryNode(ctx context.Context, id string) (bool, error) {
+	var affected int64
+	err := s.WithWriteTx(ctx, func(conn *sql.Conn) error {
+		if _, err := conn.ExecContext(ctx, `DELETE FROM memory_edges WHERE from_node_id = ? OR to_node_id = ?`, id, id); err != nil {
+			return err
+		}
+		res, err := conn.ExecContext(ctx, `DELETE FROM memory_nodes WHERE id = ?`, id)
+		if err != nil {
+			return err
+		}
+		affected, _ = res.RowsAffected()
+		return nil
+	})
+	return affected > 0, err
 }
 
 // ResetCooldown clears an account's rate-limit cooldown timer and error text.

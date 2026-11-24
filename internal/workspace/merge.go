@@ -201,7 +201,7 @@ func snapshotDirFiles(root string) (map[string]fileState, error) {
 			return nil
 		}
 		if d.IsDir() {
-			if base == "__pycache__" || base == ".pytest_cache" {
+			if base == "__pycache__" || base == ".pytest_cache" || base == "node_modules" || base == ".venv" {
 				return filepath.SkipDir
 			}
 			return nil
@@ -265,4 +265,160 @@ func threeWayMergeBytes(ctx context.Context, base, ours, theirs []byte) ([]byte,
 func sha256HexBytes(b []byte) string {
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
+}
+
+// FileDiff represents a single file change between a branch workspace and the project directory.
+type FileDiff struct {
+	Path        string `json:"path"`
+	Status      string `json:"status"` // "added" | "modified" | "deleted"
+	UnifiedDiff string `json:"unified_diff,omitempty"`
+}
+
+// WorkspaceDiffReport summarizes unapplied changes in an isolated branch workspace relative to baseDir.
+type WorkspaceDiffReport struct {
+	Files        []FileDiff `json:"files"`
+	TotalChanges int        `json:"total_changes"`
+}
+
+func sameCleanedPath(a, b string) bool {
+	if strings.TrimSpace(a) == "" || strings.TrimSpace(b) == "" {
+		return false
+	}
+	absA, errA := filepath.Abs(a)
+	absB, errB := filepath.Abs(b)
+	if errA != nil || errB != nil {
+		return filepath.Clean(a) == filepath.Clean(b)
+	}
+	return filepath.Clean(absA) == filepath.Clean(absB)
+}
+
+// CountWorkspaceChanges returns the number of files in branchDir that differ from baseDir.
+func (m *Manager) CountWorkspaceChanges(ctx context.Context, baseDir, branchDir string) int {
+	if sameCleanedPath(baseDir, branchDir) || strings.TrimSpace(branchDir) == "" {
+		return 0
+	}
+	if _, err := os.Stat(branchDir); err != nil {
+		return 0
+	}
+	rep, err := m.diffWorkspaces(ctx, baseDir, branchDir, false)
+	if err != nil {
+		return 0
+	}
+	return rep.TotalChanges
+}
+
+// DiffBranchWorkspace computes added, modified, and deleted files (with unified diffs) in branchDir relative to baseDir.
+func (m *Manager) DiffBranchWorkspace(ctx context.Context, baseDir, branchDir string) (WorkspaceDiffReport, error) {
+	if sameCleanedPath(baseDir, branchDir) || strings.TrimSpace(branchDir) == "" {
+		return WorkspaceDiffReport{Files: []FileDiff{}}, nil
+	}
+	return m.diffWorkspaces(ctx, baseDir, branchDir, true)
+}
+
+// ApplyBranchWorkspace applies all added, modified, and deleted files from branchDir into baseDir.
+func (m *Manager) ApplyBranchWorkspace(ctx context.Context, baseDir, branchDir string) (MergeReport, error) {
+	if sameCleanedPath(baseDir, branchDir) {
+		return MergeReport{}, nil
+	}
+	return m.MergeBranchWorkspaces(ctx, baseDir, []string{branchDir}, baseDir)
+}
+
+func (m *Manager) diffWorkspaces(ctx context.Context, baseDir, branchDir string, includeDiff bool) (WorkspaceDiffReport, error) {
+	out := WorkspaceDiffReport{Files: []FileDiff{}}
+	baseFiles, err := snapshotDirFiles(baseDir)
+	if err != nil {
+		return out, err
+	}
+	branchFiles, err := snapshotDirFiles(branchDir)
+	if err != nil {
+		return out, err
+	}
+
+	pathSet := make(map[string]bool, len(baseFiles)+len(branchFiles))
+	for rel := range baseFiles {
+		pathSet[rel] = true
+	}
+	for rel := range branchFiles {
+		pathSet[rel] = true
+	}
+	paths := make([]string, 0, len(pathSet))
+	for rel := range pathSet {
+		paths = append(paths, rel)
+	}
+	sort.Strings(paths)
+
+	for _, rel := range paths {
+		bSt := baseFiles[rel]
+		wSt := branchFiles[rel]
+		if bSt.exists == wSt.exists && bSt.hash == wSt.hash {
+			continue
+		}
+		var status string
+		switch {
+		case !bSt.exists && wSt.exists:
+			status = "added"
+		case bSt.exists && !wSt.exists:
+			status = "deleted"
+		default:
+			status = "modified"
+		}
+		fd := FileDiff{
+			Path:   rel,
+			Status: status,
+		}
+		if includeDiff {
+			fd.UnifiedDiff = buildUnifiedFileDiff(ctx, rel, bSt, wSt)
+		}
+		out.Files = append(out.Files, fd)
+	}
+	out.TotalChanges = len(out.Files)
+	return out, nil
+}
+
+func buildUnifiedFileDiff(ctx context.Context, rel string, baseSt, branchSt fileState) string {
+	const maxDiffBytes = 256 * 1024
+	if len(baseSt.content) > maxDiffBytes || len(branchSt.content) > maxDiffBytes {
+		return fmt.Sprintf("(file exceeds %d KB diff preview limit)", maxDiffBytes/1024)
+	}
+	if bytes.IndexByte(baseSt.content, 0) >= 0 || bytes.IndexByte(branchSt.content, 0) >= 0 {
+		return "(binary file changed)"
+	}
+
+	tmpDir, err := os.MkdirTemp("", "soma-diff-*")
+	if err == nil {
+		defer func() { _ = os.RemoveAll(tmpDir) }()
+		aFile := filepath.Join(tmpDir, "a")
+		bFile := filepath.Join(tmpDir, "b")
+		_ = os.WriteFile(aFile, baseSt.content, 0o600)
+		_ = os.WriteFile(bFile, branchSt.content, 0o600)
+		cmd := exec.CommandContext(ctx, "git", "diff", "--no-index", "--no-color", "--unified=3", aFile, bFile)
+		raw, _ := cmd.Output()
+		if len(raw) > 0 {
+			s := string(raw)
+			s = strings.ReplaceAll(s, aFile, "a/"+rel)
+			s = strings.ReplaceAll(s, bFile, "b/"+rel)
+			lines := strings.Split(s, "\n")
+			// Trim leading `diff --git` and `index ...` metadata lines for cleaner UI display.
+			start := 0
+			for start < len(lines) && (strings.HasPrefix(lines[start], "diff --git") || strings.HasPrefix(lines[start], "index ") || strings.HasPrefix(lines[start], "new file") || strings.HasPrefix(lines[start], "deleted file")) {
+				start++
+			}
+			return strings.TrimSpace(strings.Join(lines[start:], "\n"))
+		}
+	}
+
+	// Fallback line diff if git is unavailable.
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "--- a/%s\n+++ b/%s\n", rel, rel)
+	if baseSt.exists {
+		for _, ln := range strings.Split(strings.TrimSuffix(string(baseSt.content), "\n"), "\n") {
+			fmt.Fprintf(&sb, "-%s\n", ln)
+		}
+	}
+	if branchSt.exists {
+		for _, ln := range strings.Split(strings.TrimSuffix(string(branchSt.content), "\n"), "\n") {
+			fmt.Fprintf(&sb, "+%s\n", ln)
+		}
+	}
+	return strings.TrimSpace(sb.String())
 }

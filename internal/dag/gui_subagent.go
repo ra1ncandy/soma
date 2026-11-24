@@ -19,12 +19,13 @@ import (
 // polluting the main reasoning agent's context, allows using high-throughput/low-cost vision models,
 // and enforces a strict privilege boundary (no host shell, no secret brokers, no trusted memory writes).
 type GUISubagentConfig struct {
-	Provider   ModelProvider
-	ModelID    string
-	AccountID  string
-	MCPManager *mcp.Manager
-	MCPCatalog *mcp.EpochCatalog
-	MaxSteps   int
+	Provider    ModelProvider
+	ModelID     string
+	AccountID   string
+	MCPManager  *mcp.Manager
+	MCPCatalog  *mcp.EpochCatalog
+	MaxSteps    int
+	EnsureReady func(ctx context.Context, mode string) (*mcp.Manager, error)
 }
 
 // restrictedGUIToolRunner wraps a LocalToolRunner and permits ONLY safe GUI/inspection tools.
@@ -71,7 +72,20 @@ func (e *Executor) RunGUISubagent(ctx context.Context, runID, parentBranchID, mo
 	}
 
 	baseLT, ok := e.Tools.(*LocalToolRunner)
-	if !ok || baseLT == nil || baseLT.MCPManager == nil {
+	if !ok || baseLT == nil {
+		return ToolOutput{}, fmt.Errorf("%s_task requires a LocalToolRunner", mode)
+	}
+	if e.GUIConfig != nil && e.GUIConfig.EnsureReady != nil && (baseLT.MCPManager == nil || len(baseLT.MCPManager.ListServers()) == 0 || mode == "desktop") {
+		mgr, ensureErr := e.GUIConfig.EnsureReady(ctx, mode)
+		if ensureErr != nil {
+			return ToolOutput{}, fmt.Errorf("%s_task auto-launch failed: %w", mode, ensureErr)
+		}
+		if mgr != nil {
+			baseLT.MCPManager = mgr
+			e.GUIConfig.MCPManager = mgr
+		}
+	}
+	if baseLT.MCPManager == nil {
 		return ToolOutput{}, fmt.Errorf("%s_task requires an active MCP manager (start with --browser or --desktop)", mode)
 	}
 
@@ -121,27 +135,74 @@ func (e *Executor) RunGUISubagent(ctx context.Context, runID, parentBranchID, mo
 		return ToolOutput{}, fmt.Errorf("create gui subagent branch: %w", err)
 	}
 
-	// Build a focused system prompt for the fast GUI subagent.
+	// Build a focused system prompt for the fast GUI subagent, including parameter signatures
+	// so smaller vision/flash models never guess wrong argument names or try unavailable shell tools.
 	var toolList strings.Builder
+	hasLaunchApp := false
+	launchSrv := ""
 	for _, srv := range servers {
 		tools := baseLT.MCPManager.ListTools(srv)[srv]
-		names := make([]string, 0, len(tools))
+		fmt.Fprintf(&toolList, "  Server %q:\n", srv)
 		for _, t := range tools {
-			names = append(names, t.Name)
+			if t.Name == "desktop_launch_app" {
+				hasLaunchApp = true
+				launchSrv = srv
+			}
+			var propKeys []string
+			if t.InputSchema != nil {
+				if rawSchema, err := json.Marshal(t.InputSchema); err == nil {
+					var schema struct {
+						Properties map[string]any `json:"properties"`
+						Required   []string       `json:"required"`
+					}
+					if json.Unmarshal(rawSchema, &schema) == nil && len(schema.Properties) > 0 {
+						reqSet := make(map[string]bool, len(schema.Required))
+						for _, r := range schema.Required {
+							reqSet[r] = true
+						}
+						for k := range schema.Properties {
+							if reqSet[k] {
+								propKeys = append(propKeys, k)
+							} else {
+								propKeys = append(propKeys, k+"?")
+							}
+						}
+					}
+				}
+			}
+			fmt.Fprintf(&toolList, "    - %s(%s): %s\n", t.Name, strings.Join(propKeys, ", "), t.Description)
 		}
-		fmt.Fprintf(&toolList, "  - server=%q tools=[%s]\n", srv, strings.Join(names, ", "))
+	}
+
+	// If a start_url was supplied for desktop mode and desktop_launch_app is available, launch Chromium immediately
+	// so the browser is already opening on turn 1 instead of wasting turns on an empty desktop.
+	if mode == "desktop" && strings.TrimSpace(startURL) != "" && hasLaunchApp {
+		cleanURL := strings.TrimSpace(startURL)
+		if !strings.HasPrefix(cleanURL, "http://") && !strings.HasPrefix(cleanURL, "https://") {
+			cleanURL = "https://" + cleanURL
+		}
+		_, _ = baseLT.MCPManager.CallTool(ctx, launchSrv, "desktop_launch_app", map[string]any{
+			"command": "chromium --no-sandbox --start-maximized " + cleanURL,
+		})
+		select {
+		case <-ctx.Done():
+			return ToolOutput{}, ctx.Err()
+		case <-time.After(2500 * time.Millisecond):
+		}
 	}
 
 	subGoal := goal
 	if strings.TrimSpace(startURL) != "" {
-		subGoal = fmt.Sprintf("Start at URL %s. %s", strings.TrimSpace(startURL), goal)
+		subGoal = fmt.Sprintf("URL %s was just launched in Chromium. %s", strings.TrimSpace(startURL), goal)
 	}
 	subSys := fmt.Sprintf(
-		"You are soma's fast %s GUI subagent operating inside an isolated sandbox. "+
-			"Connected MCP servers:\n%s"+
-			"Use mcp_call(server, tool, arguments_json) to inspect and interact with the UI. "+
-			"Prefer compact accessibility-tree / ref-based snapshots first; use screenshots (displayed in Layer 3 viewport) when visual grounding is needed. "+
-			"You have NO host shell or secret access. Complete the sub-goal concisely and finish with a structured summary of what you observed/accomplished and any files saved.\n"+
+		"You are soma's fast %s GUI subagent operating inside an isolated virtual desktop.\n"+
+			"Available MCP tools (invoke ONLY via mcp_call(server, tool, arguments_json)):\n%s\n"+
+			"Rules:\n"+
+			"1. Do NOT call host `exec` — it is disabled here. To open a GUI app/URL inside the desktop, use desktop_launch_app(command=\"chromium --no-sandbox --start-maximized https://...\"). If desktop_exec is listed above, you may use it to run commands or install packages (sudo apt-get, pip, npm) inside the isolated desktop container.\n"+
+			"2. Start by calling desktop_screenshot() or desktop_list_windows() to see the current screen.\n"+
+			"3. Use desktop_click(x, y or ref), desktop_type(text, enter?), desktop_key(keys), and desktop_scroll(clicks, x?, y?) to interact.\n"+
+			"4. Once the goal is achieved and visible on screen, stop and return a concise 1-3 sentence summary.\n"+
 			"Sub-goal: %s",
 		mode, toolList.String(), subGoal,
 	)
@@ -166,6 +227,9 @@ func (e *Executor) RunGUISubagent(ctx context.Context, runID, parentBranchID, mo
 		AccountIDs:          accs,
 		AllowFailover:       true,
 		EnforceStallBreaker: true,
+		AutonomyMode:        e.AutonomyMode,
+		AfterDispatchHook:   e.AfterDispatchHook,
+		OnStep:              e.OnStep,
 	}
 
 	res, execErr := subExec.ExecuteBranch(ctx, childID, maxSteps)

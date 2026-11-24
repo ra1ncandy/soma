@@ -20,6 +20,13 @@ import (
 
 func attachSessionMCP(ctx context.Context, wsDir string, enableBrowser, enableDesktop bool, tools *dag.LocalToolRunner) (*mcp.Manager, error) {
 	var endpoints []mcp.ServerEndpoint
+	if configured, err := mcp.LoadServerEndpoints(wsDir); err == nil {
+		for _, ep := range configured {
+			if ep.IsEnabled() {
+				endpoints = append(endpoints, ep)
+			}
+		}
+	}
 	if enableDesktop {
 		dm := desktop.NewManager()
 		st, running, err := dm.Status(ctx, wsDir)

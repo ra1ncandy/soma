@@ -1,8 +1,10 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -22,6 +24,7 @@ import (
 	"github.com/ra1ncandy/soma/internal/memory"
 	"github.com/ra1ncandy/soma/internal/store"
 	"github.com/ra1ncandy/soma/internal/tui"
+	"github.com/ra1ncandy/soma/internal/webui"
 )
 
 func newUICmd() *cobra.Command {
@@ -247,6 +250,14 @@ func selectOptionalProvider(workspaceDir string, useMock bool) (dag.ModelProvide
 	if useMock || strings.TrimSpace(os.Getenv("SOMA_API_BASE")) != "" {
 		return selectProvider(workspaceDir, useMock)
 	}
+	if st, sErr := openStore(workspaceDir); sErr == nil {
+		defer func() { _ = st.Close() }()
+		if prov, m, ok := webui.ResolveDefaultProviderFromHarness(context.Background(), st, workspaceDir); ok {
+			return prov, m, nil
+		}
+	} else if prov, m, ok := webui.ResolveDefaultProviderFromHarness(context.Background(), nil, workspaceDir); ok {
+		return prov, m, nil
+	}
 	return nil, "", nil
 }
 
@@ -323,8 +334,17 @@ func newBridgeCmd() *cobra.Command {
 			out := cmd.OutOrStdout()
 			fmt.Fprintf(out, "Channel Bridge Adapters (%s):\n", absDir)
 			fmt.Fprintf(out, "  Kernel socket: %s [%s]\n", sockPath, sockState)
-			fmt.Fprintf(out, "  - discord   (also standalone: soma-bridge-discord; Ed25519 interactions + bot alerts)\n")
-			fmt.Fprintf(out, "  - telegram  (Bot API long-poll updates + inbox alerts)\n")
+			fmt.Fprintf(out, "  - discord      (Ed25519 interactions + bot alerts)\n")
+			fmt.Fprintf(out, "  - telegram     (Bot API long-poll updates + inbox alerts)\n")
+			fmt.Fprintf(out, "  - slack        (Events API webhook + chat.postMessage)\n")
+			fmt.Fprintf(out, "  - matrix       (Client-Server v3 /sync + room messaging)\n")
+			fmt.Fprintf(out, "  - mattermost   (Bot API v4 + outgoing webhook)\n")
+			fmt.Fprintf(out, "  - teams        (Incoming Webhook MessageCard)\n")
+			fmt.Fprintf(out, "  - google-chat  (Event webhook + synchronous replies)\n")
+			fmt.Fprintf(out, "  - email        (SMTP outbound notifications)\n")
+			fmt.Fprintf(out, "  - whatsapp     (Sidecar JSON webhook bridge)\n")
+			fmt.Fprintf(out, "  - signal       (Sidecar JSON webhook bridge)\n")
+			fmt.Fprintf(out, "  - sms          (Sidecar JSON webhook bridge)\n")
 			return nil
 		},
 	}
@@ -332,8 +352,8 @@ func newBridgeCmd() *cobra.Command {
 
 	var startDir, listenAddr string
 	startCmd := &cobra.Command{
-		Use:   "start <discord|telegram>",
-		Short: "Start an external Discord or Telegram bridge connected strictly to .soma/kernel.sock",
+		Use:   "start <adapter>",
+		Short: "Start an external Channel Bridge (discord|telegram|slack|matrix|mattermost|google-chat|whatsapp|signal|sms) connected to .soma/kernel.sock",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			absDir, err := filepath.Abs(startDir)
@@ -346,44 +366,213 @@ func newBridgeCmd() *cobra.Command {
 				return fmt.Errorf("read bridge.token (start `soma bridge serve` first): %w", err)
 			}
 			client := bridge.NewClient(filepath.Join(somaDir, "kernel.sock"), strings.TrimSpace(string(tokBytes)))
+			hCfg := webui.LoadWorkspaceHarnessConfig(absDir)
+			brCfg := hCfg.Bridges
+			ps := bridge.NewPairingStore(somaDir)
+			envOr := func(k, fallback string) string {
+				if v := strings.TrimSpace(os.Getenv(k)); v != "" {
+					return v
+				}
+				return fallback
+			}
+			listOr := func(envKey string, fallback []string) []string {
+				if v := strings.TrimSpace(os.Getenv(envKey)); v != "" {
+					return splitCommaList(v)
+				}
+				return fallback
+			}
+
 			ctx, cancel := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 			defer cancel()
 
 			switch strings.ToLower(args[0]) {
 			case "discord":
 				adp := bridge.NewDiscordAdapter(client, bridge.DiscordConfig{
-					BotToken:          os.Getenv("DISCORD_BOT_TOKEN"),
-					PublicKeyHex:      os.Getenv("DISCORD_PUBLIC_KEY"),
-					ChannelID:         os.Getenv("DISCORD_CHANNEL_ID"),
-					AllowedUserIDs:    splitCommaList(os.Getenv("DISCORD_ALLOWED_USERS")),
-					AllowedChannelIDs: splitCommaList(os.Getenv("DISCORD_ALLOWED_CHANNELS")),
+					BotToken:          envOr("DISCORD_BOT_TOKEN", brCfg.Discord.BotToken),
+					PublicKeyHex:      envOr("DISCORD_PUBLIC_KEY", brCfg.Discord.PublicKeyHex),
+					ChannelID:         envOr("DISCORD_CHANNEL_ID", brCfg.Discord.ChannelID),
+					AllowedUserIDs:    listOr("DISCORD_ALLOWED_USERS", brCfg.Discord.AllowedUserIDs),
+					AllowedChannelIDs: listOr("DISCORD_ALLOWED_CHANNELS", brCfg.Discord.AllowedChannelIDs),
 					ListenAddr:        listenAddr,
 				})
+				adp.Pairing = ps
 				fmt.Fprintf(cmd.OutOrStdout(), "Starting Discord bridge (listen=%s, allowed_users=%d)\n",
 					listenAddr, len(adp.Config.AllowedUserIDs))
 				return adp.Run(ctx)
 
 			case "telegram":
-				alertChat, _ := strconv.ParseInt(strings.TrimSpace(os.Getenv("TELEGRAM_ALERT_CHAT_ID")), 10, 64)
+				alertChat := brCfg.Telegram.AlertChatID
+				if v := strings.TrimSpace(os.Getenv("TELEGRAM_ALERT_CHAT_ID")); v != "" {
+					alertChat, _ = strconv.ParseInt(v, 10, 64)
+				}
+				allowedTGUsers := brCfg.Telegram.AllowedUserIDs
+				if v := strings.TrimSpace(os.Getenv("TELEGRAM_ALLOWED_USERS")); v != "" {
+					allowedTGUsers = splitCommaInt64(v)
+				}
+				allowedTGChats := brCfg.Telegram.AllowedChatIDs
+				if v := strings.TrimSpace(os.Getenv("TELEGRAM_ALLOWED_CHATS")); v != "" {
+					allowedTGChats = splitCommaInt64(v)
+				}
 				adp := bridge.NewTelegramAdapter(client, bridge.TelegramConfig{
-					BotToken:       os.Getenv("TELEGRAM_BOT_TOKEN"),
-					AllowedUserIDs: splitCommaInt64(os.Getenv("TELEGRAM_ALLOWED_USERS")),
-					AllowedChatIDs: splitCommaInt64(os.Getenv("TELEGRAM_ALLOWED_CHATS")),
+					BotToken:       envOr("TELEGRAM_BOT_TOKEN", brCfg.Telegram.BotToken),
+					AllowedUserIDs: allowedTGUsers,
+					AllowedChatIDs: allowedTGChats,
 					AlertChatID:    alertChat,
 				})
+				adp.Pairing = ps
 				fmt.Fprintf(cmd.OutOrStdout(), "Starting Telegram bridge (allowed_users=%d)\n",
 					len(adp.Config.AllowedUserIDs))
 				return adp.Run(ctx)
 
+			case "slack":
+				gw := bridge.NewGateway(client, somaDir)
+				adp := bridge.NewSlackAdapter(gw, bridge.SlackConfig{
+					BotToken:          envOr("SLACK_BOT_TOKEN", brCfg.Slack.BotToken),
+					SigningSecret:     envOr("SLACK_SIGNING_SECRET", brCfg.Slack.SigningSecret),
+					AllowedUserIDs:    listOr("SLACK_ALLOWED_USERS", brCfg.Slack.AllowedUserIDs),
+					AllowedChannelIDs: listOr("SLACK_ALLOWED_CHANNELS", brCfg.Slack.AllowedChannelIDs),
+				})
+				fmt.Fprintf(cmd.OutOrStdout(), "Starting Slack bridge on http://%s\n", listenAddr)
+				return serveHTTPBridge(ctx, listenAddr, adp.Handler())
+
+			case "matrix":
+				gw := bridge.NewGateway(client, somaDir)
+				adp := bridge.NewMatrixAdapter(gw, bridge.MatrixConfig{
+					HomeserverURL:  envOr("MATRIX_HOMESERVER_URL", brCfg.Matrix.HomeserverURL),
+					AccessToken:    envOr("MATRIX_ACCESS_TOKEN", brCfg.Matrix.AccessToken),
+					UserID:         envOr("MATRIX_USER_ID", brCfg.Matrix.UserID),
+					AllowedSenders: listOr("MATRIX_ALLOWED_SENDERS", brCfg.Matrix.AllowedSenders),
+					AllowedRooms:   listOr("MATRIX_ALLOWED_ROOMS", brCfg.Matrix.AllowedRooms),
+				})
+				fmt.Fprintf(cmd.OutOrStdout(), "Starting Matrix bridge (%s)\n", adp.Config.HomeserverURL)
+				return adp.Run(ctx)
+
+			case "mattermost":
+				gw := bridge.NewGateway(client, somaDir)
+				adp := bridge.NewMattermostAdapter(gw, bridge.MattermostConfig{
+					ServerURL:      envOr("MATTERMOST_URL", brCfg.Mattermost.ServerURL),
+					BotToken:       envOr("MATTERMOST_BOT_TOKEN", brCfg.Mattermost.BotToken),
+					WebhookURL:     envOr("MATTERMOST_WEBHOOK_URL", brCfg.Mattermost.WebhookURL),
+					OutgoingToken:  envOr("MATTERMOST_OUTGOING_TOKEN", brCfg.Mattermost.OutgoingToken),
+					AllowedUserIDs: listOr("MATTERMOST_ALLOWED_USERS", brCfg.Mattermost.AllowedUserIDs),
+				})
+				fmt.Fprintf(cmd.OutOrStdout(), "Starting Mattermost bridge on http://%s\n", listenAddr)
+				return serveHTTPBridge(ctx, listenAddr, adp.Handler())
+
+			case "google-chat":
+				gw := bridge.NewGateway(client, somaDir)
+				adp := bridge.NewGoogleChatAdapter(gw, envOr("GOOGLE_CHAT_WEBHOOK_URL", brCfg.GoogleChat.WebhookURL), listOr("GOOGLE_CHAT_ALLOWED_USERS", brCfg.GoogleChat.AllowedUserIDs))
+				fmt.Fprintf(cmd.OutOrStdout(), "Starting Google Chat bridge on http://%s\n", listenAddr)
+				return serveHTTPBridge(ctx, listenAddr, adp.Handler())
+
+			case "whatsapp", "signal", "sms":
+				gw := bridge.NewGateway(client, somaDir)
+				ch := strings.ToLower(args[0])
+				prefix := strings.ToUpper(ch)
+				var sc webui.SidecarBridgeCfg
+				switch ch {
+				case "whatsapp":
+					sc = brCfg.WhatsApp
+				case "signal":
+					sc = brCfg.Signal
+				case "sms":
+					sc = brCfg.SMS
+				}
+				adp := bridge.NewWebhookBridgeAdapter(gw, bridge.WebhookBridgeConfig{
+					ChannelName:    ch,
+					OutboundURL:    envOr(prefix+"_OUTBOUND_URL", sc.OutboundURL),
+					BearerToken:    envOr(prefix+"_BEARER_TOKEN", sc.BearerToken),
+					HMACSecret:     envOr(prefix+"_HMAC_SECRET", sc.HMACSecret),
+					AllowedSenders: listOr(prefix+"_ALLOWED_SENDERS", sc.AllowedSenders),
+				})
+				fmt.Fprintf(cmd.OutOrStdout(), "Starting %s webhook bridge on http://%s\n", ch, listenAddr)
+				return serveHTTPBridge(ctx, listenAddr, adp.Handler())
+
 			default:
-				return fmt.Errorf("unsupported bridge adapter %q (expected discord|telegram)", args[0])
+				return fmt.Errorf("unsupported bridge adapter %q", args[0])
 			}
 		},
 	}
 	startCmd.Flags().StringVar(&startDir, "dir", ".", "Workspace directory")
 	startCmd.Flags().StringVar(&listenAddr, "listen", "127.0.0.1:8790", "Discord Interactions HTTP listen address")
 
-	bCmd.AddCommand(serveCmd, listCmd, startCmd)
+	var pairDir string
+	pairCmd := &cobra.Command{
+		Use:   "pair <code>",
+		Short: "Approve a pending DM pairing code for a messaging channel sender",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			absDir, err := filepath.Abs(pairDir)
+			if err != nil {
+				return err
+			}
+			ps := bridge.NewPairingStore(filepath.Join(absDir, ".soma"))
+			paired, err := ps.ApproveCode(args[0])
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "Approved %s sender %s (%s)\n", paired.Channel, paired.SenderID, paired.Name)
+			return nil
+		},
+	}
+	pairCmd.Flags().StringVar(&pairDir, "dir", ".", "Workspace directory")
+
+	var pairedDir string
+	pairedCmd := &cobra.Command{
+		Use:   "paired",
+		Short: "List approved paired senders and pending DM pairing codes",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			absDir, err := filepath.Abs(pairedDir)
+			if err != nil {
+				return err
+			}
+			ps := bridge.NewPairingStore(filepath.Join(absDir, ".soma"))
+			approved, err := ps.ListApproved()
+			if err != nil {
+				return err
+			}
+			pending, err := ps.ListPending()
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "Approved (%d):\n", len(approved))
+			for _, a := range approved {
+				fmt.Fprintf(cmd.OutOrStdout(), "  - %-10s %s (%s)\n", a.Channel, a.SenderID, a.Name)
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "Pending (%d):\n", len(pending))
+			for _, p := range pending {
+				fmt.Fprintf(cmd.OutOrStdout(), "  - %-10s %-10s %s (%s)\n", p.Code, p.Channel, p.SenderID, p.Name)
+			}
+			return nil
+		},
+	}
+	pairedCmd.Flags().StringVar(&pairedDir, "dir", ".", "Workspace directory")
+
+	var unpairDir string
+	unpairCmd := &cobra.Command{
+		Use:   "unpair <channel> <sender_id>",
+		Short: "Revoke a paired sender's access",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			absDir, err := filepath.Abs(unpairDir)
+			if err != nil {
+				return err
+			}
+			ps := bridge.NewPairingStore(filepath.Join(absDir, ".soma"))
+			ok, err := ps.Revoke(args[0], args[1])
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return fmt.Errorf("sender %s on %s is not paired", args[1], args[0])
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "Revoked %s sender %s\n", args[0], args[1])
+			return nil
+		},
+	}
+	unpairCmd.Flags().StringVar(&unpairDir, "dir", ".", "Workspace directory")
+
+	bCmd.AddCommand(serveCmd, listCmd, startCmd, pairCmd, pairedCmd, unpairCmd)
 	return bCmd
 }
 
@@ -692,4 +881,23 @@ func splitCommaInt64(s string) []int64 {
 		}
 	}
 	return out
+}
+
+func serveHTTPBridge(ctx context.Context, addr string, h http.Handler) error {
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           h,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	go func() {
+		<-ctx.Done()
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutCtx)
+	}()
+	err := srv.ListenAndServe()
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return err
 }

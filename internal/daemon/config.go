@@ -42,6 +42,17 @@ type TriggerSpec struct {
 	MaxTurns       int      `yaml:"max_turns,omitempty"`
 	Urgency        string   `yaml:"urgency,omitempty"` // low | normal | urgent
 	Prompt         string   `yaml:"prompt,omitempty"`
+	Enabled        *bool    `yaml:"enabled,omitempty"`
+	NotifyChannel  string   `yaml:"notify_channel,omitempty"`
+	NotifyTarget   string   `yaml:"notify_target,omitempty"`
+}
+
+// IsEnabled reports whether this trigger is active (defaults to true).
+func (t TriggerSpec) IsEnabled() bool {
+	if t.Enabled == nil {
+		return true
+	}
+	return *t.Enabled
 }
 
 // DefaultConfig returns sensible RFC-0001 v2.1 defaults for Tier-0 daemon execution.

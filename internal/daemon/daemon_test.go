@@ -361,3 +361,67 @@ func TestDaemon_WebhookHMACFilterAndRealFSNotify(t *testing.T) {
 		t.Fatalf("Daemon.Start shutdown err: %v", err)
 	}
 }
+
+func TestDaemon_ScheduleCronDurationAndShorthandFilter(t *testing.T) {
+	// 1. Duration & day suffixes
+	sDur, err := ParseSchedule("15m")
+	if err != nil || sDur.Interval != 15*time.Minute {
+		t.Fatalf("ParseSchedule(15m): %+v err=%v", sDur, err)
+	}
+	sDays, err := ParseSchedule("7d")
+	if err != nil || sDays.Interval != 7*24*time.Hour {
+		t.Fatalf("ParseSchedule(7d): %+v err=%v", sDays, err)
+	}
+
+	// 2. 5-field cron: "0 9 * * 1-5" (09:00 Mon-Fri)
+	sCron, err := ParseSchedule("0 9 * * 1-5")
+	if err != nil || !sCron.IsCron {
+		t.Fatalf("ParseSchedule(0 9 * * 1-5): %+v err=%v", sCron, err)
+	}
+	// Saturday 2026-11-21 10:00 UTC -> next should be Monday 2026-11-23 09:00 UTC
+	sat := time.Date(2026, 11, 21, 10, 0, 0, 0, time.UTC)
+	next := sCron.Next(sat)
+	want := time.Date(2026, 11, 23, 9, 0, 0, 0, time.UTC)
+	if !next.Equal(want) {
+		t.Fatalf("expected next weekday fire %s, got %s", want, next)
+	}
+
+	// Step cron: "*/15 * * * *"
+	sStep, err := ParseSchedule("*/15 * * * *")
+	if err != nil {
+		t.Fatalf("ParseSchedule(*/15 * * * *): %v", err)
+	}
+	nextStep := sStep.Next(time.Date(2026, 11, 21, 10, 03, 0, 0, time.UTC))
+	if nextStep.Minute() != 15 || nextStep.Hour() != 10 {
+		t.Fatalf("expected 10:15, got %s", nextStep)
+	}
+
+	// Invalid schedules rejected
+	for _, bad := range []string{"0 9 * *", "99 9 * * *", "0 25 * * *", "not-a-cron"} {
+		if _, err := ParseSchedule(bad); err == nil {
+			t.Fatalf("expected error for invalid schedule %q", bad)
+		}
+	}
+
+	// 3. Filter validation & GitHub shorthand event matching
+	if err := ValidateFilter("pull_request.opened"); err != nil {
+		t.Fatalf("ValidateFilter shorthand failed: %v", err)
+	}
+	if err := ValidateFilter("conclusion == 'failure'"); err != nil {
+		t.Fatalf("ValidateFilter equality failed: %v", err)
+	}
+	if err := ValidateFilter("invalid filter syntax ???"); err == nil {
+		t.Fatal("expected ValidateFilter to reject invalid expression")
+	}
+
+	ghFields := map[string]any{
+		"action":       "opened",
+		"pull_request": map[string]any{"number": 42},
+	}
+	if !matchesFilter("pull_request.opened", ghFields) {
+		t.Fatal("expected pull_request.opened shorthand to match GitHub PR payload")
+	}
+	if matchesFilter("pull_request.closed", ghFields) {
+		t.Fatal("expected pull_request.closed shorthand not to match opened PR payload")
+	}
+}

@@ -20,23 +20,32 @@ type managedServer struct {
 	tools   []sdkmcp.Tool
 }
 
-// Manager manages live stdio and HTTP MCP server connections for soma runs, supporting
-// progressive tool discovery and taint-tagged multimodal tool invocation.
+// Manager manages live stdio, SSE, Streamable HTTP, and stateless HTTP MCP server connections for soma runs,
+// supporting progressive tool discovery, per-server tool filtering, resources/prompts, OAuth 2.1, and taint-tagged invocation.
 type Manager struct {
 	mu         sync.RWMutex
 	httpClient *Client
+	tokenStore *TokenStore
 	servers    map[string]*managedServer
 }
 
-// NewManager creates a unified MCP Manager supporting both stdio and HTTP servers.
+// NewManager creates a unified MCP Manager supporting stdio, SSE, Streamable HTTP, and stateless HTTP servers.
 func NewManager() *Manager {
 	return &Manager{
 		httpClient: NewClient(),
+		tokenStore: DefaultTokenStore(),
 		servers:    make(map[string]*managedServer),
 	}
 }
 
-// Connect connects to ep (via stdio subprocess or stateless HTTP), lists its tools, and registers it.
+// SetTokenStore configures the OAuth token store used by Streamable HTTP endpoints.
+func (m *Manager) SetTokenStore(ts *TokenStore) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.tokenStore = ts
+}
+
+// Connect connects to ep (via stdio, SSE, Streamable HTTP, or stateless HTTP), lists & filters its tools, and registers it.
 func (m *Manager) Connect(ctx context.Context, ep ServerEndpoint) error {
 	if strings.TrimSpace(ep.Name) == "" {
 		return errors.New("mcp manager: empty server name")
@@ -46,15 +55,16 @@ func (m *Manager) Connect(ctx context.Context, ep ServerEndpoint) error {
 	}
 
 	ms := &managedServer{ep: ep}
-	switch ep.EffectiveTransport() {
+	transport := ep.EffectiveTransport()
+	switch transport {
 	case "stdio":
 		if strings.TrimSpace(ep.Command) == "" {
 			return fmt.Errorf("mcp manager: stdio server %q requires command", ep.Name)
 		}
 		cmd := exec.Command(ep.Command, ep.Args...)
-		if len(ep.Env) > 0 {
+		if resolvedEnv := ResolveEnv(ep.Env); len(resolvedEnv) > 0 {
 			env := os.Environ()
-			for k, v := range ep.Env {
+			for k, v := range resolvedEnv {
 				env = append(env, k+"="+v)
 			}
 			cmd.Env = env
@@ -68,16 +78,76 @@ func (m *Manager) Connect(ctx context.Context, ep ServerEndpoint) error {
 			return fmt.Errorf("mcp stdio connect %s: %w", ep.Name, err)
 		}
 		ms.session = sess
-		res, err := sess.ListTools(ctx, &sdkmcp.ListToolsParams{})
+		tools, err := listSessionTools(ctx, sess, ep)
 		if err != nil {
 			_ = sess.Close()
 			return fmt.Errorf("mcp stdio list_tools %s: %w", ep.Name, err)
 		}
-		for _, t := range res.Tools {
-			if t != nil {
-				ms.tools = append(ms.tools, *t)
+		ms.tools = tools
+
+	case "sse":
+		if strings.TrimSpace(ep.URL) == "" {
+			return fmt.Errorf("mcp manager: sse server %q requires url", ep.Name)
+		}
+		hc := NewEndpointHTTPClient(ep, m.httpClient.HTTPClient)
+		client := sdkmcp.NewClient(&sdkmcp.Implementation{
+			Name:    "soma",
+			Version: "0.5.0",
+		}, nil)
+		sess, err := client.Connect(ctx, &sdkmcp.SSEClientTransport{
+			Endpoint:   expandEnvVars(ep.URL),
+			HTTPClient: hc,
+		}, nil)
+		if err != nil {
+			return fmt.Errorf("mcp sse connect %s: %w", ep.Name, err)
+		}
+		ms.session = sess
+		tools, err := listSessionTools(ctx, sess, ep)
+		if err != nil {
+			_ = sess.Close()
+			return fmt.Errorf("mcp sse list_tools %s: %w", ep.Name, err)
+		}
+		ms.tools = tools
+
+	case "streamable_http":
+		if strings.TrimSpace(ep.URL) == "" {
+			return fmt.Errorf("mcp manager: streamable_http server %q requires url", ep.Name)
+		}
+		hc := NewEndpointHTTPClient(ep, m.httpClient.HTTPClient)
+		var oauthHandler *StoredOAuthHandler
+		if ep.OAuth != nil && ep.OAuth.Enabled {
+			m.mu.RLock()
+			ts := m.tokenStore
+			m.mu.RUnlock()
+			oauthHandler = &StoredOAuthHandler{
+				Endpoint:   ep,
+				Store:      ts,
+				HTTPClient: hc,
 			}
 		}
+		tr := &sdkmcp.StreamableClientTransport{
+			Endpoint:   expandEnvVars(ep.URL),
+			HTTPClient: hc,
+		}
+		if oauthHandler != nil {
+			tr.OAuthHandler = oauthHandler
+		}
+		client := sdkmcp.NewClient(&sdkmcp.Implementation{
+			Name:    "soma",
+			Version: "0.5.0",
+		}, nil)
+		sess, err := client.Connect(ctx, tr, nil)
+		if err != nil {
+			return fmt.Errorf("mcp streamable_http connect %s: %w", ep.Name, err)
+		}
+		ms.session = sess
+		tools, err := listSessionTools(ctx, sess, ep)
+		if err != nil {
+			_ = sess.Close()
+			return fmt.Errorf("mcp streamable_http list_tools %s: %w", ep.Name, err)
+		}
+		ms.tools = tools
+
 	default:
 		if strings.TrimSpace(ep.URL) == "" {
 			return fmt.Errorf("mcp manager: http server %q requires url", ep.Name)
@@ -86,7 +156,7 @@ func (m *Manager) Connect(ctx context.Context, ep ServerEndpoint) error {
 		if err != nil {
 			return fmt.Errorf("mcp http list_tools %s: %w", ep.Name, err)
 		}
-		ms.tools = tools
+		ms.tools = FilterTools(tools, ep.IncludeTools, ep.ExcludeTools)
 	}
 
 	m.mu.Lock()
@@ -178,6 +248,9 @@ func (m *Manager) CallTool(ctx context.Context, serverName, toolName string, arg
 	if !ok {
 		return ToolCallOutput{}, fmt.Errorf("mcp call_tool: server %q is not connected (connected: %v)", serverName, m.ListServers())
 	}
+	if !IsToolAllowed(toolName, ms.ep.IncludeTools, ms.ep.ExcludeTools) {
+		return ToolCallOutput{}, fmt.Errorf("mcp call_tool: tool %q on server %q is blocked by server tool filter", toolName, serverName)
+	}
 	if args == nil {
 		args = map[string]any{}
 	}
@@ -237,6 +310,229 @@ func (m *Manager) CallTool(ctx context.Context, serverName, toolName string, arg
 		Images:    images,
 		TrustTier: "untrusted_external",
 	}, nil
+}
+
+func listSessionTools(ctx context.Context, sess *sdkmcp.ClientSession, ep ServerEndpoint) ([]sdkmcp.Tool, error) {
+	res, err := sess.ListTools(ctx, &sdkmcp.ListToolsParams{})
+	if err != nil {
+		return nil, err
+	}
+	rawTools := make([]sdkmcp.Tool, 0, len(res.Tools))
+	for _, t := range res.Tools {
+		if t != nil {
+			rawTools = append(rawTools, *t)
+		}
+	}
+	return FilterTools(rawTools, ep.IncludeTools, ep.ExcludeTools), nil
+}
+
+// Ping verifies connectivity to serverName.
+func (m *Manager) Ping(ctx context.Context, serverName string) error {
+	m.mu.RLock()
+	ms, ok := m.servers[strings.TrimSpace(serverName)]
+	m.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("mcp ping: server %q is not connected", serverName)
+	}
+	if ms.session != nil {
+		return ms.session.Ping(ctx, &sdkmcp.PingParams{})
+	}
+	_, err := m.httpClient.ListTools(ctx, ms.ep)
+	return err
+}
+
+// RefreshTools re-queries tools/list for serverName and updates its filtered tool cache.
+func (m *Manager) RefreshTools(ctx context.Context, serverName string) error {
+	serverName = strings.TrimSpace(serverName)
+	m.mu.RLock()
+	ms, ok := m.servers[serverName]
+	m.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("mcp refresh_tools: server %q is not connected", serverName)
+	}
+	var tools []sdkmcp.Tool
+	var err error
+	if ms.session != nil {
+		tools, err = listSessionTools(ctx, ms.session, ms.ep)
+	} else {
+		var raw []sdkmcp.Tool
+		raw, err = m.httpClient.ListTools(ctx, ms.ep)
+		if err == nil {
+			tools = FilterTools(raw, ms.ep.IncludeTools, ms.ep.ExcludeTools)
+		}
+	}
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	if cur, exists := m.servers[serverName]; exists {
+		cur.tools = tools
+	}
+	m.mu.Unlock()
+	return nil
+}
+
+// ListResources queries resources/list on serverName (or all connected servers when serverName == "").
+func (m *Manager) ListResources(ctx context.Context, serverName string) (map[string][]sdkmcp.Resource, error) {
+	m.mu.RLock()
+	targets := make(map[string]*managedServer, len(m.servers))
+	for name, ms := range m.servers {
+		if serverName != "" && name != serverName {
+			continue
+		}
+		targets[name] = ms
+	}
+	m.mu.RUnlock()
+
+	out := make(map[string][]sdkmcp.Resource, len(targets))
+	for name, ms := range targets {
+		if ms.session != nil {
+			res, err := ms.session.ListResources(ctx, &sdkmcp.ListResourcesParams{})
+			if err != nil {
+				return nil, fmt.Errorf("mcp list_resources %s: %w", name, err)
+			}
+			var items []sdkmcp.Resource
+			for _, r := range res.Resources {
+				if r != nil {
+					items = append(items, *r)
+				}
+			}
+			out[name] = items
+		} else {
+			items, err := m.httpClient.ListResources(ctx, ms.ep)
+			if err != nil {
+				return nil, fmt.Errorf("mcp list_resources %s: %w", name, err)
+			}
+			out[name] = items
+		}
+	}
+	return out, nil
+}
+
+// ReadResource fetches uri from serverName and returns it strictly tagged untrusted_external.
+func (m *Manager) ReadResource(ctx context.Context, serverName, uri string) (ResourceReadOutput, error) {
+	serverName = strings.TrimSpace(serverName)
+	uri = strings.TrimSpace(uri)
+	if serverName == "" || uri == "" {
+		return ResourceReadOutput{}, errors.New("mcp read_resource: server and uri are required")
+	}
+	m.mu.RLock()
+	ms, ok := m.servers[serverName]
+	m.mu.RUnlock()
+	if !ok {
+		return ResourceReadOutput{}, fmt.Errorf("mcp read_resource: server %q is not connected", serverName)
+	}
+	if ms.session == nil {
+		return m.httpClient.ReadResource(ctx, ms.ep, uri)
+	}
+	res, err := ms.session.ReadResource(ctx, &sdkmcp.ReadResourceParams{URI: uri})
+	if err != nil {
+		return ResourceReadOutput{}, fmt.Errorf("mcp read_resource %s %s: %w", serverName, uri, err)
+	}
+	out := ResourceReadOutput{
+		Server:    serverName,
+		URI:       uri,
+		TrustTier: "untrusted_external",
+	}
+	var texts []string
+	for _, c := range res.Contents {
+		if c == nil {
+			continue
+		}
+		if out.MIMEType == "" && c.MIMEType != "" {
+			out.MIMEType = c.MIMEType
+		}
+		if c.Text != "" {
+			texts = append(texts, c.Text)
+		}
+		if len(out.Blob) == 0 && len(c.Blob) > 0 {
+			out.Blob = c.Blob
+		}
+	}
+	out.Text = strings.Join(texts, "\n")
+	return out, nil
+}
+
+// ListPrompts queries prompts/list on serverName (or all connected servers when serverName == "").
+func (m *Manager) ListPrompts(ctx context.Context, serverName string) (map[string][]sdkmcp.Prompt, error) {
+	m.mu.RLock()
+	targets := make(map[string]*managedServer, len(m.servers))
+	for name, ms := range m.servers {
+		if serverName != "" && name != serverName {
+			continue
+		}
+		targets[name] = ms
+	}
+	m.mu.RUnlock()
+
+	out := make(map[string][]sdkmcp.Prompt, len(targets))
+	for name, ms := range targets {
+		if ms.session != nil {
+			res, err := ms.session.ListPrompts(ctx, &sdkmcp.ListPromptsParams{})
+			if err != nil {
+				return nil, fmt.Errorf("mcp list_prompts %s: %w", name, err)
+			}
+			var items []sdkmcp.Prompt
+			for _, p := range res.Prompts {
+				if p != nil {
+					items = append(items, *p)
+				}
+			}
+			out[name] = items
+		} else {
+			items, err := m.httpClient.ListPrompts(ctx, ms.ep)
+			if err != nil {
+				return nil, fmt.Errorf("mcp list_prompts %s: %w", name, err)
+			}
+			out[name] = items
+		}
+	}
+	return out, nil
+}
+
+// GetPrompt fetches promptName with args from serverName, tagged untrusted_external.
+func (m *Manager) GetPrompt(ctx context.Context, serverName, promptName string, args map[string]string) (PromptGetOutput, error) {
+	serverName = strings.TrimSpace(serverName)
+	promptName = strings.TrimSpace(promptName)
+	if serverName == "" || promptName == "" {
+		return PromptGetOutput{}, errors.New("mcp get_prompt: server and prompt are required")
+	}
+	m.mu.RLock()
+	ms, ok := m.servers[serverName]
+	m.mu.RUnlock()
+	if !ok {
+		return PromptGetOutput{}, fmt.Errorf("mcp get_prompt: server %q is not connected", serverName)
+	}
+	if ms.session == nil {
+		return m.httpClient.GetPrompt(ctx, ms.ep, promptName, args)
+	}
+	res, err := ms.session.GetPrompt(ctx, &sdkmcp.GetPromptParams{
+		Name:      promptName,
+		Arguments: args,
+	})
+	if err != nil {
+		return PromptGetOutput{}, fmt.Errorf("mcp get_prompt %s %s: %w", serverName, promptName, err)
+	}
+	out := PromptGetOutput{
+		Server:      serverName,
+		Prompt:      promptName,
+		Description: res.Description,
+		TrustTier:   "untrusted_external",
+	}
+	for _, msg := range res.Messages {
+		if msg == nil {
+			continue
+		}
+		var text string
+		if tc, ok := msg.Content.(*sdkmcp.TextContent); ok && tc != nil {
+			text = tc.Text
+		}
+		out.Messages = append(out.Messages, PromptMessage{
+			Role:    string(msg.Role),
+			Content: text,
+		})
+	}
+	return out, nil
 }
 
 // Close shuts down all active stdio MCP sessions cleanly.

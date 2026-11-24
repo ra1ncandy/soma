@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -29,6 +30,7 @@ type TelegramConfig struct {
 type TelegramAdapter struct {
 	Client     *KernelClient
 	Config     TelegramConfig
+	Pairing    *PairingStore
 	HTTPClient *http.Client
 
 	mu        sync.Mutex
@@ -53,14 +55,29 @@ func NewTelegramAdapter(client *KernelClient, cfg TelegramConfig) *TelegramAdapt
 	}
 }
 
+// Name returns "telegram" to satisfy ChannelAdapter.
+func (a *TelegramAdapter) Name() string { return "telegram" }
+
+// Send delivers an OutboundMessage to Telegram via SendMessage.
+func (a *TelegramAdapter) Send(ctx context.Context, msg OutboundMessage) error {
+	var chatID int64
+	if strings.TrimSpace(msg.Target) != "" {
+		chatID, _ = strconv.ParseInt(strings.TrimSpace(msg.Target), 10, 64)
+	}
+	return a.SendMessage(ctx, chatID, msg.Text)
+}
+
 func (a *TelegramAdapter) isUserAllowed(userID int64) bool {
-	if userID == 0 || len(a.Config.AllowedUserIDs) == 0 {
+	if userID == 0 {
 		return false
 	}
 	for _, id := range a.Config.AllowedUserIDs {
 		if id == userID {
 			return true
 		}
+	}
+	if a.Pairing != nil && a.Pairing.IsApproved("telegram", strconv.FormatInt(userID, 10)) {
+		return true
 	}
 	return false
 }
@@ -138,14 +155,38 @@ func (a *TelegramAdapter) PollUpdatesOnce(ctx context.Context) (int, error) {
 		}
 		userID := upd.Message.From.ID
 		chatID := upd.Message.Chat.ID
-		if !a.isChatAllowed(chatID) || !a.isUserAllowed(userID) {
+		if !a.isChatAllowed(chatID) {
+			continue
+		}
+		if !a.isUserAllowed(userID) {
+			if a.Pairing != nil && chatID == userID && strings.TrimSpace(upd.Message.Text) != "" {
+				if req, pErr := a.Pairing.IssueCode("telegram", strconv.FormatInt(userID, 10), upd.Message.From.Username); pErr == nil {
+					_ = a.SendMessage(ctx, chatID, fmt.Sprintf("Pairing required. Approve code %s in soma Dashboard → Connectors → Channel Bridges (or run `soma bridge pair %s`).", req.Code, req.Code))
+				}
+			}
 			continue
 		}
 		cmd, ok := ParseCommand(upd.Message.Text)
-		if !ok {
+		var reply string
+		var cmdErr error
+		if ok {
+			reply, cmdErr = dispatchBridgeCommand(ctx, a.Client, "telegram", fmt.Sprintf("telegram:%d", userID), "/", cmd)
+		} else if strings.TrimSpace(upd.Message.Text) != "" && chatID == userID && a.Client != nil {
+			res, sErr := a.Client.StartRun(ctx, StartRunRequest{
+				Goal:   strings.TrimSpace(upd.Message.Text),
+				Source: fmt.Sprintf("telegram:%d", chatID),
+				Sync:   true,
+			})
+			if sErr != nil {
+				cmdErr = sErr
+			} else if strings.TrimSpace(res.Summary) != "" {
+				reply = res.Summary
+			} else {
+				reply = fmt.Sprintf("run %s (%s)", res.RunID, res.Status)
+			}
+		} else {
 			continue
 		}
-		reply, cmdErr := dispatchBridgeCommand(ctx, a.Client, "telegram", fmt.Sprintf("telegram:%d", userID), "/", cmd)
 		if cmdErr != nil {
 			reply = "error: " + cmdErr.Error()
 		}

@@ -176,15 +176,17 @@ func (e *StallBreakerError) Error() string {
 
 // RunRequest configures a new Run and its root Branch.
 type RunRequest struct {
-	RunID         string
-	Title         string
-	WorkspacePath string
-	WorkspaceKind string
-	GoalSpec      string
-	ContractSpec  string
-	SystemPrompt  string
-	Profile       compiler.ModelProfile
-	AccountIDs    []string
+	RunID             string
+	Title             string
+	WorkspacePath     string
+	WorkspaceKind     string
+	WorkspaceStrategy string
+	GoalSpec          string
+	ContractSpec      string
+	SystemPrompt      string
+	AutonomyMode      string // "standard" | "autonomous"
+	Profile           compiler.ModelProfile
+	AccountIDs        []string
 }
 
 // BranchResult summarizes the outcome of an ExecuteBranch call.
@@ -226,8 +228,10 @@ type Executor struct {
 	AccountIDs          []string
 	AllowFailover       bool
 	EnforceStallBreaker bool
+	AutonomyMode        string // "standard" | "autonomous"
 	GUIConfig           *GUISubagentConfig
 	AfterDispatchHook   func(ctx context.Context, entry store.ActionJournalEntry) error
+	OnStep              func(step store.Step)
 	seq                 atomic.Uint64
 }
 
@@ -348,6 +352,9 @@ func (e *Executor) StartRun(ctx context.Context, req RunRequest) (string, string
 	if req.SystemPrompt != "" {
 		e.SystemPrompt = req.SystemPrompt
 	}
+	if req.AutonomyMode != "" {
+		e.AutonomyMode = req.AutonomyMode
+	}
 	if len(req.AccountIDs) > 0 {
 		e.AccountIDs = req.AccountIDs
 	}
@@ -383,11 +390,12 @@ func (e *Executor) StartRun(ctx context.Context, req RunRequest) (string, string
 
 	branchID := fmt.Sprintf("br_%x_%04d", time.Now().UnixNano(), e.seq.Add(1))
 	branch := store.Branch{
-		ID:     branchID,
-		RunID:  runID,
-		Label:  "main",
-		Epoch:  1,
-		Status: string(StatusQueued),
+		ID:                branchID,
+		RunID:             runID,
+		Label:             "main",
+		Epoch:             1,
+		Status:            string(StatusQueued),
+		WorkspaceStrategy: workspace.NormalizeStrategy(req.WorkspaceStrategy),
 	}
 	if err := e.Store.CreateBranch(ctx, branch); err != nil {
 		return "", "", fmt.Errorf("create main branch: %w", err)
@@ -609,6 +617,77 @@ func (e *Executor) ReconcileAction(ctx context.Context, actionID string, outcome
 				_ = e.Store.UpdateInboxStatus(ctx, it.ID, "approved")
 			}
 		}
+	}
+	return nil
+}
+
+// AppendFollowUpUserTurn records a user follow-up message on branchID, preserving L0/L1 KV prefix and history.
+func (e *Executor) AppendFollowUpUserTurn(ctx context.Context, branchID, message string) error {
+	msg := strings.TrimSpace(message)
+	if msg == "" {
+		return errors.New("follow-up message is required")
+	}
+	branch, err := e.Store.GetBranch(ctx, branchID)
+	if err != nil {
+		return err
+	}
+	run, err := e.Store.GetRun(ctx, branch.RunID)
+	if err != nil {
+		return err
+	}
+	snap, snapID, _, pendingDeltaAppends, nextTurn, err := e.loadOrInitEpochState(ctx, run, branch)
+	if err != nil {
+		return err
+	}
+	deltaBytes, _ := json.Marshal(compiler.FrameDelta{AppendedL2: pendingDeltaAppends})
+	deltaHash, _, err := e.Store.Blobs().Put(deltaBytes)
+	if err != nil {
+		return err
+	}
+	emPayload := EmittedPayload{
+		Response: GenerateResponse{
+			Reasoning: msg,
+		},
+		ResultingLogEntries: []compiler.LogEntry{
+			{
+				Kind:        "user",
+				TurnIndex:   nextTurn,
+				Action:      "user_message",
+				Observation: msg,
+			},
+		},
+	}
+	emBytes, _ := json.Marshal(emPayload)
+	emHash, _, err := e.Store.Blobs().Put(emBytes)
+	if err != nil {
+		return err
+	}
+	sid := ComputeStepID(branch.HeadStepID, branch.ID, snapID, branch.ActiveAccountID, deltaHash, "user_turn", emHash, msg)
+	stepRow := store.Step{
+		ID:                 sid,
+		RunID:              run.ID,
+		BranchID:           branch.ID,
+		ParentStepID:       branch.HeadStepID,
+		Epoch:              snap.Epoch,
+		TurnIndex:          nextTurn,
+		AccountID:          branch.ActiveAccountID,
+		ModelID:            "user",
+		StateHash:          "user_turn",
+		EpochSnapshotID:    snapID,
+		FrameDeltaBlobHash: deltaHash,
+		CompiledFrameHash:  "user_turn",
+		EmittedBlobHash:    emHash,
+	}
+	if err := e.Store.AppendStep(ctx, stepRow, store.BranchUpdate{
+		Epoch:           snap.Epoch,
+		Status:          string(StatusQueued),
+		ActiveAccountID: branch.ActiveAccountID,
+		StallCount:      0,
+	}); err != nil {
+		return err
+	}
+	if e.OnStep != nil {
+		e.OnStep(stepRow)
 	}
 	return nil
 }
@@ -994,6 +1073,10 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 			}
 			idemKey := sha256Hex([]byte(idemRaw))
 
+			if decision == taint.DecisionAsk && strings.EqualFold(e.AutonomyMode, "autonomous") && tc.EffectClass != taint.EffectIrreversible {
+				decision = taint.DecisionAllow
+				reason = "auto-approved (autonomous mode)"
+			}
 			if decision == taint.DecisionAsk {
 				_ = e.Store.PrepareAction(ctx, store.ActionJournalEntry{
 					ActionID:            actionID,
@@ -1287,6 +1370,9 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 		}
 		if err != nil {
 			return res, err
+		}
+		if e.OnStep != nil {
+			e.OnStep(stepRow)
 		}
 
 		branch.HeadStepID = sid
@@ -1753,8 +1839,25 @@ func (e *Executor) rolloverWithHandoff(
 	return nextSnap, nextSnapID, skeleton, nil
 }
 
+// WorkspaceScopeKey derives a deterministic workspace memory scope identifier for workspacePath.
+func WorkspaceScopeKey(workspacePath string) string {
+	trimmed := strings.TrimSpace(workspacePath)
+	if trimmed == "" {
+		return "workspace"
+	}
+	abs, err := filepath.Abs(trimmed)
+	if err != nil {
+		abs = filepath.Clean(trimmed)
+	}
+	sum := sha256.Sum256([]byte(filepath.Clean(abs)))
+	return "workspace:" + hex.EncodeToString(sum[:6])
+}
+
 func (e *Executor) loadMemoryAndGraveyard(ctx context.Context, runID string) ([]compiler.MemoryEntry, []compiler.GraveyardEntry, error) {
-	scopes := []string{"global", "repo:" + runID}
+	scopes := []string{"global", "workspace", "repo:" + runID}
+	if run, rErr := e.Store.GetRun(ctx, runID); rErr == nil && strings.TrimSpace(run.WorkspacePath) != "" {
+		scopes = append(scopes, WorkspaceScopeKey(run.WorkspacePath))
+	}
 	nodes, err := e.Store.ListActiveMemoryByScopes(ctx, scopes, nil)
 	if err != nil {
 		return nil, nil, err
@@ -1835,7 +1938,7 @@ func strconvUnquote(s string) (string, error) {
 }
 
 func defaultKernelSystemPrompt() string {
-	return "You are soma, executing inside an isolated branch workspace. Available workspace tools: fs_list, fs_grep, fs_read(path, start_line?, end_line?), fs_write, fs_patch, exec(command, timeout_sec?), bg_exec, bg_poll(job_id, wait_seconds?), bg_kill, page_grep(page_id, pattern, context_lines?, ignore_case?), page_slice, page_search, memory_search, publish_finding, web_extract. Efficiency & rigor rules: (1) Batch independent read-only calls (fs_list, fs_grep, fs_read, page_grep, page_slice) in a single turn — they execute in parallel. (2) Use fs_grep to locate symbols, log lines, configs, or motifs across files instead of reading whole directories; use fs_read with start_line/end_line or page_grep/page_slice/page_search on spilled @page_XXXX handles instead of guessing. (3) Prefer fs_patch for targeted edits to existing files to preserve untouched code/configs. (4) For heavy compute, tests, or long-running processes, pass timeout_sec to exec (up to 300s) or use bg_exec + bg_poll(job_id, wait_seconds). (5) For difficult research and engineering tasks, form explicit hypotheses, verify edge cases, numerical/causal invariants, and boundary conditions with tests before declaring completion."
+	return "You are soma, executing inside an isolated branch workspace. Available workspace tools: fs_list, fs_grep, fs_read(path, start_line?, end_line?), fs_write, fs_patch, exec(command, timeout_sec?), bg_exec, bg_poll(job_id, wait_seconds?), bg_kill, page_grep(page_id, pattern, context_lines?, ignore_case?), page_slice, page_search, memory_search, publish_finding, web_extract, desktop_task(goal, start_url?). Efficiency & rigor rules: (0) Match effort and response length to the request: answer simple questions, greetings, or quick queries directly and concisely (1–3 sentences) without running unnecessary workspace tools or writing long reports; only use tools when the user asks you to inspect, build, edit, run, or verify something in the workspace. (1) Batch independent read-only calls (fs_list, fs_grep, fs_read, page_grep, page_slice) in a single turn — they execute in parallel. (2) Use fs_grep to locate symbols, log lines, configs, or motifs across files instead of reading whole directories; use fs_read with start_line/end_line or page_grep/page_slice/page_search on spilled @page_XXXX handles instead of guessing. (3) Prefer fs_patch for targeted edits to existing files to preserve untouched code/configs. (4) For heavy compute, tests, or long-running processes, pass timeout_sec to exec (up to 300s) or use bg_exec + bg_poll(job_id, wait_seconds). (5) When asked to open a website, browse interactively, or control a GUI/desktop, call desktop_task(goal, start_url?) directly — the host automatically starts the Virtual Desktop if it is not running (never try to start Docker inside exec). (6) For complex research and engineering tasks, form explicit hypotheses, verify edge cases and invariants with tests before declaring completion, then summarize concisely."
 }
 
 func (e *Executor) buildEpochInput(run store.Run, activeMem []compiler.MemoryEntry, grave []compiler.GraveyardEntry) compiler.EpochInput {
@@ -1884,6 +1987,8 @@ type LocalToolRunner struct {
 	// AllowUnsandboxedExec lets exec/bg_exec run a bare host shell when Sandbox is nil.
 	// It is off by default (fail-closed) and must never be enabled for model-driven runs.
 	AllowUnsandboxedExec bool
+	// AllowSandboxNetwork permits outbound network access inside the OS sandbox (disables --unshare-net / deny network*).
+	AllowSandboxNetwork bool
 }
 
 // NewLocalToolRunner constructs a workspace-scoped tool runner with no OS sandbox. Its exec and
@@ -2265,6 +2370,7 @@ func (r *LocalToolRunner) Execute(ctx context.Context, call ToolCall) (ToolOutpu
 			Label:            label,
 			Sandbox:          r.Sandbox,
 			AllowUnsandboxed: r.AllowUnsandboxedExec,
+			AllowNetwork:     r.AllowSandboxNetwork,
 		})
 		if err != nil {
 			return ToolOutput{}, err
@@ -2341,6 +2447,7 @@ func (r *LocalToolRunner) Execute(ctx context.Context, call ToolCall) (ToolOutpu
 				WorkspaceDir: call.WorkspaceDir,
 				Command:      "/bin/sh",
 				Args:         []string{"-c", command},
+				AllowNetwork: r.AllowSandboxNetwork,
 				Timeout:      timeout,
 			})
 			if err != nil {
@@ -2573,6 +2680,12 @@ func (r *LocalToolRunner) Execute(ctx context.Context, call ToolCall) (ToolOutpu
 		}
 		serverName, _ := args["server"].(string)
 		toolName, _ := args["tool"].(string)
+		if strings.TrimSpace(serverName) == "" {
+			if parsedSrv, parsedTool, ok := mcp.ParseToolName(toolName); ok {
+				serverName = parsedSrv
+				toolName = parsedTool
+			}
+		}
 		var toolArgs map[string]any
 		if rawArgs, ok := args["arguments_json"].(string); ok && strings.TrimSpace(rawArgs) != "" {
 			if err := json.Unmarshal([]byte(rawArgs), &toolArgs); err != nil {

@@ -76,6 +76,8 @@ type BgStartSpec struct {
 	// AllowUnsandboxed permits a bare host shell when Sandbox is nil. Never set this for
 	// model-driven runs: it hands the model the operator's network and filesystem.
 	AllowUnsandboxed bool
+	// AllowNetwork permits outbound network inside the OS sandbox (disables --unshare-net / deny network*).
+	AllowNetwork bool
 }
 
 // ErrUnsandboxedExec is returned when a shell tool is invoked with no sandbox and no explicit opt-out.
@@ -98,6 +100,7 @@ func (m *BgProcessManager) Start(spec BgStartSpec) (string, error) {
 			WorkspaceDir: workspaceDir,
 			Command:      "/bin/sh",
 			Args:         []string{"-c", command},
+			AllowNetwork: spec.AllowNetwork,
 		})
 		if err != nil {
 			return "", fmt.Errorf("bg_exec sandbox: %w", err)

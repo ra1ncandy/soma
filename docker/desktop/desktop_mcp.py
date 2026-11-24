@@ -14,6 +14,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 
 from PIL import Image, ImageDraw
 
@@ -182,6 +183,27 @@ TOOLS = [
         "description": "List open windows inside the isolated desktop.",
         "inputSchema": {"type": "object", "properties": {}},
     },
+    {
+        "name": "desktop_wait",
+        "description": "Wait for N seconds (1-10) for a page or app to finish loading.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"seconds": {"type": "number"}},
+            "required": ["seconds"],
+        },
+    },
+    {
+        "name": "desktop_exec",
+        "description": "Run a shell command inside the isolated desktop container (supports sudo apt-get, pip, npm, git, etc.).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string"},
+                "timeout_sec": {"type": "integer"},
+            },
+            "required": ["command"],
+        },
+    },
 ]
 
 
@@ -274,6 +296,32 @@ def handle_tool(name: str, args: dict) -> dict:
         res = subprocess.run(["wmctrl", "-lG"], env=ENV, capture_output=True, text=True)
         out = res.stdout.strip() or "(no windows)"
         return {"content": [{"type": "text", "text": out}]}
+
+    if name == "desktop_wait":
+        secs = max(0.2, min(10.0, float(args.get("seconds") or 1.0)))
+        time.sleep(secs)
+        return {"content": [{"type": "text", "text": f"waited {secs:.1f}s"}]}
+
+    if name == "desktop_exec":
+        cmd = str(args.get("command") or "").strip()
+        if not cmd:
+            return {"isError": True, "content": [{"type": "text", "text": "desktop_exec requires non-empty command"}]}
+        timeout = max(1, min(180, int(args.get("timeout_sec") or 60)))
+        try:
+            res = subprocess.run(
+                ["/bin/sh", "-c", cmd],
+                env=ENV,
+                cwd="/workspace",
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            out = (res.stdout or "") + (res.stderr or "")
+            if len(out) > 12000:
+                out = "...(truncated)\n" + out[-12000:]
+            return {"content": [{"type": "text", "text": f"exit_code={res.returncode}\n{out.strip()}"}]}
+        except subprocess.TimeoutExpired:
+            return {"isError": True, "content": [{"type": "text", "text": f"desktop_exec timed out after {timeout}s"}]}
 
     return {"isError": True, "content": [{"type": "text", "text": f"unknown tool: {name}"}]}
 
