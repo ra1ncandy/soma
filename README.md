@@ -13,7 +13,8 @@ Instead of treating an autonomous agent as an append-only chat array that dumps 
 - **Bi-Temporal Provenance Memory Graph** with point-in-time `QueryAsOf`, *MINJA* untrusted quarantine, semantic conflict detection, and **Epoch-Pinned Top-$K$ Hybrid Retrieval**.
 - **External Verification Oracles (`CommandOracle`, `ArtifactOracle`, Zero-History `AdvisoryReviewer`)** with kernel `EROFS` read-only test pinning that eliminate self-graded completion lies.
 - **Speculative Branching (`soma search`) & Concurrent Multi-Agent Swarms (`soma swarm`)** with isolated per-branch Git worktrees, a cache-safe **`Layer 2` Blackboard bus**, **3-way `git merge-file` workspace merging**, and a cross-branch **Graveyard (`negative_path`)**.
-- **Fail-Closed OS Sandboxing (`bwrap` / Seatbelt / Docker / Remote SSH; Landlock is probed but not yet an enforcement backend)** paired with **Secretless Capability Brokers** and **Data/Action-Level Provenance Taint Tracking**.
+- **Fail-Closed OS Sandboxing (`bwrap` / Seatbelt / Docker / Remote SSH; Landlock is probed but not yet an enforcement backend)** paired with **Secretless Capability Brokers**, **Data/Action-Level Provenance Taint Tracking**, opt-in **Sandbox Network Access**, and **Standard / High-Autonomy** execution modes.
+- **Web Dashboard (`soma web`) & Isolated Virtual Desktop (`soma-desktop`)** featuring live SSE step streaming, compact collapsible thinking/tool traces, isolated workspace **Review Diff & Apply to Project** (or `Direct` mode), embedded **Cron/Webhook Automations & 11 Channel Bridges** (Discord, Telegram, Slack, Matrix, Email, etc. with DM pairing), **49+ one-click MCP Connectors**, **Cloudflare Tunnel** remote access, and a **noVNC Virtual Desktop** with **Take Over / View-Only** protection, idle auto-stop, and container-scoped package managers (`sudo apt-get`, `pip`, `npm`).
 - **Oracle-Verified SFT & Contrastive DPO/GRPO Trajectory Export (`soma export-trajectories`)** pairing verified winning branches against Graveyard-abandoned sibling branches from their exact shared fork ancestor.
 
 > - Architecture Specification: [RFC-0001 (`soma` v2.1 Architecture)](docs/rfcs/0001-soma-v2-architecture.md)
@@ -27,8 +28,9 @@ Instead of treating an autonomous agent as an append-only chat array that dumps 
 ```text
 ┌───────────────────────────────────────────────────────────────────────────────┐
 │                            OPERATOR & BRIDGE SURFACE                          │
-│  CLI (`soma run/search/swarm/export-trajectories`)  │  Bubble Tea v2 4-Tab TUI│
-│  Unix-Socket JSON-RPC Bridge (`soma-bridge-discord`, TelegramAdapter)         │
+│  Web Dashboard (`soma web` · SSE, Diff/Apply, Virtual Desktop noVNC, Tunnel)  │
+│  CLI (`soma run/search/swarm/mcp/bridge/export-trajectories`) │ 4-Tab TUI     │
+│  11 Channel Bridges (Discord, Telegram, Slack, Matrix, Email, Webhooks, IPC)  │
 └───────────────────────────────────────┬───────────────────────────────────────┘
                                         │
 ┌───────────────────────────────────────▼───────────────────────────────────────┐
@@ -53,7 +55,7 @@ Instead of treating an autonomous agent as an append-only chat array that dumps 
 │  └────────────────┬────────────────┘  └─────────────────┬──────────────────┘  │
 │                   └──────────────────┬──────────────────┘                     │
 │  ┌───────────────────────────────────▼─────────────────────────────────────┐  │
-│  │        Pure-Go Split-Pool SQLite WAL (`.soma/state.db` + `blobs/`)      │  │
+│  │        Pure-Go Split-Pool SQLite WAL (`.soma/project.db` + `blobs/`)    │  │
 │  │  runs | branches | epoch_snapshots | steps | pages | action_journal     │  │
 │  │  memory_nodes | embeddings | contracts | accounts | trigger_runs | inbox│  │
 │  └─────────────────────────────────────────────────────────────────────────┘  │
@@ -62,10 +64,10 @@ Instead of treating an autonomous agent as an append-only chat array that dumps 
 ┌───────────────────▼────────────────────┐  ┌─────────────────▼─────────────────┐
 │   FAIL-CLOSED SANDBOX & TAINT ENGINE   │  │    TIER-0 PROACTIVITY DAEMON      │
 │  • Linux bwrap (--unshare-net/pid)     │  │  • 0-Token Shell/SQL Sentinels    │
-│  • macOS Seatbelt (Landlock probe only) │  │  • fsnotify + HMAC-SHA256 Webhooks│
-│  • Ephemeral Docker & Remote SSH       │  │  • 30s Debounce Coalescer         │
-│  • Secretless HTTP/SSH/FS Brokers      │  │  • 4 Hard Circuit Brakes & TTL GC │
-│  • Data/Action Provenance Taint        │  │                                   │
+│  • macOS Seatbelt (Landlock probe only) │  │  • 5-Field Cron + Webhooks (HMAC) │
+│  • Ephemeral Docker Desktop (noVNC)    │  │  • fsnotify + 30s Coalescer       │
+│  • Secretless HTTP/SSH/FS Brokers      │  │  • Embedded in `soma web` & CLI   │
+│  • Data/Action Provenance Taint        │  │  • 4 Hard Circuit Brakes & TTL GC │
 └────────────────────────────────────────┘  └───────────────────────────────────┘
 ```
 
@@ -139,6 +141,11 @@ When reading results from these tests, keep in mind:
 - **Concurrent Multi-Agent Swarm Coordinator (`internal/dag/swarm.go`, `internal/workspace/merge.go`)**:
   - **`--mode cooperative`**: Runs $K$ parallel workers in isolated Git worktrees/snapshots sharing `PrefixHashL0L1`, merges their results via 3-way `git merge-file` (`MergeBranchWorkspaces`), and gates completion on the root `ContractVerifier` oracle.
   - **`--mode competitive`**: Runs $K$ competing hypotheses in parallel; failed or stalled branches immediately broadcast live `graveyard_notice` warnings to still-running sibling workers.
+- **Web Dashboard & Isolated Virtual Desktop (`internal/webui`, `internal/desktop`, `docker/desktop`)**:
+  - **Chat-First Task Runner**: Live SSE step & tool streaming, compact collapsible thinking traces, inline **Review Diff & Apply to Project** for isolated worktrees/snapshots (plus optional `Direct` mode), and **Approvals Inbox** with automatic branch resume.
+  - **Models, Autonomy & Access**: Unified multi-provider model pool (`Worker`, `Frontier`, `GUI`, `Fallback` roles persisted in `.soma/harness.json`), opt-in sandbox internet access (`AllowSandboxNetwork`), and `Standard` vs. `High Autonomy` execution modes while keeping OS sandboxing fail-closed.
+  - **Virtual Desktop (`soma-desktop`)**: Auto-launches a sandboxed Debian XFCE + Chromium container (`--rm`) when `desktop_task` needs GUI/browser access, streams via same-origin noVNC with a **View-Only / Take Over** shield, auto-stops after 5 min idle (or on exit), and supports `desktop_exec` + `sudo apt-get` / `pip` / `npm` inside the container.
+  - **Connectors, Bridges & Automations**: 49+ MCP presets + stdio/HTTP/OAuth importers (`soma mcp`), 11 channel bridges with DM pairing (`soma bridge`), embedded 5-field cron & HMAC webhook scheduler, and optional Cloudflare Tunnel remote access (`soma web install-service`).
 - **Oracle-Verified SFT & Contrastive DPO/GRPO Trajectory Exporter (`internal/replay/exporter.go`)**:
   - `soma export-trajectories --format sft --verified-only`: Exports ShareGPT / OpenAI tool-calling trajectories strictly from completed branches passing external verification contracts.
   - `soma export-trajectories --format dpo --verified-only`: Pairs winning branches (`ChosenTurns`) against Graveyard-abandoned sibling branches (`RejectedTurns` + `GraveyardReason`) from their shared `PromptAtFork` ancestor for DPO/GRPO reinforcement learning.
@@ -176,7 +183,8 @@ SOMA_MODEL="gpt-4.1" \
 ./bin/soma export-trajectories --dir /tmp/demo --format sft --verified-only --out sft.jsonl
 ./bin/soma export-trajectories --dir /tmp/demo --format dpo --verified-only --out dpo.jsonl
 
-# 7. Launch the 4-tab Bubble Tea v2 interactive TUI or regenerate the conformance report
+# 7. Launch the Web Dashboard (http://127.0.0.1:7420) or the 4-tab TUI
+./bin/soma web --dir /tmp/demo
 ./bin/soma ui --dir /tmp/demo
 make shadow
 ```
