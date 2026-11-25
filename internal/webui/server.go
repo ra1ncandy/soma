@@ -74,6 +74,7 @@ type Server struct {
 	server            *http.Server
 	wg                sync.WaitGroup
 	activeCancels     map[string]context.CancelFunc
+	activeDone        map[string]chan struct{}
 	activeTools       map[string]string
 	desktopLastActive time.Time
 	desktopTakeOver   bool
@@ -278,6 +279,7 @@ func NewServer(st *store.Store, cfg ServerConfig) (*Server, error) {
 		static:        subFS,
 		tunnel:        NewTunnelManager(),
 		activeCancels: make(map[string]context.CancelFunc),
+		activeDone:    make(map[string]chan struct{}),
 		activeTools:   make(map[string]string),
 		stopCh:        make(chan struct{}),
 		subs:          make(map[chan struct{}]struct{}),
@@ -1179,26 +1181,59 @@ func (s *Server) providerForAccount(ctx context.Context, accountID string) dag.M
 	return dag.NewOpenAICompatProvider(base, key)
 }
 
+// runTimeoutFor bounds a run by its turn budget instead of a fixed wall-clock cap: each turn may
+// legitimately take minutes (long model generations, 300s exec calls).
+func runTimeoutFor(maxTurns int) time.Duration {
+	if raw := strings.TrimSpace(os.Getenv("SOMA_RUN_TIMEOUT")); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+			return d
+		}
+	}
+	d := time.Duration(maxTurns) * 6 * time.Minute
+	if d < 30*time.Minute {
+		d = 30 * time.Minute
+	}
+	if d > 12*time.Hour {
+		d = 12 * time.Hour
+	}
+	return d
+}
+
 func (s *Server) runBranchAsync(exec *dag.Executor, branchID string, maxTurns int) {
 	if maxTurns <= 0 {
 		maxTurns = s.defaultMaxTurns()
 	}
+	timeout := runTimeoutFor(maxTurns)
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		runCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		runCtx, cancel := context.WithTimeout(context.Background(), timeout)
+		done := make(chan struct{})
 		s.mu.Lock()
-		if prev := s.activeCancels[branchID]; prev != nil {
-			prev()
-		}
+		prevCancel := s.activeCancels[branchID]
+		prevDone := s.activeDone[branchID]
 		s.activeCancels[branchID] = cancel
+		s.activeDone[branchID] = done
 		s.mu.Unlock()
+		// Never run two executor loops on one branch/workspace: stop the previous launch and wait for it.
+		if prevCancel != nil {
+			prevCancel()
+			if prevDone != nil {
+				<-prevDone
+			}
+		}
 		defer func() {
 			cancel()
 			s.mu.Lock()
-			delete(s.activeCancels, branchID)
-			delete(s.activeTools, branchID)
+			// Only clear the registration if it still belongs to this launch.
+			if s.activeDone[branchID] == done {
+				delete(s.activeCancels, branchID)
+				delete(s.activeDone, branchID)
+				delete(s.activeTools, branchID)
+			}
 			s.mu.Unlock()
+			close(done)
+			s.notify()
 		}()
 		go func() {
 			select {
@@ -1207,12 +1242,58 @@ func (s *Server) runBranchAsync(exec *dag.Executor, branchID string, maxTurns in
 			case <-runCtx.Done():
 			}
 		}()
-		_, _ = exec.ExecuteBranch(runCtx, branchID, maxTurns)
-		s.mu.Lock()
-		delete(s.activeTools, branchID)
-		s.mu.Unlock()
-		s.notify()
+		_, runErr := exec.ExecuteBranch(runCtx, branchID, maxTurns)
+		if closer, ok := exec.Tools.(interface{ Close() error }); ok {
+			_ = closer.Close()
+		}
+		s.recordRunOutcome(branchID, runErr, timeout)
 	}()
+}
+
+// recordRunOutcome persists a terminal status and an operator-visible notice when a run ends on an
+// error the executor did not already translate into a branch status.
+func (s *Server) recordRunOutcome(branchID string, runErr error, timeout time.Duration) {
+	if runErr == nil || errors.Is(runErr, context.Canceled) {
+		return // success, operator Stop, shutdown, or superseded launch
+	}
+	var (
+		quotaErr  *dag.SuspendedQuotaError
+		apprErr   *dag.SuspendedApprovalError
+		recErr    *dag.SuspendedReconcileError
+		stallErr  *dag.StallBreakerError
+		verifyErr *dag.VerificationFailedError
+	)
+	if errors.As(runErr, &quotaErr) || errors.As(runErr, &apprErr) || errors.As(runErr, &recErr) ||
+		errors.As(runErr, &stallErr) || errors.As(runErr, &verifyErr) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	br, err := s.store.GetBranch(ctx, branchID)
+	if err != nil {
+		return
+	}
+	status := string(dag.StatusFailed)
+	title := "Task failed"
+	summary := runErr.Error()
+	if errors.Is(runErr, context.DeadlineExceeded) {
+		status = "stopped"
+		title = "Task stopped: time limit reached"
+		summary = fmt.Sprintf("The run hit its %s time limit and was stopped. Continue the task to pick up where it left off (set SOMA_RUN_TIMEOUT to change the limit).", timeout)
+	}
+	if len(summary) > 2000 {
+		summary = summary[:2000] + "..."
+	}
+	_ = s.store.UpdateBranchStatus(ctx, br.ID, status, br.ActiveAccountID, br.StallCount)
+	_ = s.store.UpdateRunStatus(ctx, br.RunID, status)
+	_ = s.store.InsertInboxItem(ctx, store.InboxItem{
+		ID:       fmt.Sprintf("inbox_runerr_%s_%x", br.ID, time.Now().UnixNano()),
+		RunID:    br.RunID,
+		BranchID: br.ID,
+		ItemKind: "notice",
+		Title:    title,
+		Summary:  summary,
+	})
 }
 
 func (s *Server) buildRunRequest(title, goal string, prof compiler.ModelProfile, accIDs []string) dag.RunRequest {
@@ -1283,11 +1364,17 @@ func (s *Server) handleDeleteRun(w http.ResponseWriter, r *http.Request, runID s
 	for _, b := range branches {
 		s.mu.Lock()
 		cancel := s.activeCancels[b.ID]
-		delete(s.activeCancels, b.ID)
-		delete(s.activeTools, b.ID)
+		done := s.activeDone[b.ID]
 		s.mu.Unlock()
 		if cancel != nil {
 			cancel()
+			// Wait for the executor loop to exit before removing its workspace and rows.
+			if done != nil {
+				select {
+				case <-done:
+				case <-time.After(15 * time.Second):
+				}
+			}
 		}
 		if s.wsMgr != nil {
 			_ = s.wsMgr.CleanupBranchWorkspace(r.Context(), run, b)
