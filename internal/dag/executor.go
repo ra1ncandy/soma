@@ -23,7 +23,6 @@ import (
 	"sync/atomic"
 	"time"
 
-
 	"github.com/ra1ncandy/soma/internal/broker"
 	"github.com/ra1ncandy/soma/internal/compiler"
 	"github.com/ra1ncandy/soma/internal/embed"

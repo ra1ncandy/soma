@@ -67,16 +67,16 @@ type ContextFile struct {
 type EpochInput struct {
 	SystemPrompt        string
 	ProjectInstructions []ContextFile
-	WorkspaceMode     string
-	TaskGoal          string
-	ContractSpec      string
-	Syscalls          []SyscallDef
-	SkillIndex        []SkillMeta
-	MCPSummaries      []MCPSummary
-	ActiveMemory      []MemoryEntry
-	Graveyard         []GraveyardEntry
-	CarriedSkills     []SkillBody
-	CarriedMCPSchemas []ToolSchema
+	WorkspaceMode       string
+	TaskGoal            string
+	ContractSpec        string
+	Syscalls            []SyscallDef
+	SkillIndex          []SkillMeta
+	MCPSummaries        []MCPSummary
+	ActiveMemory        []MemoryEntry
+	Graveyard           []GraveyardEntry
+	CarriedSkills       []SkillBody
+	CarriedMCPSchemas   []ToolSchema
 }
 
 // EpochSnapshot is strictly immutable for the duration of an epoch.
