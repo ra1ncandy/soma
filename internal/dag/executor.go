@@ -1265,7 +1265,7 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 					defer wg.Done()
 					sem <- struct{}{}
 					defer func() { <-sem }()
-					out, execErr := e.Tools.Execute(ctx, ToolCall{
+					out, execErr := e.execTool(ctx, ToolCall{
 						ActionID:          p.actionID,
 						IdempotencyKey:    p.idemKey,
 						RunID:             run.ID,
@@ -1323,7 +1323,7 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 						return res, err
 					}
 
-					out, execErr = e.Tools.Execute(ctx, ToolCall{
+					out, execErr = e.execTool(ctx, ToolCall{
 						ActionID:          pc.actionID,
 						IdempotencyKey:    pc.idemKey,
 						RunID:             run.ID,
@@ -1610,7 +1610,7 @@ func (e *Executor) recoverPendingActions(
 				}
 				if !recDone {
 					var execErr error
-					out, execErr = e.Tools.Execute(ctx, ToolCall{
+					out, execErr = e.execTool(ctx, ToolCall{
 						ActionID:       entry.ActionID,
 						IdempotencyKey: entry.IdempotencyKey,
 						Name:           entry.ToolName,
