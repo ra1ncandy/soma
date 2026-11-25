@@ -347,11 +347,7 @@ func ExecuteVisionAnalyze(
 	client *http.Client,
 	visionBaseURL, apiKey, modelID, workspaceDir, relImagePath, prompt string,
 ) (ToolOutput, error) {
-	target, err := resolveInsideWorkspace(workspaceDir, relImagePath)
-	if err != nil {
-		return ToolOutput{}, err
-	}
-	raw, err := os.ReadFile(target)
+	raw, err := wsReadFile(workspaceDir, relImagePath)
 	if err != nil {
 		return ToolOutput{}, err
 	}
