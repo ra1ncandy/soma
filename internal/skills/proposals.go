@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -76,6 +77,8 @@ type skillProposal struct {
 	Proposed int64  `json:"proposed_unix"`
 }
 
+var proposalIDRe = regexp.MustCompile(`^skp_[0-9a-f]+_[a-z0-9]+(-[a-z0-9]+)*$`)
+
 func proposalDir(st *store.Store, id string) string {
 	return filepath.Join(st.SomaDir(), "skill_proposals", id)
 }
@@ -131,6 +134,9 @@ func ProposeSkillChange(ctx context.Context, st *store.Store, root, name, conten
 // ApplySkillProposal writes an approved staged proposal to its skill root, keeping the previous
 // SKILL.md under <skill>/.history/ so every agent-proposed change is reversible.
 func ApplySkillProposal(st *store.Store, proposalID string) (Skill, error) {
+	if !proposalIDRe.MatchString(proposalID) {
+		return Skill{}, fmt.Errorf("skills: %q is not a staged skill proposal (no staged content to apply)", proposalID)
+	}
 	dir := proposalDir(st, proposalID)
 	raw, err := os.ReadFile(filepath.Join(dir, "proposal.json"))
 	if err != nil {
@@ -177,7 +183,7 @@ func ApplySkillProposal(st *store.Store, proposalID string) (Skill, error) {
 
 // DiscardSkillProposal removes the staged content of a dismissed proposal.
 func DiscardSkillProposal(st *store.Store, proposalID string) {
-	if st == nil || proposalID == "" || strings.ContainsAny(proposalID, `/\`) {
+	if st == nil || !proposalIDRe.MatchString(proposalID) {
 		return
 	}
 	_ = os.RemoveAll(proposalDir(st, proposalID))

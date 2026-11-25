@@ -217,7 +217,7 @@ func TestDiscordAdapter_Ed25519AllowlistCommandsAndAlerts(t *testing.T) {
 	}
 
 	if err := st.InsertInboxItem(ctx, store.InboxItem{
-		ID: "inb_disc_1", ItemKind: "skill_patch", Title: "Review patch", Summary: "patch diff", Urgency: "urgent",
+		ID: "inb_disc_1", ItemKind: "alert", Title: "Review patch", Summary: "patch diff", Urgency: "urgent",
 	}); err != nil {
 		t.Fatalf("InsertInboxItem: %v", err)
 	}

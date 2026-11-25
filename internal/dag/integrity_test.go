@@ -154,6 +154,66 @@ func TestPublishFindingQuarantinedInTaintedRun(t *testing.T) {
 	}
 }
 
+// Running out of turns or hitting a transient provider error must leave a truthful status, never
+// "running"; identical bg_poll turns are progress, not a stall.
+func TestTerminalStatusesAndPollExemptStallBreaker(t *testing.T) {
+	ctx := context.Background()
+	newRun := func(t *testing.T, fn func(int, GenerateRequest) (*GenerateResponse, error)) (*store.Store, *Executor, string) {
+		t.Helper()
+		ws := t.TempDir()
+		st, err := store.Open(filepath.Join(ws, ".soma"))
+		if err != nil {
+			t.Fatalf("store.Open: %v", err)
+		}
+		t.Cleanup(func() { _ = st.Close() })
+		setupAccount(t, st, "acc_ts")
+		ex := NewExecutor(st, &scriptedProvider{fn: fn}, &recordingToolRunner{}, compiler.WorkerProfile())
+		_, brID, err := ex.StartRun(ctx, RunRequest{WorkspacePath: ws, GoalSpec: "ts", AccountIDs: []string{"acc_ts"}})
+		if err != nil {
+			t.Fatalf("StartRun: %v", err)
+		}
+		return st, ex, brID
+	}
+
+	t.Run("budget exhausted while polling", func(t *testing.T) {
+		st, ex, brID := newRun(t, func(int, GenerateRequest) (*GenerateResponse, error) {
+			return &GenerateResponse{ToolCall: &ToolCallSpec{Name: "bg_poll", ArgsJSON: `{"job_id":"bg_0001","wait_seconds":30}`}, StateHash: "same"}, nil
+		})
+		res, err := ex.ExecuteBranch(ctx, brID, 8)
+		if err != nil {
+			t.Fatalf("polling loop tripped an error (stall breaker?): %v", err)
+		}
+		if res.Status != StatusBudgetExhausted {
+			t.Fatalf("status = %s, want budget_exhausted", res.Status)
+		}
+		if br, _ := st.GetBranch(ctx, brID); br.Status != string(StatusBudgetExhausted) {
+			t.Fatalf("stored status = %s", br.Status)
+		}
+	})
+
+	t.Run("identical non-poll calls trip the stall breaker", func(t *testing.T) {
+		_, ex, brID := newRun(t, func(int, GenerateRequest) (*GenerateResponse, error) {
+			return &GenerateResponse{ToolCall: &ToolCallSpec{Name: "fs_read", ArgsJSON: `{"path":"a"}`}, StateHash: "same"}, nil
+		})
+		var stall *StallBreakerError
+		if _, err := ex.ExecuteBranch(ctx, brID, 20); !errors.As(err, &stall) {
+			t.Fatalf("want StallBreakerError, got %v", err)
+		}
+	})
+
+	t.Run("transient provider error is suspended_io", func(t *testing.T) {
+		st, ex, brID := newRun(t, func(int, GenerateRequest) (*GenerateResponse, error) {
+			return nil, &TransientError{AccountID: "acc_ts", StatusCode: 503, Err: errors.New("upstream down")}
+		})
+		if _, err := ex.ExecuteBranch(ctx, brID, 3); err == nil {
+			t.Fatal("expected provider error")
+		}
+		if br, _ := st.GetBranch(ctx, brID); br.Status != string(StatusSuspendedIO) {
+			t.Fatalf("stored status = %s, want suspended_io", br.Status)
+		}
+	})
+}
+
 // A crash while an external_write (MCP tool, broker call) was dispatched must never be
 // silently skipped or re-executed: it becomes ambiguous and the branch suspends for reconcile.
 func TestCrashRecovery_DispatchedExternalWriteSuspendsForReconcile(t *testing.T) {

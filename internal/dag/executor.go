@@ -49,8 +49,10 @@ const (
 	StatusVerifying          BranchStatus = "verifying"
 	StatusStalled            BranchStatus = "stalled"
 	StatusCompleted          BranchStatus = "completed"
-	StatusFailed             BranchStatus = "failed"
-	StatusAbandoned          BranchStatus = "abandoned"
+	// StatusBudgetExhausted: the turn budget ran out before completion; resumable.
+	StatusBudgetExhausted BranchStatus = "budget_exhausted"
+	StatusFailed          BranchStatus = "failed"
+	StatusAbandoned       BranchStatus = "abandoned"
 )
 
 var (
@@ -261,6 +263,9 @@ func NewExecutor(
 		Tools:             tools,
 		Profile:           prof,
 		MaxLayer1Memories: 25,
+		// A model repeating the same tool calls burns its whole budget; stop it early everywhere,
+		// not only in search and swarm runs.
+		EnforceStallBreaker: true,
 	}
 	if lt, ok := ex.Tools.(*LocalToolRunner); ok {
 		if lt.ForkBranchFunc == nil {
@@ -904,6 +909,15 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 				}
 			}
 			_ = e.releaseLease(ctx, acc.ID, 0)
+			// Leave a truthful, resumable status instead of "running": a transient upstream
+			// failure is suspended_io (retry later), anything else failed.
+			status := StatusFailed
+			var trErr *TransientError
+			if errors.As(genErr, &trErr) || errors.Is(genErr, context.Canceled) || errors.Is(genErr, context.DeadlineExceeded) {
+				status = StatusSuspendedIO
+			}
+			_ = e.Store.UpdateBranchStatus(context.WithoutCancel(ctx), branch.ID, string(status), acc.ID, branch.StallCount)
+			res.Status = status
 			return res, genErr
 		}
 		_ = e.releaseLease(ctx, acc.ID, genResp.CostUSD)
@@ -911,7 +925,7 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 		res.TotalTokens += genResp.InputTokens + genResp.CacheReadTokens + genResp.OutputTokens
 		res.CacheReadToks += genResp.CacheReadTokens
 
-		if genResp.StateHash != "" && (genResp.StateHash == lastStateHash || (prevStateHash != "" && genResp.StateHash == prevStateHash)) {
+		if genResp.StateHash != "" && !isPollOnlyTurn(genResp) && (genResp.StateHash == lastStateHash || (prevStateHash != "" && genResp.StateHash == prevStateHash)) {
 			branch.StallCount++
 		} else {
 			branch.StallCount = 0
@@ -1435,7 +1449,32 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 		res.Status = StatusFailed
 		return res, &VerificationFailedError{BranchID: branch.ID, Counterexample: lastOracleError}
 	}
+	if res.Status != StatusCompleted {
+		// The turn budget ran out before the model finished. Record it instead of leaving the
+		// branch "running"; ExecuteBranch can resume it with a fresh budget.
+		_ = e.Store.UpdateBranchStatus(context.WithoutCancel(ctx), branch.ID, string(StatusBudgetExhausted), branch.ActiveAccountID, branch.StallCount)
+		_ = e.Store.UpdateRunStatus(context.WithoutCancel(ctx), run.ID, string(StatusBudgetExhausted))
+		res.Status = StatusBudgetExhausted
+	}
 	return res, nil
+}
+
+// isPollOnlyTurn reports turns that only wait on background jobs. Repeating an identical
+// bg_poll while a build runs is progress, not a loop, so it never counts toward the stall breaker.
+func isPollOnlyTurn(resp *GenerateResponse) bool {
+	calls := resp.ToolCalls
+	if len(calls) == 0 && resp.ToolCall != nil {
+		calls = []ToolCallSpec{*resp.ToolCall}
+	}
+	if len(calls) == 0 {
+		return false
+	}
+	for _, c := range calls {
+		if c.Name != "bg_poll" {
+			return false
+		}
+	}
+	return true
 }
 
 func appendDynamicEntries(turn int, resp *GenerateResponse, turnEntries ...compiler.LogEntry) []compiler.LogEntry {

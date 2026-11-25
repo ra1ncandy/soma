@@ -108,7 +108,7 @@ func seedTUIWorkspace(t *testing.T) (*store.Store, string, string, string) {
 		t.Fatalf("InsertInboxItem 2: %v", err)
 	}
 	if err := st.InsertInboxItem(ctx, store.InboxItem{
-		ID: "inb_tui_3", RunID: runID, BranchID: brID, ItemKind: "skill_patch",
+		ID: "inb_tui_3", RunID: runID, BranchID: brID, ItemKind: "alert",
 		Title: "Approve skill diff", Summary: "Safe skill patch", ArtifactRef: "demo-skill", Urgency: "normal",
 	}); err != nil {
 		t.Fatalf("InsertInboxItem 3: %v", err)
