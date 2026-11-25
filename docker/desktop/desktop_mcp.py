@@ -316,8 +316,9 @@ def handle_tool(name: str, args: dict) -> dict:
             return {"isError": True, "content": [{"type": "text", "text": "desktop_open_url requires non-empty url"}]}
         if not url.startswith(("http://", "https://", "file://")):
             url = "https://" + url
-        cmd = f"chromium --no-sandbox --start-maximized {json.dumps(url)}"
-        subprocess.Popen(["/bin/sh", "-c", cmd], env=ENV, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        # Pass the URL as its own argv entry, never through a shell: inside double quotes a shell
+        # still expands $(...) and backticks, so a crafted URL would run commands.
+        subprocess.Popen(["chromium", "--no-sandbox", "--start-maximized", "--", url], env=ENV, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
         return {"content": [{"type": "text", "text": f"opened in Chromium: {url}"}]}
 
     if name == "desktop_list_windows":
