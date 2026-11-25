@@ -20,8 +20,8 @@ import (
 	"github.com/ra1ncandy/soma/internal/replay"
 	"github.com/ra1ncandy/soma/internal/sandbox"
 	"github.com/ra1ncandy/soma/internal/store"
-	"github.com/ra1ncandy/soma/internal/webui"
 	"github.com/ra1ncandy/soma/internal/vmem"
+	"github.com/ra1ncandy/soma/internal/webui"
 )
 
 const Version = "v0.4.0 (RFC-0001 v2.1 Complete — Shadow Gauntlet & Branching Search)"

@@ -67,6 +67,11 @@ func Open(somaDir string) (*Store, error) {
 		_ = blobs.Close()
 		return nil, fmt.Errorf("apply schema upgrades: %w", err)
 	}
+	if err := applyVersionedMigrations(writer); err != nil {
+		_ = writer.Close()
+		_ = blobs.Close()
+		return nil, err
+	}
 
 	readerDSN := buildSQLiteDSN(dbPath, true)
 	reader, err := sql.Open("sqlite", readerDSN)

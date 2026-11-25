@@ -168,6 +168,9 @@ func (s *Store) DeleteRun(ctx context.Context, id string) (bool, error) {
 			WHERE provenance_step_id IN (SELECT id FROM steps WHERE run_id = ?)`, id); err != nil {
 			return err
 		}
+		if _, err := conn.ExecContext(ctx, `DELETE FROM transcript_fts WHERE run_id = ?`, id); err != nil {
+			return err
+		}
 		res, err := conn.ExecContext(ctx, `DELETE FROM runs WHERE id = ?`, id)
 		if err != nil {
 			return err

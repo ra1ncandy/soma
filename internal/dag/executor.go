@@ -17,7 +17,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -416,6 +415,7 @@ func (e *Executor) StartRun(ctx context.Context, req RunRequest) (string, string
 	if _, _, err := e.Workspace.PrepareBranchWorkspace(ctx, e.Store, run, branch); err != nil {
 		return "", "", fmt.Errorf("prepare branch workspace: %w", err)
 	}
+	_ = e.Store.IndexTranscript(ctx, []store.TranscriptEntry{{RunID: runID, BranchID: branchID, Kind: "goal", Text: title + "\n" + req.GoalSpec}})
 	return runID, branchID, nil
 }
 
@@ -698,6 +698,7 @@ func (e *Executor) AppendFollowUpUserTurn(ctx context.Context, branchID, message
 	}); err != nil {
 		return err
 	}
+	e.indexTranscript(ctx, branch.RunID, branch.ID, sid, []compiler.LogEntry{{Kind: "user", Observation: msg}})
 	if e.OnStep != nil {
 		e.OnStep(stepRow)
 	}
@@ -1432,6 +1433,7 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 		if err != nil {
 			return res, err
 		}
+		e.indexTranscript(ctx, run.ID, branch.ID, sid, nextPending)
 		if e.OnStep != nil {
 			e.OnStep(stepRow)
 		}
@@ -2680,8 +2682,7 @@ func (r *LocalToolRunner) Execute(ctx context.Context, call ToolCall) (ToolOutpu
 			return ToolOutput{}, errors.New("session_search: store not initialized")
 		}
 		query, _ := args["query"].(string)
-		q := strings.ToLower(strings.TrimSpace(query))
-		if q == "" {
+		if strings.TrimSpace(query) == "" {
 			return ToolOutput{}, errors.New("session_search requires non-empty query")
 		}
 		limitF, _ := args["limit"].(float64)
@@ -2692,58 +2693,11 @@ func (r *LocalToolRunner) Execute(ctx context.Context, call ToolCall) (ToolOutpu
 		if limit > 20 {
 			limit = 20
 		}
-		runs, err := r.vm.Store().ListRuns(ctx)
+		text, tier, err := searchSessions(ctx, r.vm.Store(), query, limit)
 		if err != nil {
 			return ToolOutput{}, err
 		}
-		terms := strings.Fields(q)
-		type scoredRun struct {
-			run   store.Run
-			score int
-		}
-		var matches []scoredRun
-		for _, rn := range runs {
-			hay := strings.ToLower(rn.ID + " " + rn.Title + " " + rn.GoalSpec + " " + rn.Status)
-			sc := 0
-			for _, term := range terms {
-				if strings.Contains(hay, term) {
-					sc++
-				}
-			}
-			if sc > 0 {
-				matches = append(matches, scoredRun{run: rn, score: sc})
-			}
-		}
-		sort.SliceStable(matches, func(i, j int) bool {
-			if matches[i].score != matches[j].score {
-				return matches[i].score > matches[j].score
-			}
-			return matches[i].run.CreatedAt > matches[j].run.CreatedAt
-		})
-		if len(matches) == 0 {
-			return ToolOutput{
-				NameHint:  "session_search.txt",
-				Content:   []byte(fmt.Sprintf("session_search: 0 past runs matching %q", query)),
-				TrustTier: "trusted_repo",
-			}, nil
-		}
-		if len(matches) > limit {
-			matches = matches[:limit]
-		}
-		var sb strings.Builder
-		fmt.Fprintf(&sb, "session_search: top %d past run(s) matching %q:\n", len(matches), query)
-		for i, m := range matches {
-			goal := m.run.GoalSpec
-			if len(goal) > 160 {
-				goal = goal[:157] + "..."
-			}
-			fmt.Fprintf(&sb, "%d. [%s] status=%s title=%q goal=%q\n", i+1, m.run.ID, m.run.Status, m.run.Title, goal)
-		}
-		return ToolOutput{
-			NameHint:  "session_search.txt",
-			Content:   []byte(strings.TrimRight(sb.String(), "\n")),
-			TrustTier: "trusted_repo",
-		}, nil
+		return ToolOutput{NameHint: "session_search.txt", Content: []byte(text), TrustTier: tier}, nil
 
 	case "skill_manage":
 		action, _ := args["action"].(string)
