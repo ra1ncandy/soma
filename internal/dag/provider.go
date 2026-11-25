@@ -963,63 +963,11 @@ func (p *OpenAICompatProvider) Generate(ctx context.Context, req GenerateRequest
 	if len(msg.ToolCalls) == 0 && content == "" && parsed.Choices[0].FinishReason == "length" {
 		return nil, fmt.Errorf("openai-compat provider: response truncated (finish_reason=length at max_tokens=%d) before emitting content or tool_calls", maxToks)
 	}
-	gen.AssistantContent = content
-	gen.ReasoningContent = strings.TrimSpace(msg.ReasoningContent)
-	reasoning := content
-	if reasoning == "" {
-		reasoning = gen.ReasoningContent
+	calls := make([]wireToolCall, 0, len(msg.ToolCalls))
+	for _, rawTC := range msg.ToolCalls {
+		calls = append(calls, wireToolCall{ID: rawTC.ID, Name: rawTC.Function.Name, Arguments: rawTC.Function.Arguments})
 	}
-	if len(reasoning) > 280 {
-		reasoning = reasoning[:277] + "..."
-	}
-
-	if len(msg.ToolCalls) > 0 {
-		var specs []ToolCallSpec
-		var hashParts []string
-		var names []string
-		for idx, rawTC := range msg.ToolCalls {
-			fn := rawTC.Function
-			callID := strings.TrimSpace(rawTC.ID)
-			if callID == "" {
-				callID = fmt.Sprintf("call_e%d_t%d_%d", req.Frame.Epoch, req.TurnIndex, idx)
-			}
-			argsJSON := strings.TrimSpace(fn.Arguments)
-			if argsJSON == "" {
-				argsJSON = "{}"
-			}
-			var refs []string
-			var argMap map[string]any
-			if json.Unmarshal([]byte(argsJSON), &argMap) == nil {
-				if pid, ok := argMap["page_id"].(string); ok && strings.TrimSpace(pid) != "" {
-					refs = append(refs, strings.TrimPrefix(strings.TrimSpace(pid), "@"))
-				}
-			}
-			specs = append(specs, ToolCallSpec{
-				CallID:            callID,
-				Name:              fn.Name,
-				ArgsJSON:          argsJSON,
-				EffectClass:       inferToolEffectClass(fn.Name),
-				ReferencedPageIDs: refs,
-			})
-			hashParts = append(hashParts, fn.Name+"|"+argsJSON)
-			names = append(names, fn.Name)
-		}
-		if reasoning == "" {
-			reasoning = fmt.Sprintf("invoke %s", strings.Join(names, ", "))
-		}
-		gen.Reasoning = reasoning
-		gen.Done = false
-		gen.ToolCalls = specs
-		gen.ToolCall = &gen.ToolCalls[0]
-		gen.StateHash = shortHashHex([]byte(strings.Join(hashParts, ";")))
-		return gen, nil
-	}
-
-	gen.Reasoning = reasoning
-	gen.Done = true
-	gen.FinalSummary = content
-	gen.StateHash = shortHashHex([]byte("done|" + content))
-	return gen, nil
+	return finishGenerateResponse(gen, req, content, msg.ReasoningContent, calls), nil
 }
 
 // inferToolEffectClass maps a tool name to its risk tier. Only the built-in workspace tools are

@@ -1233,7 +1233,7 @@ func (s *Server) restoreProviderFromHarness(ctx context.Context) {
 		if s.cfg.ModelID == "" {
 			s.cfg.ModelID = model
 		}
-		s.cfg.Provider = dag.NewOpenAICompatProvider(base, key)
+		s.cfg.Provider = dag.NewProvider(base, key)
 		s.mu.Unlock()
 		return
 	}
@@ -1243,7 +1243,7 @@ func (s *Server) restoreProviderFromHarness(ctx context.Context) {
 		if cfg.Provider.ModelID != "" {
 			s.cfg.ModelID = cfg.Provider.ModelID
 		}
-		s.cfg.Provider = dag.NewOpenAICompatProvider(strings.TrimSpace(cfg.Provider.APIBase), cfg.Provider.APIKey)
+		s.cfg.Provider = dag.NewProvider(strings.TrimSpace(cfg.Provider.APIBase), cfg.Provider.APIKey)
 		s.mu.Unlock()
 	}
 }
@@ -1342,7 +1342,7 @@ func (s *Server) providerForAccount(ctx context.Context, accountID string) dag.M
 	if base == "" {
 		return nil
 	}
-	return dag.NewOpenAICompatProvider(base, key)
+	return dag.NewProvider(base, key)
 }
 
 // runTimeoutFor bounds a run by its turn budget instead of a fixed wall-clock cap: each turn may

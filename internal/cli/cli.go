@@ -622,16 +622,24 @@ func selectProvider(workspaceDir string, useMock bool) (dag.ModelProvider, strin
 	if model == "" {
 		return nil, "", fmt.Errorf("no model configured for %s: set SOMA_MODEL or default_model in .soma/config.yaml", baseURL)
 	}
-	prov := dag.NewOpenAICompatProvider(baseURL, os.Getenv("SOMA_API_KEY"))
-	if mt, err := strconv.Atoi(strings.TrimSpace(os.Getenv("SOMA_MAX_TOKENS"))); err == nil && mt > 0 {
-		prov.MaxTokens = mt
-	}
-	if eff := strings.TrimSpace(os.Getenv("SOMA_REASONING_EFFORT")); eff != "" {
-		prov.ReasoningEffort = eff
-	}
-	if strings.EqualFold(strings.TrimSpace(os.Getenv("SOMA_PASS_REASONING")), "1") ||
-		strings.EqualFold(strings.TrimSpace(os.Getenv("SOMA_PASS_REASONING")), "true") {
-		prov.PassReasoningContent = true
+	prov := dag.NewProvider(baseURL, os.Getenv("SOMA_API_KEY"))
+	mt, mtErr := strconv.Atoi(strings.TrimSpace(os.Getenv("SOMA_MAX_TOKENS")))
+	switch p := prov.(type) {
+	case *dag.OpenAICompatProvider:
+		if mtErr == nil && mt > 0 {
+			p.MaxTokens = mt
+		}
+		if eff := strings.TrimSpace(os.Getenv("SOMA_REASONING_EFFORT")); eff != "" {
+			p.ReasoningEffort = eff
+		}
+		if strings.EqualFold(strings.TrimSpace(os.Getenv("SOMA_PASS_REASONING")), "1") ||
+			strings.EqualFold(strings.TrimSpace(os.Getenv("SOMA_PASS_REASONING")), "true") {
+			p.PassReasoningContent = true
+		}
+	case *dag.AnthropicProvider:
+		if mtErr == nil && mt > 0 {
+			p.MaxTokens = mt
+		}
 	}
 	return prov, model, nil
 }

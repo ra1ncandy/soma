@@ -414,7 +414,7 @@ func ResolveDefaultProviderFromHarness(ctx context.Context, st *store.Store, wor
 				m = defMod
 			}
 			if base != "" {
-				return dag.NewOpenAICompatProvider(base, key), m, true
+				return dag.NewProvider(base, key), m, true
 			}
 		}
 	}
@@ -429,10 +429,10 @@ func ResolveDefaultProviderFromHarness(ctx context.Context, st *store.Store, wor
 		if cfg.Provider.ModelID != "" {
 			m = cfg.Provider.ModelID
 		}
-		return dag.NewOpenAICompatProvider(base, key), m, true
+		return dag.NewProvider(base, key), m, true
 	}
 	if strings.TrimSpace(cfg.Provider.APIBase) != "" {
-		return dag.NewOpenAICompatProvider(strings.TrimSpace(cfg.Provider.APIBase), cfg.Provider.APIKey), cfg.Provider.ModelID, true
+		return dag.NewProvider(strings.TrimSpace(cfg.Provider.APIBase), cfg.Provider.APIKey), cfg.Provider.ModelID, true
 	}
 	return nil, "", false
 }
@@ -958,7 +958,7 @@ func (s *Server) handleSaveProvider(w http.ResponseWriter, r *http.Request) {
 	case "openai_compat":
 		if cfg.Provider.APIBase != "" {
 			s.cfg.UseMock = false
-			s.cfg.Provider = dag.NewOpenAICompatProvider(cfg.Provider.APIBase, cfg.Provider.APIKey)
+			s.cfg.Provider = dag.NewProvider(cfg.Provider.APIBase, cfg.Provider.APIKey)
 		}
 	default:
 		if base, key, model, ok := dag.ResolveProviderEndpoint(cfg.Provider.ProviderType, cfg.Provider.APIBase, cfg.Provider.APIKey, cfg.Provider.ModelID); ok {
@@ -969,7 +969,7 @@ func (s *Server) handleSaveProvider(w http.ResponseWriter, r *http.Request) {
 			}
 			_ = s.saveHarnessConfig(cfg)
 			s.cfg.UseMock = false
-			s.cfg.Provider = dag.NewOpenAICompatProvider(base, key)
+			s.cfg.Provider = dag.NewProvider(base, key)
 		}
 	}
 	s.mu.Unlock()
@@ -1767,7 +1767,7 @@ func (s *Server) applyAccountToServerLocked(cfg *HarnessConfig, id, provider, ap
 	}
 	if base != "" {
 		s.cfg.UseMock = false
-		s.cfg.Provider = dag.NewOpenAICompatProvider(base, key)
+		s.cfg.Provider = dag.NewProvider(base, key)
 	}
 }
 

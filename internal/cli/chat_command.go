@@ -185,10 +185,8 @@ func newChatCmd() *cobra.Command {
 
 			out := cmd.OutOrStdout()
 			streamed := false
-			if p, ok := prov.(*dag.OpenAICompatProvider); ok {
-				// Stream model text as it arrives.
-				p.OnDelta = func(text string) { streamed = true; fmt.Fprint(out, text) }
-			}
+			// Stream model text as it arrives (any streaming provider).
+			execDag.OnDelta = func(_, text string) { streamed = true; fmt.Fprint(out, text) }
 			fmt.Fprintf(out, "soma chat (model=%s workspace=%s browser=%v desktop=%v) — /help for commands\n", modelID, absWS, enableBrowser, enableDesktop)
 			sess := &chatSession{st: st, ex: execDag, ws: absWS, accID: accID, modelID: modelID, maxTurns: maxTurns, out: out, streamed: &streamed}
 			return sess.loop(cmd.Context(), cmd.InOrStdin())
