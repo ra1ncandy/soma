@@ -147,6 +147,12 @@ func (a *SlackAdapter) Handler() http.Handler {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
+		// Slack re-delivers an event when we have not answered within 3 seconds, and a run takes
+		// far longer than that. Acknowledge retries without starting the same task again.
+		if r.Header.Get("X-Slack-Retry-Num") != "" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		if len(a.Config.AllowedChannelIDs) > 0 && !containsString(a.Config.AllowedChannelIDs, env.Event.Channel) {
 			w.WriteHeader(http.StatusOK)
 			return
@@ -170,7 +176,8 @@ func (a *SlackAdapter) Handler() http.Handler {
 		})
 		if err != nil {
 			if errors.Is(err, ErrUnauthorized) {
-				w.WriteHeader(http.StatusForbidden)
+				// 200, not 403: an error status makes Slack retry the event.
+				w.WriteHeader(http.StatusOK)
 				return
 			}
 			http.Error(w, err.Error(), http.StatusInternalServerError)

@@ -50,7 +50,7 @@ func NewTelegramAdapter(client *KernelClient, cfg TelegramConfig) *TelegramAdapt
 	return &TelegramAdapter{
 		Client:     client,
 		Config:     cfg,
-		HTTPClient: &http.Client{Timeout: 10 * time.Second},
+		HTTPClient: &http.Client{Timeout: 40 * time.Second},
 		seenInbox:  make(map[string]bool),
 	}
 }
@@ -118,11 +118,16 @@ type tgMessage struct {
 
 // PollUpdatesOnce fetches pending Telegram updates, advances offset, enforces allowlists, and replies.
 func (a *TelegramAdapter) PollUpdatesOnce(ctx context.Context) (int, error) {
+	return a.pollUpdates(ctx, 0)
+}
+
+// pollUpdates fetches updates, long-polling for up to waitSeconds when no update is pending.
+func (a *TelegramAdapter) pollUpdates(ctx context.Context, waitSeconds int) (int, error) {
 	a.mu.Lock()
 	off := a.offset
 	a.mu.Unlock()
 
-	url := fmt.Sprintf("%s/bot%s/getUpdates?offset=%d&timeout=0", a.Config.APIBaseURL, a.Config.BotToken, off)
+	url := fmt.Sprintf("%s/bot%s/getUpdates?offset=%d&timeout=%d", a.Config.APIBaseURL, a.Config.BotToken, off, waitSeconds)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return 0, err
@@ -145,11 +150,15 @@ func (a *TelegramAdapter) PollUpdatesOnce(ctx context.Context) (int, error) {
 	}
 
 	processed := 0
-	maxID := off - 1
+	var firstSendErr error
 	for _, upd := range parsed.Result {
-		if upd.UpdateID > maxID {
-			maxID = upd.UpdateID
+		// Acknowledge each update before acting on it. If a reply later fails (rate limit, user
+		// blocked the bot) the update must not be fetched and executed again on the next poll.
+		a.mu.Lock()
+		if upd.UpdateID >= a.offset {
+			a.offset = upd.UpdateID + 1
 		}
+		a.mu.Unlock()
 		if upd.Message == nil || upd.Message.From == nil {
 			continue
 		}
@@ -191,17 +200,14 @@ func (a *TelegramAdapter) PollUpdatesOnce(ctx context.Context) (int, error) {
 			reply = "error: " + cmdErr.Error()
 		}
 		if err := a.SendMessage(ctx, chatID, reply); err != nil {
-			return processed, err
+			if firstSendErr == nil {
+				firstSendErr = err
+			}
+			continue
 		}
 		processed++
 	}
-
-	a.mu.Lock()
-	if maxID >= a.offset {
-		a.offset = maxID + 1
-	}
-	a.mu.Unlock()
-	return processed, nil
+	return processed, firstSendErr
 }
 
 // SendMessage sends chunked Telegram replies (max 4000 chars) to chatID.
@@ -268,16 +274,37 @@ func (a *TelegramAdapter) PollInboxOnce(ctx context.Context) (int, error) {
 
 // Run polls Telegram updates and inbox alerts until ctx cancels.
 func (a *TelegramAdapter) Run(ctx context.Context) error {
-	ticker := time.NewTicker(a.Config.PollInterval)
-	defer ticker.Stop()
+	// Inbox alerts tick on their own so a long-poll (or a long-running message) does not delay them.
+	go func() {
+		ticker := time.NewTicker(max(a.Config.PollInterval, 5*time.Second))
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				_, _ = a.PollInboxOnce(ctx)
+			}
+		}
+	}()
 
+	// Long-poll: one held request instead of a request every few seconds, with instant delivery.
+	wait := 25
+	if a.HTTPClient != nil && a.HTTPClient.Timeout > 0 && a.HTTPClient.Timeout < 35*time.Second {
+		wait = 0
+	}
 	for {
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			return nil
-		case <-ticker.C:
-			_, _ = a.PollUpdatesOnce(ctx)
-			_, _ = a.PollInboxOnce(ctx)
+		}
+		_, err := a.pollUpdates(ctx, wait)
+		if err != nil || wait == 0 {
+			pause := a.Config.PollInterval
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(pause):
+			}
 		}
 	}
 }

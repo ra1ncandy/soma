@@ -32,12 +32,18 @@ func NewClient(socketPath, token string) *KernelClient {
 	return &KernelClient{
 		socketPath: socketPath,
 		token:      token,
-		httpClient: &http.Client{
-			Transport: tr,
-			Timeout:   15 * time.Second,
-		},
+		// No client-wide timeout: each call is bounded by callTimeout below, because a
+		// synchronous run legitimately takes minutes while every other RPC is quick.
+		httpClient: &http.Client{Transport: tr},
 	}
 }
+
+const (
+	defaultCallTimeout = 15 * time.Second
+	// syncRunTimeout must exceed the kernel's own budget for a synchronous bridge run, otherwise
+	// the client gives up first, the server-side context is cancelled, and the run dies mid-task.
+	syncRunTimeout = 6 * time.Minute
+)
 
 func (c *KernelClient) doJSON(ctx context.Context, method, path string, reqBody, dst any) error {
 	var bodyReader io.Reader
@@ -48,6 +54,12 @@ func (c *KernelClient) doJSON(ctx context.Context, method, path string, reqBody,
 		}
 		bodyReader = bytes.NewReader(raw)
 	}
+	timeout := defaultCallTimeout
+	if sr, ok := reqBody.(StartRunRequest); ok && sr.Sync {
+		timeout = syncRunTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, method, "http://soma-kernel"+path, bodyReader)
 	if err != nil {
 		return err

@@ -85,6 +85,12 @@ func (a *MatrixAdapter) Send(ctx context.Context, msg OutboundMessage) error {
 
 // PollOnce performs a single /_matrix/client/v3/sync request and processes room text messages.
 func (a *MatrixAdapter) PollOnce(ctx context.Context, since string) (string, error) {
+	return a.pollOnce(ctx, since, false)
+}
+
+// pollOnce runs one /sync. With skipTimeline the events are not dispatched: the initial sync of a
+// session returns recent room history, which must not be re-executed on every restart.
+func (a *MatrixAdapter) pollOnce(ctx context.Context, since string, skipTimeline bool) (string, error) {
 	u := strings.TrimRight(a.Config.HomeserverURL, "/") + "/_matrix/client/v3/sync?timeout=25000"
 	if since != "" {
 		u += "&since=" + url.QueryEscape(since)
@@ -126,6 +132,12 @@ func (a *MatrixAdapter) PollOnce(ctx context.Context, since string) (string, err
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&syncRes); err != nil {
 		return since, err
+	}
+	if skipTimeline {
+		if syncRes.NextBatch != "" {
+			return syncRes.NextBatch, nil
+		}
+		return since, nil
 	}
 	for roomID, room := range syncRes.Rooms.Join {
 		if len(a.Config.AllowedRooms) > 0 && !containsString(a.Config.AllowedRooms, roomID) {
@@ -169,7 +181,7 @@ func (a *MatrixAdapter) Run(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		next, err := a.PollOnce(ctx, since)
+		next, err := a.pollOnce(ctx, since, since == "")
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
