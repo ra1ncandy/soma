@@ -102,6 +102,9 @@ func BuildRunArgs(cfg Config, containerName, vncPass string) ([]string, error) {
 		// Strictly bind noVNC to loopback only; never expose VNC to 0.0.0.0.
 		"-p", fmt.Sprintf("127.0.0.1:%d:6080", port),
 		"-v", absWS + ":/workspace",
+		// The shared workspace is the project directory; never expose kernel state, credentials,
+		// triggers, or the control socket under .soma to the GUI container.
+		"--tmpfs", "/workspace/.soma:rw,noexec,nosuid,size=1m",
 		"-e", "SCREEN_WIDTH=" + strconv.Itoa(w),
 		"-e", "SCREEN_HEIGHT=" + strconv.Itoa(h),
 		"-e", "SOMA_VNC_PASSWORD=" + vncPass,

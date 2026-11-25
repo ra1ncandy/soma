@@ -26,6 +26,38 @@ func newBwrapBackend() Backend {
 	return &bwrapBackend{binPath: path}
 }
 
+// maxCapturedOutput caps each of stdout and stderr kept from one sandboxed command.
+const maxCapturedOutput = 16 << 20
+
+// cappedBuffer keeps the first limit bytes written and discards the rest, noting the truncation.
+type cappedBuffer struct {
+	buf       bytes.Buffer
+	limit     int
+	truncated bool
+}
+
+func (c *cappedBuffer) Write(p []byte) (int, error) {
+	if room := c.limit - c.buf.Len(); room > 0 {
+		if len(p) > room {
+			c.buf.Write(p[:room])
+			c.truncated = true
+		} else {
+			c.buf.Write(p)
+		}
+	} else if len(p) > 0 {
+		c.truncated = true
+	}
+	return len(p), nil
+}
+
+func (c *cappedBuffer) Bytes() []byte {
+	if !c.truncated {
+		return c.buf.Bytes()
+	}
+	out := append([]byte(nil), c.buf.Bytes()...)
+	return append(out, []byte(fmt.Sprintf("\n[output truncated at %d MiB]\n", c.limit>>20))...)
+}
+
 func (b *bwrapBackend) Name() string { return "bwrap" }
 
 func (b *bwrapBackend) Available() bool { return b.binPath != "" }
@@ -81,6 +113,19 @@ func BuildBwrapArgs(spec ExecSpec) ([]string, error) {
 		"--clearenv",
 	)
 
+	// When the workspace is the project directory itself (direct mode) it contains kernel state
+	// and credentials under .soma; hide them behind an empty tmpfs.
+	if info, err := os.Lstat(filepath.Join(absWS, ".soma")); err == nil && info.IsDir() {
+		args = append(args, "--tmpfs", "/workspace/.soma")
+	}
+	// Git hooks and config are executed by the operator's own git commands on the host, so the
+	// sandbox may use the repository but not rewrite either.
+	for _, rel := range []string{".git/hooks", ".git/config"} {
+		if info, err := os.Lstat(filepath.Join(absWS, rel)); err == nil && info.Mode()&os.ModeSymlink == 0 {
+			args = append(args, "--ro-bind", filepath.Join(absWS, rel), "/workspace/"+rel)
+		}
+	}
+
 	// Enforce kernel-level EROFS read-only binds on pinned oracle files inside /workspace.
 	for _, rel := range spec.PinnedReadOnlyFiles {
 		cleanRel := filepath.Clean(rel)
@@ -100,6 +145,11 @@ func BuildBwrapArgs(spec ExecSpec) ([]string, error) {
 		args = append(args,
 			"--ro-bind-try", "/etc/resolv.conf", "/etc/resolv.conf",
 			"--ro-bind-try", "/etc/ssl", "/etc/ssl",
+			// CA bundles are often symlinks out of /etc/ssl; without their targets TLS fails.
+			"--ro-bind-try", "/etc/ca-certificates", "/etc/ca-certificates",
+			"--ro-bind-try", "/etc/pki", "/etc/pki",
+			"--ro-bind-try", "/etc/hosts", "/etc/hosts",
+			"--ro-bind-try", "/etc/nsswitch.conf", "/etc/nsswitch.conf",
 		)
 	}
 
@@ -148,9 +198,11 @@ func (b *bwrapBackend) Exec(ctx context.Context, spec ExecSpec) (ExecResult, err
 	start := time.Now()
 	cmd := exec.CommandContext(runCtx, b.binPath, args...)
 	cmd.WaitDelay = 500 * time.Millisecond
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	// Bound captured output so a chatty command (`yes`, a log storm) cannot exhaust host memory.
+	stdout := &cappedBuffer{limit: maxCapturedOutput}
+	stderr := &cappedBuffer{limit: maxCapturedOutput}
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 
 	runErr := cmd.Run()
 	dur := time.Since(start)
