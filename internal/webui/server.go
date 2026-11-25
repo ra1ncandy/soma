@@ -1308,6 +1308,28 @@ func runTimeoutFor(maxTurns int) time.Duration {
 	return d
 }
 
+// stopActiveLoop cancels the executor loop running on branchID, if any, and waits for it to exit.
+// It reports false if the loop is still running after timeout.
+func (s *Server) stopActiveLoop(branchID string, timeout time.Duration) bool {
+	s.mu.Lock()
+	cancel := s.activeCancels[branchID]
+	done := s.activeDone[branchID]
+	s.mu.Unlock()
+	if cancel == nil {
+		return true
+	}
+	cancel()
+	if done == nil {
+		return true
+	}
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
 func (s *Server) runBranchAsync(exec *dag.Executor, branchID string, maxTurns int) {
 	if maxTurns <= 0 {
 		maxTurns = s.defaultMaxTurns()
@@ -1649,6 +1671,14 @@ func (s *Server) handleContinueBranch(w http.ResponseWriter, r *http.Request, br
 	exec, _, err := s.executorForRequest(r.Context(), req.Profile, accID)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	// A follow-up interrupts the running loop. Stop it and wait until it has committed its last
+	// step before appending, or the old loop would parent its next step on a stale head and
+	// orphan the user's message.
+	if !s.stopActiveLoop(br.ID, 30*time.Second) {
+		closeExecutor(exec)
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "the running turn did not stop in time; try again"})
 		return
 	}
 	if err := exec.AppendFollowUpUserTurn(r.Context(), br.ID, msg); err != nil {
