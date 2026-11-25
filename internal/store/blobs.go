@@ -8,6 +8,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/klauspost/compress/zstd"
 )
@@ -68,6 +70,10 @@ func (b *BlobStore) Put(data []byte) (string, string, error) {
 	abs := filepath.Join(filepath.Dir(b.root), rel)
 
 	if _, err := os.Stat(abs); err == nil {
+		// Mark the blob as in use now, so a concurrent sweep does not collect it in the window
+		// before the row that references it is committed.
+		now := time.Now()
+		_ = os.Chtimes(abs, now, now)
 		return hash, rel, nil
 	}
 
@@ -136,6 +142,43 @@ func (b *BlobStore) Exists(hash string) bool {
 	}
 	_, err = os.Stat(abs)
 	return err == nil
+}
+
+// Sweep deletes blobs that are not in referenced and have not been written or re-used for at
+// least minAge. It returns the number of blobs removed and the bytes freed.
+func (b *BlobStore) Sweep(referenced map[string]bool, minAge time.Duration) (int, int64, error) {
+	cutoff := time.Now().Add(-minAge)
+	removed := 0
+	var freed int64
+	err := filepath.WalkDir(b.root, func(p string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil || d.IsDir() {
+			return nil
+		}
+		name := d.Name()
+		hash, ok := strings.CutSuffix(name, ".zst")
+		if !ok || len(hash) != 64 {
+			// Leftover temp file from an interrupted write.
+			if strings.HasPrefix(name, ".tmp-") {
+				if info, iErr := d.Info(); iErr == nil && info.ModTime().Before(cutoff) {
+					_ = os.Remove(p)
+				}
+			}
+			return nil
+		}
+		if referenced[hash] {
+			return nil
+		}
+		info, iErr := d.Info()
+		if iErr != nil || info.ModTime().After(cutoff) {
+			return nil
+		}
+		if os.Remove(p) == nil {
+			removed++
+			freed += info.Size()
+		}
+		return nil
+	})
+	return removed, freed, err
 }
 
 // TotalBytes returns the total compressed size on disk of all blobs in the store.

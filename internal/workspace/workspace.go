@@ -287,6 +287,11 @@ func copyFile(src, dst string, d fs.DirEntry) error {
 	}
 	defer func() { _ = out.Close() }()
 
+	// Share data blocks copy-on-write where the filesystem allows it: a snapshot of a large tree
+	// then costs almost no time or disk until files are actually modified.
+	if tryReflink(out, in) {
+		return nil
+	}
 	_, err = io.Copy(out, in)
 	return err
 }

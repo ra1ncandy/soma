@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -1966,6 +1967,82 @@ func (s *Store) CountPendingInbox(ctx context.Context) (int, error) {
 	var count int
 	err := s.reader.QueryRowContext(ctx, `SELECT COUNT(*) FROM inbox_items WHERE status = 'pending'`).Scan(&count)
 	return count, err
+}
+
+// SweepUnreferencedBlobs removes blobs no surviving row points at (left behind when runs are
+// deleted). References are page contents, epoch snapshot layers, step frame deltas and emitted
+// payloads, plus the viewport screenshots named inside frame deltas.
+func (s *Store) SweepUnreferencedBlobs(ctx context.Context, minAge time.Duration) (int, int64, error) {
+	referenced := make(map[string]bool)
+	collect := func(query string) error {
+		rows, err := s.reader.QueryContext(ctx, query)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = rows.Close() }()
+		for rows.Next() {
+			var h sql.NullString
+			if err := rows.Scan(&h); err != nil {
+				return err
+			}
+			if h.Valid && len(h.String) == 64 {
+				referenced[h.String] = true
+			}
+		}
+		return rows.Err()
+	}
+	var deltaHashes []string
+	for _, q := range []string{
+		`SELECT content_hash FROM pages`,
+		`SELECT layer0_blob_hash FROM epoch_snapshots`,
+		`SELECT layer1_blob_hash FROM epoch_snapshots`,
+		`SELECT emitted_blob_hash FROM steps`,
+	} {
+		if err := collect(q); err != nil {
+			return 0, 0, err
+		}
+	}
+	rows, err := s.reader.QueryContext(ctx, `SELECT DISTINCT frame_delta_blob_hash FROM steps`)
+	if err != nil {
+		return 0, 0, err
+	}
+	for rows.Next() {
+		var h string
+		if err := rows.Scan(&h); err != nil {
+			_ = rows.Close()
+			return 0, 0, err
+		}
+		if len(h) == 64 {
+			referenced[h] = true
+			deltaHashes = append(deltaHashes, h)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return 0, 0, err
+	}
+	_ = rows.Close()
+
+	for _, h := range deltaHashes {
+		if ctx.Err() != nil {
+			return 0, 0, ctx.Err()
+		}
+		raw, gErr := s.blobs.Get(h)
+		if gErr != nil {
+			continue
+		}
+		var delta struct {
+			LiveTail struct {
+				Viewport *struct {
+					BlobHash string `json:"blob_hash"`
+				} `json:"viewport"`
+			} `json:"live_tail"`
+		}
+		if json.Unmarshal(raw, &delta) == nil && delta.LiveTail.Viewport != nil && len(delta.LiveTail.Viewport.BlobHash) == 64 {
+			referenced[delta.LiveTail.Viewport.BlobHash] = true
+		}
+	}
+	return s.blobs.Sweep(referenced, minAge)
 }
 
 // --- Matryoshka Int8 Embeddings (Memory & @page Chunks) ---

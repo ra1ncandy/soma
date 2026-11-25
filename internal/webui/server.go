@@ -354,6 +354,7 @@ func (s *Server) ServeListener(ctx context.Context, ln net.Listener) error {
 	if s.supervisor != nil {
 		s.supervisor.Start(ctx)
 	}
+	go s.runHousekeeping(ctx)
 
 	if hCfg := s.loadHarnessConfig(); hCfg.Tunnel.AutoStart && strings.TrimSpace(hCfg.Tunnel.AuthToken) != "" && s.tunnel != nil {
 		s.setAuthToken(hCfg.Tunnel.AuthToken)
@@ -1354,6 +1355,31 @@ func (s *Server) runBranchAsync(exec *dag.Executor, branchID string, maxTurns in
 		closeExecutor(exec)
 		s.recordRunOutcome(branchID, runErr, timeout)
 	}()
+}
+
+// runHousekeeping periodically reclaims disk: finished workspaces with nothing left to apply,
+// orphaned workspace directories, and blobs no run references any more.
+func (s *Server) runHousekeeping(ctx context.Context) {
+	tick := time.NewTimer(2 * time.Minute)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.stopCh:
+			return
+		case <-tick.C:
+		}
+		if s.wsMgr != nil {
+			_, _ = s.wsMgr.GCWorkspaces(ctx, s.store, 24*time.Hour, func(branchID string) bool {
+				s.mu.Lock()
+				defer s.mu.Unlock()
+				return s.activeCancels[branchID] != nil
+			})
+		}
+		_, _, _ = s.store.SweepUnreferencedBlobs(ctx, 24*time.Hour)
+		tick.Reset(6 * time.Hour)
+	}
 }
 
 // closeExecutor releases per-run resources (MCP server processes, background jobs) held by exec.
