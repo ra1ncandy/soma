@@ -2,7 +2,9 @@ package webui
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"embed"
 	"encoding/hex"
@@ -75,6 +77,7 @@ type Server struct {
 	wg                sync.WaitGroup
 	activeCancels     map[string]context.CancelFunc
 	activeDone        map[string]chan struct{}
+	loginLimiter      loginThrottle
 	activeTools       map[string]string
 	desktopLastActive time.Time
 	desktopTakeOver   bool
@@ -339,6 +342,8 @@ func (s *Server) ServeListener(ctx context.Context, ln net.Listener) error {
 	srv := &http.Server{
 		Handler:           s.Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 	s.mu.Lock()
 	s.listener = ln
@@ -421,6 +426,13 @@ func (s *Server) Handler() http.Handler {
 		w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self' ws: wss:; frame-src 'self'")
 
 		path := r.URL.Path
+		// DNS-rebinding defence: with no access token the dashboard is trusted purely because it
+		// is on loopback, so only answer requests actually addressed to a loopback name. A page
+		// on evil.example that rebinds to 127.0.0.1 still sends Host: evil.example.
+		if !strings.HasPrefix(path, "/webhooks/") && s.activeAuthToken() == "" && !isLoopbackHost(r.Host) && !s.hostExplicitlyAllowed(r.Host) {
+			http.Error(w, "forbidden host", http.StatusForbidden)
+			return
+		}
 		if strings.HasPrefix(path, "/webhooks/triggers/") {
 			if s.supervisor != nil {
 				s.supervisor.ServeTriggerWebhook(w, r)
@@ -641,6 +653,92 @@ func (s *Server) setAuthToken(tok string) {
 	s.mu.Unlock()
 }
 
+// isLoopbackHost reports whether a Host header names this machine's loopback interface.
+func isLoopbackHost(hostport string) bool {
+	host := hostport
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		host = h
+	}
+	host = strings.ToLower(strings.TrimSuffix(strings.Trim(host, "[]"), "."))
+	if host == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
+// hostExplicitlyAllowed honours the listen address itself and SOMA_ALLOWED_HOSTS (comma-separated)
+// for token-less setups reached by a custom local name.
+func (s *Server) hostExplicitlyAllowed(hostport string) bool {
+	host := hostport
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		host = h
+	}
+	host = strings.ToLower(strings.Trim(host, "[]"))
+	if listenHost, _, err := net.SplitHostPort(s.cfg.Addr); err == nil && listenHost != "" && strings.EqualFold(strings.Trim(listenHost, "[]"), host) {
+		return true
+	}
+	for _, allowed := range strings.Split(os.Getenv("SOMA_ALLOWED_HOSTS"), ",") {
+		if a := strings.ToLower(strings.TrimSpace(allowed)); a != "" && a == host {
+			return true
+		}
+	}
+	return false
+}
+
+// sessionValueFor derives the session cookie value from the access token. The cookie proves
+// knowledge of the token without containing it, so a leaked cookie does not reveal the token.
+func sessionValueFor(token string) string {
+	mac := hmac.New(sha256.New, []byte(token))
+	mac.Write([]byte("soma_session:v1"))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func requestIsHTTPS(r *http.Request) bool {
+	return r != nil && (r.TLS != nil || strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https"))
+}
+
+// loginThrottle slows online guessing of the access token: after 5 consecutive failures every
+// further attempt is refused for an exponentially growing window (capped at 5 minutes).
+type loginThrottle struct {
+	mu        sync.Mutex
+	failures  int
+	lockUntil time.Time
+}
+
+func (t *loginThrottle) allowed(now time.Time) (bool, time.Duration) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if now.Before(t.lockUntil) {
+		return false, t.lockUntil.Sub(now)
+	}
+	return true, 0
+}
+
+func (t *loginThrottle) record(success bool, now time.Time) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if success {
+		t.failures = 0
+		t.lockUntil = time.Time{}
+		return
+	}
+	t.failures++
+	if t.failures >= 5 {
+		shift := t.failures - 5
+		if shift > 9 {
+			shift = 9
+		}
+		lock := time.Duration(1<<uint(shift)) * time.Second
+		if lock > 5*time.Minute {
+			lock = 5 * time.Minute
+		}
+		t.lockUntil = now.Add(lock)
+	}
+}
+
 func (s *Server) validAuth(r *http.Request) bool {
 	expected := s.activeAuthToken()
 	if expected == "" {
@@ -654,7 +752,8 @@ func (s *Server) validAuth(r *http.Request) bool {
 	}
 	if c, err := r.Cookie("soma_session"); err == nil && c != nil {
 		got := strings.TrimSpace(c.Value)
-		if len(got) == len(expected) && subtle.ConstantTimeCompare([]byte(got), []byte(expected)) == 1 {
+		want := sessionValueFor(expected)
+		if len(got) == len(want) && subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1 {
 			return true
 		}
 	}
@@ -682,24 +781,33 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "auth_required": false})
 		return
 	}
+	now := time.Now()
+	if ok, wait := s.loginLimiter.allowed(now); !ok {
+		w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds())+1))
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "too many failed sign-in attempts; try again shortly"})
+		return
+	}
 	got := strings.TrimSpace(req.Token)
 	if len(got) != len(expected) || subtle.ConstantTimeCompare([]byte(got), []byte(expected)) != 1 {
+		s.loginLimiter.record(false, now)
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid access token"})
 		return
 	}
-	s.issueSessionCookie(w, expected)
+	s.loginLimiter.record(true, now)
+	s.issueSessionCookie(w, r, expected)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "authenticated": true})
 }
 
-func (s *Server) issueSessionCookie(w http.ResponseWriter, token string) {
+func (s *Server) issueSessionCookie(w http.ResponseWriter, r *http.Request, token string) {
 	if strings.TrimSpace(token) == "" {
 		return
 	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     "soma_session",
-		Value:    strings.TrimSpace(token),
+		Value:    sessionValueFor(strings.TrimSpace(token)),
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   requestIsHTTPS(r),
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   86400 * 7,
 	})

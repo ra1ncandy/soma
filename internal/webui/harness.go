@@ -1136,6 +1136,10 @@ func (s *Server) handleSaveTunnelConfig(w http.ResponseWriter, r *http.Request) 
 		cfg.Tunnel.AuthToken = tok
 		generated = tok
 	} else if strings.TrimSpace(req.AuthToken) != "" {
+		if len(strings.TrimSpace(req.AuthToken)) < 16 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "access token must be at least 16 characters (or use Generate)"})
+			return
+		}
 		cfg.Tunnel.AuthToken = strings.TrimSpace(req.AuthToken)
 	}
 
@@ -1145,7 +1149,7 @@ func (s *Server) handleSaveTunnelConfig(w http.ResponseWriter, r *http.Request) 
 	}
 	if strings.TrimSpace(cfg.Tunnel.AuthToken) != "" {
 		s.setAuthToken(cfg.Tunnel.AuthToken)
-		s.issueSessionCookie(w, cfg.Tunnel.AuthToken)
+		s.issueSessionCookie(w, r, cfg.Tunnel.AuthToken)
 	}
 	s.notify()
 	out := map[string]any{
@@ -1178,7 +1182,7 @@ func (s *Server) handleStartTunnel(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.setAuthToken(cfg.Tunnel.AuthToken)
-	s.issueSessionCookie(w, cfg.Tunnel.AuthToken)
+	s.issueSessionCookie(w, r, cfg.Tunnel.AuthToken)
 
 	localURL := "http://" + s.Addr()
 	if s.tunnel == nil {
@@ -1842,6 +1846,18 @@ func (s *Server) handleDesktopVNCProxy(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "virtual desktop is not running", http.StatusServiceUnavailable)
 		return
 	}
+
+	// WebSocket upgrades are not covered by the browser same-origin policy: refuse cross-site pages.
+	if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" {
+		if u, err := url.Parse(origin); err != nil || !strings.EqualFold(u.Host, r.Host) {
+			http.Error(w, "cross-origin desktop access blocked", http.StatusForbidden)
+			return
+		}
+	}
+	// Never forward dashboard credentials into the agent-controlled desktop container.
+	r = r.Clone(r.Context())
+	r.Header.Del("Cookie")
+	r.Header.Del("Authorization")
 
 	targetAddr := fmt.Sprintf("127.0.0.1:%d", st.NoVNCPort)
 	trimmedPath := strings.TrimPrefix(r.URL.Path, "/desktop-vnc")
