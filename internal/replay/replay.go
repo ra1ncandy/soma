@@ -107,14 +107,24 @@ func (r *Replayer) Replay(ctx context.Context, branchID string, opts ReplayOptio
 			}
 			origAct := loadActionKey(r.Store, s)
 			toks := s.InputTokens + s.CacheReadTokens + s.OutputTokens
+			// Kernel-synthesised steps (user follow-ups, crash recovery, manual reconcile) never sent a
+			// compiled frame to a model, so they carry no frame hash to reproduce.
+			synthetic := s.ModelID == "user" || s.ModelID == "recovery" || s.ModelID == "reconciler"
+			verified := synthetic || frame.CompiledFrameHash == s.CompiledFrameHash
 			report.StepsChecked++
-			report.HashVerifiedCount++
+			if verified {
+				report.HashVerifiedCount++
+			} else if !report.Diverged {
+				report.Diverged = true
+				report.DivergedAtStep = s.ID
+			}
 			report.OriginalTotalTokens += toks
 			report.ReplayTotalTokens += frame.TotalTokens
 			report.Comparisons = append(report.Comparisons, StepComparison{
 				TurnIndex:         s.TurnIndex,
 				StepID:            s.ID,
-				FrameHashVerified: frame.CompiledFrameHash == s.CompiledFrameHash,
+				FrameHashVerified: verified,
+				Diverged:          !verified,
 				OriginalAction:    origAct,
 				ReplayAction:      origAct,
 				OriginalTokens:    toks,
