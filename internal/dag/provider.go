@@ -836,7 +836,7 @@ func (p *OpenAICompatProvider) Generate(ctx context.Context, req GenerateRequest
 		retryAfterHeader = resp.Header.Get("Retry-After")
 
 		if statusCode == http.StatusOK && strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
-			completion, streamErr := readChatStream(resp.Body, cancelReq, p.StreamIdleTimeout, p.OnDelta)
+			completion, streamErr := readChatStream(resp.Body, cancelReq, p.StreamIdleTimeout, deltaSink(ctx, p.OnDelta))
 			_ = resp.Body.Close()
 			cancelReq()
 			if streamErr != nil {

@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net"
 	"net/http"
@@ -87,6 +88,8 @@ type Server struct {
 	stopCh   chan struct{}
 	subMu    sync.Mutex
 	subs     map[chan struct{}]struct{}
+	// deltaSubs receive streamed model text (SSE "delta" events).
+	deltaSubs map[chan streamDelta]struct{}
 }
 
 // StateDTO is the clean, UI-friendly JSON snapshot returned by GET /api/state.
@@ -957,12 +960,18 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 
 	ch := make(chan struct{}, 1)
+	deltas := make(chan streamDelta, 512)
 	s.subMu.Lock()
 	s.subs[ch] = struct{}{}
+	if s.deltaSubs == nil {
+		s.deltaSubs = make(map[chan streamDelta]struct{})
+	}
+	s.deltaSubs[deltas] = struct{}{}
 	s.subMu.Unlock()
 	defer func() {
 		s.subMu.Lock()
 		delete(s.subs, ch)
+		delete(s.deltaSubs, deltas)
 		s.subMu.Unlock()
 	}()
 
@@ -981,9 +990,55 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		case <-ch:
 			_, _ = fmt.Fprint(w, "event: state\ndata: refresh\n\n")
 			flusher.Flush()
+		case d := <-deltas:
+			// Coalesce whatever else is queued for the same branch into one event.
+			text := d.Text
+		drain:
+			for i := 0; i < 64; i++ {
+				select {
+				case more := <-deltas:
+					if more.BranchID != d.BranchID {
+						writeDeltaEvent(w, d.BranchID, text)
+						d, text = more, more.Text
+						continue
+					}
+					text += more.Text
+				default:
+					break drain
+				}
+			}
+			writeDeltaEvent(w, d.BranchID, text)
+			flusher.Flush()
 		case <-ticker.C:
 			_, _ = fmt.Fprint(w, ": keepalive\n\n")
 			flusher.Flush()
+		}
+	}
+}
+
+// streamDelta is a piece of model text streamed for a branch.
+type streamDelta struct {
+	BranchID string `json:"branch_id"`
+	Text     string `json:"text"`
+}
+
+func writeDeltaEvent(w io.Writer, branchID, text string) {
+	raw, _ := json.Marshal(streamDelta{BranchID: branchID, Text: text})
+	_, _ = fmt.Fprintf(w, "event: delta\ndata: %s\n\n", raw)
+}
+
+// publishDelta fans streamed model text out to every SSE client. Slow clients drop deltas
+// (the full text arrives with the next state refresh), never blocking generation.
+func (s *Server) publishDelta(branchID, text string) {
+	if text == "" {
+		return
+	}
+	s.subMu.Lock()
+	defer s.subMu.Unlock()
+	for ch := range s.deltaSubs {
+		select {
+		case ch <- streamDelta{BranchID: branchID, Text: text}:
+		default:
 		}
 	}
 }
@@ -1963,6 +2018,7 @@ func (s *Server) newExecutor(prof compiler.ModelProfile) *dag.Executor {
 		s.mu.Unlock()
 		s.notify()
 	}
+	exec.OnDelta = s.publishDelta
 
 	guiProv := prov
 	guiModel := modelID

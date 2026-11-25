@@ -231,7 +231,9 @@ type Executor struct {
 	GUIConfig           *GUISubagentConfig
 	AfterDispatchHook   func(ctx context.Context, entry store.ActionJournalEntry) error
 	OnStep              func(step store.Step)
-	seq                 atomic.Uint64
+	// OnDelta receives streamed model text for a branch as it is generated.
+	OnDelta func(branchID, text string)
+	seq     atomic.Uint64
 }
 
 // NewExecutor builds a configured DAG Executor.
@@ -893,7 +895,12 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 			return res, err
 		}
 
-		genResp, genErr := e.Provider.Generate(ctx, GenerateRequest{
+		genCtx := ctx
+		if e.OnDelta != nil {
+			bid := branch.ID
+			genCtx = WithDeltaSink(ctx, func(t string) { e.OnDelta(bid, t) })
+		}
+		genResp, genErr := e.Provider.Generate(genCtx, GenerateRequest{
 			RunID:     run.ID,
 			BranchID:  branch.ID,
 			AccountID: acc.ID,
