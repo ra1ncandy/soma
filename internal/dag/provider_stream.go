@@ -10,6 +10,7 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -67,9 +68,9 @@ func readChatStream(body io.Reader, cancel context.CancelFunc, idle time.Duratio
 	if idle <= 0 {
 		idle = streamIdleTimeout
 	}
-	stalled := false
+	var stalled atomic.Bool
 	watchdog := time.AfterFunc(idle, func() {
-		stalled = true
+		stalled.Store(true)
 		cancel()
 	})
 	defer watchdog.Stop()
@@ -167,7 +168,7 @@ func readChatStream(body io.Reader, cancel context.CancelFunc, idle time.Duratio
 			if errors.Is(err, io.EOF) {
 				break
 			}
-			if stalled {
+			if stalled.Load() {
 				return nil, fmt.Errorf("%w: no data for %s", errStreamStalled, idle)
 			}
 			return nil, err

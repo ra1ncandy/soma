@@ -44,6 +44,7 @@ type TunnelDTO struct {
 
 // TunnelManager supervises a local cloudflared subprocess for authenticated external dashboard access.
 type TunnelManager struct {
+	startMu   sync.Mutex // serialises Start so two calls cannot each leave a cloudflared running
 	mu        sync.Mutex
 	cmd       *exec.Cmd
 	cancel    context.CancelFunc
@@ -94,6 +95,8 @@ func (tm *TunnelManager) Status(cfg TunnelConfig) TunnelDTO {
 // Start launches cloudflared pointing at localURL (e.g. "http://127.0.0.1:7420").
 // It requires cfg.AuthToken to be set so the exposed dashboard is never unauthenticated.
 func (tm *TunnelManager) Start(parentCtx context.Context, localURL string, cfg TunnelConfig) error {
+	tm.startMu.Lock()
+	defer tm.startMu.Unlock()
 	if strings.TrimSpace(cfg.AuthToken) == "" {
 		return errors.New("tunnel: dashboard auth_token is required before exposing externally")
 	}
@@ -175,9 +178,13 @@ func (tm *TunnelManager) Start(parentCtx context.Context, localURL string, cfg T
 	go func() {
 		waitErr := cmd.Wait()
 		tm.mu.Lock()
-		tm.running = false
-		if waitErr != nil && ctx.Err() == nil {
-			tm.lastErr = waitErr.Error()
+		// Only the current process may report "stopped": a previous tunnel's exit must not mark
+		// its replacement (which is live and public) as down.
+		if tm.cmd == cmd {
+			tm.running = false
+			if waitErr != nil && ctx.Err() == nil {
+				tm.lastErr = waitErr.Error()
+			}
 		}
 		tm.mu.Unlock()
 	}()

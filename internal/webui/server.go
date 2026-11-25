@@ -78,6 +78,7 @@ type Server struct {
 	activeCancels     map[string]context.CancelFunc
 	activeDone        map[string]chan struct{}
 	loginLimiter      loginThrottle
+	perf              perfCaches
 	activeTools       map[string]string
 	desktopLastActive time.Time
 	desktopTakeOver   bool
@@ -419,7 +420,6 @@ func (s *Server) Stop(ctx context.Context) error {
 
 // Handler returns the HTTP router protected by CSP, Origin check, optional Bearer auth, and CSRF verification.
 func (s *Server) Handler() http.Handler {
-	staticSrv := http.FileServer(http.FS(s.static))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "no-referrer")
@@ -462,9 +462,12 @@ func (s *Server) Handler() http.Handler {
 			return
 		}
 		if r.Method == http.MethodGet && strings.HasPrefix(path, "/static/") {
-			w.Header().Set("Cache-Control", "no-store")
-			http.StripPrefix("/static/", staticSrv).ServeHTTP(w, r)
+			s.serveStatic(w, r, strings.TrimPrefix(path, "/static/"))
 			return
+		}
+		if mutatesHarnessConfig(r.Method, path) {
+			s.perf.harnessMu.Lock()
+			defer s.perf.harnessMu.Unlock()
 		}
 
 		if strings.HasPrefix(path, "/api/") {
@@ -939,12 +942,7 @@ func (s *Server) maybeAutoStopDesktop(ctx context.Context, idleTimeout time.Dura
 }
 
 func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
-	state, err := s.buildState(r.Context())
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
-	writeJSON(w, http.StatusOK, state)
+	s.serveState(w, r)
 }
 
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
@@ -990,6 +988,8 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) notify() {
+	s.perf.stateVersion.Add(1)
+	s.invalidateDesktopStatus()
 	s.subMu.Lock()
 	defer s.subMu.Unlock()
 	for ch := range s.subs {
@@ -1549,6 +1549,7 @@ func (s *Server) handleBranchApply(w http.ResponseWriter, r *http.Request, branc
 		baseDir = s.cfg.WorkspaceDir
 	}
 	rep, err := s.wsMgr.ApplyBranchWorkspace(r.Context(), baseDir, br.WorkspaceDir)
+	s.invalidateChangedCount(br.ID)
 	if err != nil {
 		status := http.StatusInternalServerError
 		if errors.Is(err, workspace.ErrMergeConflict) {
@@ -1958,6 +1959,9 @@ func (s *Server) buildState(ctx context.Context) (StateDTO, error) {
 		brByRun[b.RunID] = append(brByRun[b.RunID], b)
 	}
 
+	liveSteps := make(map[string]bool)
+	defer func() { s.pruneStepCache(liveSteps) }()
+
 	runTitles := make(map[string]string, len(runs))
 	for _, r := range runs {
 		ctrs, _ := s.store.ListRunContracts(ctx, r.ID)
@@ -1995,7 +1999,7 @@ func (s *Server) buildState(ctx context.Context) (StateDTO, error) {
 			for _, st := range steps {
 				inToks += st.InputTokens + st.CacheReadTokens
 				cacheToks += st.CacheReadTokens
-				stepDTOs = append(stepDTOs, s.decodeStepDTO(st))
+				stepDTOs = append(stepDTOs, s.stepDTOCached(st, liveSteps))
 			}
 			hitPct := 0.0
 			if inToks > 0 {
@@ -2003,19 +2007,27 @@ func (s *Server) buildState(ctx context.Context) (StateDTO, error) {
 			}
 			var ft FrameTokensDTO
 			if b.HeadStepID != "" {
-				if frame, fErr := compiler.ReconstructFrame(ctx, s.store, b.HeadStepID, compiler.WorkerProfile()); fErr == nil {
-					ft = FrameTokensDTO{
+				headID := b.HeadStepID
+				ft = s.frameTokensCached(headID, func() (FrameTokensDTO, bool) {
+					frame, fErr := compiler.ReconstructFrame(ctx, s.store, headID, compiler.WorkerProfile())
+					if fErr != nil {
+						return FrameTokensDTO{}, false
+					}
+					return FrameTokensDTO{
 						L0:    frame.L0Tokens,
 						L1:    frame.L1Tokens,
 						L2:    frame.L2Tokens,
 						L3:    frame.L3Tokens,
 						Total: frame.TotalTokens,
-					}
-				}
+					}, true
+				})
 			}
 			changedCount := 0
 			if s.wsMgr != nil && b.WorkspaceDir != "" && b.WorkspaceStrategy != workspace.StrategyDirect && len(steps) > 0 {
-				changedCount = s.wsMgr.CountWorkspaceChanges(ctx, baseWS, b.WorkspaceDir)
+				wsDir := b.WorkspaceDir
+				changedCount = s.changedCountCached(b.ID, b.HeadStepID, func() int {
+					return s.wsMgr.CountWorkspaceChanges(ctx, baseWS, wsDir)
+				})
 			}
 			brDTOs = append(brDTOs, BranchDTO{
 				ID:                b.ID,

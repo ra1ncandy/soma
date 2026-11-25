@@ -1,6 +1,7 @@
 package webui
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -451,7 +452,14 @@ func loadHarnessConfigFromPath(path string) HarnessConfig {
 	if err != nil {
 		return cfg
 	}
-	_ = json.Unmarshal(raw, &cfg)
+	if jErr := json.Unmarshal(raw, &cfg); jErr != nil && len(bytes.TrimSpace(raw)) > 0 {
+		// Never let a damaged file be silently replaced by defaults on the next save: keep a
+		// copy of what was there (API keys, connectors, bridge tokens) for recovery.
+		backup := path + ".corrupt"
+		if _, sErr := os.Stat(backup); sErr != nil {
+			_ = os.WriteFile(backup, raw, 0o600)
+		}
+	}
 	if cfg.Provider.MaxTurns <= 0 {
 		cfg.Provider.MaxTurns = 15
 	}
@@ -482,7 +490,14 @@ func (s *Server) saveHarnessConfig(cfg HarnessConfig) error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(s.harnessPath(), b, 0o600); err != nil {
+	// Write-then-rename so a concurrent reader never sees a truncated file (which would parse as
+	// defaults and be saved back, wiping every credential).
+	tmp := s.harnessPath() + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, s.harnessPath()); err != nil {
+		_ = os.Remove(tmp)
 		return err
 	}
 	return s.syncMCPYAML(cfg.MCPServers)
@@ -601,8 +616,7 @@ func builtinMCPPresetCatalog(containerName string) []MCPPresetDTO {
 }
 
 func (s *Server) desktopStatusDTO(ctx context.Context) DesktopStatusDTO {
-	mgr := desktop.NewManager()
-	st, running, _ := mgr.Status(ctx, s.cfg.WorkspaceDir)
+	st, running := s.cachedDesktopStatus(ctx)
 	proxyURL := ""
 	novncURL := ""
 	if running && st.NoVNCPort > 0 {
@@ -630,15 +644,19 @@ func (s *Server) buildHarnessDTO(ctx context.Context) HarnessDTO {
 	cfg := s.loadHarnessConfig()
 	desk := s.desktopStatusDTO(ctx)
 
+	// These fields are written under s.mu by the provider/account handlers.
+	s.mu.Lock()
+	useMock, hasProvider, curModelID := s.cfg.UseMock, s.cfg.Provider != nil, s.cfg.ModelID
+	s.mu.Unlock()
 	provMode := "read-only"
-	if s.cfg.UseMock || cfg.Provider.ProviderType == "mock" {
+	if useMock || cfg.Provider.ProviderType == "mock" {
 		provMode = "mock"
-	} else if s.cfg.Provider != nil || strings.TrimSpace(cfg.Provider.APIBase) != "" {
+	} else if hasProvider || strings.TrimSpace(cfg.Provider.APIBase) != "" {
 		provMode = "live"
 	}
 	modelID := cfg.Provider.ModelID
 	if modelID == "" {
-		modelID = s.cfg.ModelID
+		modelID = curModelID
 	}
 
 	installedByPreset := make(map[string]bool)
@@ -865,7 +883,7 @@ func (s *Server) buildHarnessDTO(ctx context.Context) HarnessDTO {
 }
 
 func (s *Server) handleGetHarness(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, s.buildHarnessDTO(r.Context()))
+	writeJSONCompressed(w, r, http.StatusOK, s.buildHarnessDTO(r.Context()))
 }
 
 func (s *Server) handleSaveProvider(w http.ResponseWriter, r *http.Request) {
@@ -1012,6 +1030,10 @@ func (s *Server) handleStartProviderOAuth(w http.ResponseWriter, r *http.Request
 		if wErr != nil || token == "" {
 			return
 		}
+		// Same lock as the config-saving API routes: this completes minutes later and must not
+		// overwrite (or be overwritten by) a save made in the meantime.
+		s.perf.harnessMu.Lock()
+		defer s.perf.harnessMu.Unlock()
 		cfg := s.loadHarnessConfig()
 		if cfg.AccountConfigs == nil {
 			cfg.AccountConfigs = map[string]AccountEndpointCfg{}
@@ -1840,8 +1862,7 @@ func (s *Server) handleFetchProviderModels(w http.ResponseWriter, r *http.Reques
 // handleDesktopVNCProxy proxies HTTP and WebSocket traffic on /desktop-vnc/* to the local noVNC server
 // so the Virtual Desktop embeds cleanly on the same origin without relaxing CSP frame-src.
 func (s *Server) handleDesktopVNCProxy(w http.ResponseWriter, r *http.Request) {
-	mgr := desktop.NewManager()
-	st, running, _ := mgr.Status(r.Context(), s.cfg.WorkspaceDir)
+	st, running := s.cachedDesktopStatus(r.Context())
 	if !running || st.NoVNCPort <= 0 {
 		http.Error(w, "virtual desktop is not running", http.StatusServiceUnavailable)
 		return

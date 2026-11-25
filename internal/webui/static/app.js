@@ -333,7 +333,32 @@
     setTimeout(() => tokIn.focus(), 30);
   }
 
-  async function refreshAll() {
+  // Every tool call and step emits an SSE event. Coalesce them: one refresh in flight at a time,
+  // plus a single trailing refresh if more events arrived while it ran. This keeps responses in
+  // order (an older state can never overwrite a newer one) and avoids rebuilding the whole view
+  // once per event during a burst.
+  let refreshInFlight = null;
+  let refreshQueued = false;
+  function refreshAll() {
+    if (refreshInFlight) {
+      refreshQueued = true;
+      return refreshInFlight;
+    }
+    refreshInFlight = (async () => {
+      try {
+        await refreshAllNow();
+      } finally {
+        refreshInFlight = null;
+        if (refreshQueued) {
+          refreshQueued = false;
+          refreshAll().catch(() => {});
+        }
+      }
+    })();
+    return refreshInFlight;
+  }
+
+  async function refreshAllNow() {
     try {
       const [st, har, authSt] = await Promise.all([
         apiGet("/api/state"),

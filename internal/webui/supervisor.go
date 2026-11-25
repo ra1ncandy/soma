@@ -27,6 +27,10 @@ type TriggerRunSummaryDTO struct {
 type RuntimeSupervisor struct {
 	server *Server
 
+	// reloadMu serialises Reload and Stop. Two overlapping reloads would each start a full set of
+	// daemon workers and bridge pollers and only one could ever be cancelled.
+	reloadMu sync.Mutex
+
 	mu            sync.RWMutex
 	started       bool
 	parentCtx     context.Context
@@ -62,6 +66,8 @@ func (rs *RuntimeSupervisor) Start(ctx context.Context) {
 
 // Stop halts all supervised Daemon and Bridge goroutines cleanly.
 func (rs *RuntimeSupervisor) Stop() {
+	rs.reloadMu.Lock()
+	defer rs.reloadMu.Unlock()
 	rs.mu.Lock()
 	rs.started = false
 	cancel := rs.epochCancel
@@ -78,6 +84,8 @@ func (rs *RuntimeSupervisor) Stop() {
 
 // Reload rebuilds webhook handlers and, when Start has been called, restarts background workers cleanly.
 func (rs *RuntimeSupervisor) Reload() {
+	rs.reloadMu.Lock()
+	defer rs.reloadMu.Unlock()
 	rs.mu.Lock()
 	isStarted := rs.started
 	parentCtx := rs.parentCtx
