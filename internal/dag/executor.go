@@ -49,6 +49,8 @@ const (
 	StatusVerifying          BranchStatus = "verifying"
 	StatusStalled            BranchStatus = "stalled"
 	StatusCompleted          BranchStatus = "completed"
+	// StatusAwaitingInput: the model called clarify; a follow-up message resumes the branch.
+	StatusAwaitingInput BranchStatus = "awaiting_input"
 	// StatusBudgetExhausted: the turn budget ran out before completion; resumable.
 	StatusBudgetExhausted BranchStatus = "budget_exhausted"
 	StatusFailed          BranchStatus = "failed"
@@ -279,6 +281,9 @@ func NewExecutor(
 		}
 		if lt.ProjectSomaDir == "" && st != nil {
 			lt.ProjectSomaDir = st.SomaDir()
+		}
+		if lt.DelegateFunc == nil {
+			lt.DelegateFunc = ex.RunDelegatedTasks
 		}
 	}
 	return ex
@@ -793,6 +798,16 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 			}
 			var acqErr error
 			acc, acqErr = e.Scheduler.Acquire(ctx, preferred, e.AccountIDs)
+			// Every eligible account is at its concurrency cap (parallel subagents, swarm workers):
+			// wait for a lease to free up instead of failing the branch.
+			for wait := 0; errors.Is(acqErr, store.ErrNoCapacity) && wait < 600; wait++ {
+				select {
+				case <-ctx.Done():
+					return res, ctx.Err()
+				case <-time.After(500 * time.Millisecond):
+				}
+				acc, acqErr = e.Scheduler.Acquire(ctx, preferred, e.AccountIDs)
+			}
 			if acqErr != nil {
 				var coolErr *ErrAllAccountsCoolingDown
 				if errors.As(acqErr, &coolErr) {
@@ -1430,6 +1445,26 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 		res.Status = StatusRunning
 		res.TurnsExecuted++
 
+		// clarify: the model asked the user a question. Stop here, durably, until a follow-up
+		// message answers it (any surface: web, CLI chat, bridges, API).
+		if q, asked := clarifyQuestion(calls); asked {
+			_ = e.Store.UpdateBranchStatus(ctx, branch.ID, string(StatusAwaitingInput), acc.ID, branch.StallCount)
+			_ = e.Store.UpdateRunStatus(ctx, run.ID, string(StatusAwaitingInput))
+			_ = e.Store.InsertInboxItem(ctx, store.InboxItem{
+				ID:          fmt.Sprintf("inbox_q_%s_%d", branch.ID, nextTurn),
+				RunID:       run.ID,
+				BranchID:    branch.ID,
+				ItemKind:    "question",
+				Title:       "The agent is asking a question",
+				Summary:     q,
+				ArtifactRef: sid,
+				Urgency:     "normal",
+			})
+			res.Status = StatusAwaitingInput
+			res.FinalSummary = q
+			return res, nil
+		}
+
 		if e.EnforceStallBreaker && e.Profile.MaxStalls > 0 && branch.StallCount >= e.Profile.MaxStalls {
 			_ = e.Store.UpdateBranchStatus(ctx, branch.ID, string(StatusStalled), acc.ID, branch.StallCount)
 			res.Status = StatusStalled
@@ -2028,7 +2063,7 @@ func (e *Executor) buildEpochInput(run store.Run, activeMem []compiler.MemoryEnt
 		ProjectInstructions: LoadProjectInstructions(run.WorkspacePath),
 		WorkspaceMode:       run.WorkspaceKind,
 		TaskGoal:            run.GoalSpec,
-		Syscalls:            compiler.DefaultCoreSyscalls(),
+		Syscalls:            CoreSyscalls(),
 		SkillIndex:          skillIndexFor(run.WorkspacePath, somaDir),
 		ActiveMemory:        activeMem,
 		Graveyard:           grave,
@@ -2087,6 +2122,11 @@ type LocalToolRunner struct {
 	// OnTriggersChanged is called after cronjob_manage changes triggers.yaml (e.g. to hot-reload
 	// the embedded daemon).
 	OnTriggersChanged func()
+	// DelegateFunc runs delegate_task subtasks as child branches (set by NewExecutor).
+	DelegateFunc func(ctx context.Context, call ToolCall, tasks []DelegateTask, maxTurns int) (ToolOutput, error)
+	// subagentDepth > 0 marks a runner used by a delegated child: delegation and other
+	// SubagentBlocked tools are refused.
+	subagentDepth int
 }
 
 // Close stops this runner's background jobs and releases anything registered through OnClose.
@@ -2472,7 +2512,7 @@ func (r *LocalToolRunner) Execute(ctx context.Context, call ToolCall) (ToolOutpu
 		q := strings.ToLower(strings.TrimSpace(query))
 		var sb strings.Builder
 		var matches int
-		for _, sc := range compiler.DefaultCoreSyscalls() {
+		for _, sc := range CoreSyscalls() {
 			if q == "" || strings.Contains(strings.ToLower(sc.Name), q) || strings.Contains(strings.ToLower(sc.Signature), q) {
 				fmt.Fprintf(&sb, "- [core] %s: %s\n", sc.Name, sc.Signature)
 				matches++
@@ -2789,6 +2829,12 @@ func (r *LocalToolRunner) Execute(ctx context.Context, call ToolCall) (ToolOutpu
 		}, nil
 
 	default:
+		if def, ok := lookupTool(call.Name); ok && def.Handler != nil {
+			if def.SubagentBlocked && r.subagentDepth > 0 {
+				return ToolOutput{}, fmt.Errorf("%s is not available to delegated subagents; report back to the parent instead", call.Name)
+			}
+			return def.Handler(ctx, r, call, args)
+		}
 		return ToolOutput{}, fmt.Errorf("%w: %q (use tool_search to inspect available syscalls)", ErrUnknownTool, call.Name)
 	}
 }

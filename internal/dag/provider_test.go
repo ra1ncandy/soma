@@ -123,8 +123,15 @@ func TestOpenAICompatProvider_ToolsSessionCacheAnd429(t *testing.T) {
 		t.Fatalf("expected sticky run-scoped x-opencode-session header, got %q", gotSess)
 	}
 	rawTools, ok := lastReqBody["tools"].([]any)
-	if !ok || len(rawTools) != 27 {
-		t.Fatalf("expected 27 canonical tools in request body, got %d", len(rawTools))
+	syscalls := dag.CoreSyscalls()
+	if !ok || len(rawTools) != len(syscalls) {
+		t.Fatalf("wire tools (%d) and Layer 0 syscalls (%d) differ", len(rawTools), len(syscalls))
+	}
+	for i, rt := range rawTools {
+		name, _ := rt.(map[string]any)["function"].(map[string]any)["name"].(string)
+		if name != syscalls[i].Name {
+			t.Fatalf("tool %d: wire %q vs syscall %q (lists drifted or unsorted)", i, name, syscalls[i].Name)
+		}
 	}
 
 	// Call 2: normal completion without tool_calls -> Done=true.
