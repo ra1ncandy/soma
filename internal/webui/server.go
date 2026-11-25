@@ -1376,6 +1376,49 @@ func (s *Server) runBranchAsync(exec *dag.Executor, branchID string, maxTurns in
 		_, runErr := exec.ExecuteBranch(runCtx, branchID, maxTurns)
 		closeExecutor(exec)
 		s.recordRunOutcome(branchID, runErr, timeout)
+		var quotaErr *dag.SuspendedQuotaError
+		if errors.As(runErr, &quotaErr) {
+			s.scheduleQuotaResume(branchID, quotaErr.ResumeAt, maxTurns)
+		}
+	}()
+}
+
+// scheduleQuotaResume resumes a branch that suspended on a rate limit once its cooldown expires,
+// unless it was stopped, resumed or deleted in the meantime.
+func (s *Server) scheduleQuotaResume(branchID string, at time.Time, maxTurns int) {
+	delay := time.Until(at) + time.Second
+	if delay < time.Second {
+		delay = time.Second
+	}
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		t := time.NewTimer(delay)
+		defer t.Stop()
+		select {
+		case <-s.stopCh:
+			return
+		case <-t.C:
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		br, err := s.store.GetBranch(ctx, branchID)
+		if err != nil || br.Status != string(dag.StatusSuspendedQuota) {
+			return
+		}
+		s.mu.Lock()
+		busy := s.activeCancels[branchID] != nil
+		s.mu.Unlock()
+		if busy {
+			return
+		}
+		exec, _, err := s.executorForRequest(ctx, "", br.ActiveAccountID)
+		if err != nil {
+			return
+		}
+		_ = s.store.UpdateBranchStatus(ctx, br.ID, string(dag.StatusRunning), br.ActiveAccountID, br.StallCount)
+		s.notify()
+		s.runBranchAsync(exec, br.ID, maxTurns)
 	}()
 }
 
