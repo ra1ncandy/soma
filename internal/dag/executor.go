@@ -17,7 +17,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -49,6 +48,8 @@ const (
 	StatusVerifying          BranchStatus = "verifying"
 	StatusStalled            BranchStatus = "stalled"
 	StatusCompleted          BranchStatus = "completed"
+	// StatusAwaitingInput: the model called clarify; a follow-up message resumes the branch.
+	StatusAwaitingInput BranchStatus = "awaiting_input"
 	// StatusBudgetExhausted: the turn budget ran out before completion; resumable.
 	StatusBudgetExhausted BranchStatus = "budget_exhausted"
 	StatusFailed          BranchStatus = "failed"
@@ -230,7 +231,9 @@ type Executor struct {
 	GUIConfig           *GUISubagentConfig
 	AfterDispatchHook   func(ctx context.Context, entry store.ActionJournalEntry) error
 	OnStep              func(step store.Step)
-	seq                 atomic.Uint64
+	// OnDelta receives streamed model text for a branch as it is generated.
+	OnDelta func(branchID, text string)
+	seq     atomic.Uint64
 }
 
 // NewExecutor builds a configured DAG Executor.
@@ -279,6 +282,9 @@ func NewExecutor(
 		}
 		if lt.ProjectSomaDir == "" && st != nil {
 			lt.ProjectSomaDir = st.SomaDir()
+		}
+		if lt.DelegateFunc == nil {
+			lt.DelegateFunc = ex.RunDelegatedTasks
 		}
 	}
 	return ex
@@ -411,6 +417,7 @@ func (e *Executor) StartRun(ctx context.Context, req RunRequest) (string, string
 	if _, _, err := e.Workspace.PrepareBranchWorkspace(ctx, e.Store, run, branch); err != nil {
 		return "", "", fmt.Errorf("prepare branch workspace: %w", err)
 	}
+	_ = e.Store.IndexTranscript(ctx, []store.TranscriptEntry{{RunID: runID, BranchID: branchID, Kind: "goal", Text: title + "\n" + req.GoalSpec}})
 	return runID, branchID, nil
 }
 
@@ -448,6 +455,13 @@ func (e *Executor) ForkBranch(ctx context.Context, runID, fromStepID, label stri
 	}
 	if _, _, err := e.Workspace.PrepareBranchWorkspace(ctx, e.Store, run, branch); err != nil {
 		return "", fmt.Errorf("prepare forked workspace: %w", err)
+	}
+	// The fork's history ends at fromStepID, so its files must too (not the parent's current
+	// files). Without a checkpoint (older runs) the fork keeps the parent's current files.
+	if _, err := e.RestoreStepFiles(ctx, branchID, fromStepID); err != nil && !errors.Is(err, store.ErrNotFound) {
+		if _, cpErr := e.checkpointAtStep(ctx, fromStepID); cpErr == nil {
+			return "", fmt.Errorf("restore forked workspace to step %s: %w", fromStepID, err)
+		}
 	}
 	return branchID, nil
 }
@@ -693,6 +707,7 @@ func (e *Executor) AppendFollowUpUserTurn(ctx context.Context, branchID, message
 	}); err != nil {
 		return err
 	}
+	e.indexTranscript(ctx, branch.RunID, branch.ID, sid, []compiler.LogEntry{{Kind: "user", Observation: msg}})
 	if e.OnStep != nil {
 		e.OnStep(stepRow)
 	}
@@ -729,6 +744,8 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 		branch.WorkspaceStrategy = strat
 	}
 	_ = e.Store.UpdateRunStatus(ctx, run.ID, string(StatusRunning))
+
+	e.checkpointStart(ctx, run, branch)
 
 	snap, snapID, l2, pendingDeltaAppends, nextTurn, err := e.loadOrInitEpochState(ctx, run, branch)
 	if err != nil {
@@ -793,6 +810,16 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 			}
 			var acqErr error
 			acc, acqErr = e.Scheduler.Acquire(ctx, preferred, e.AccountIDs)
+			// Every eligible account is at its concurrency cap (parallel subagents, swarm workers):
+			// wait for a lease to free up instead of failing the branch.
+			for wait := 0; errors.Is(acqErr, store.ErrNoCapacity) && wait < 600; wait++ {
+				select {
+				case <-ctx.Done():
+					return res, ctx.Err()
+				case <-time.After(500 * time.Millisecond):
+				}
+				acc, acqErr = e.Scheduler.Acquire(ctx, preferred, e.AccountIDs)
+			}
 			if acqErr != nil {
 				var coolErr *ErrAllAccountsCoolingDown
 				if errors.As(acqErr, &coolErr) {
@@ -868,7 +895,12 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 			return res, err
 		}
 
-		genResp, genErr := e.Provider.Generate(ctx, GenerateRequest{
+		genCtx := ctx
+		if e.OnDelta != nil {
+			bid := branch.ID
+			genCtx = WithDeltaSink(ctx, func(t string) { e.OnDelta(bid, t) })
+		}
+		genResp, genErr := e.Provider.Generate(genCtx, GenerateRequest{
 			RunID:     run.ID,
 			BranchID:  branch.ID,
 			AccountID: acc.ID,
@@ -1068,7 +1100,7 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 			}
 			// With sandbox networking enabled a shell command can send data anywhere, so it is an
 			// external write and subject to the untrusted-provenance check, not a local edit.
-			if (tc.Name == "exec" || tc.Name == "bg_exec") && tc.EffectClass == taint.EffectWorkspaceWrite {
+			if (tc.Name == "exec" || tc.Name == "bg_exec" || tc.Name == "execute_code") && tc.EffectClass == taint.EffectWorkspaceWrite {
 				if lt, ok := e.Tools.(*LocalToolRunner); ok && lt.AllowSandboxNetwork {
 					tc.EffectClass = taint.EffectExternalWrite
 				}
@@ -1417,6 +1449,8 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 		if err != nil {
 			return res, err
 		}
+		e.indexTranscript(ctx, run.ID, branch.ID, sid, nextPending)
+		e.checkpointAfterTurn(ctx, run.ID, branch, sid, calls)
 		if e.OnStep != nil {
 			e.OnStep(stepRow)
 		}
@@ -1429,6 +1463,26 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 		res.HeadStepID = sid
 		res.Status = StatusRunning
 		res.TurnsExecuted++
+
+		// clarify: the model asked the user a question. Stop here, durably, until a follow-up
+		// message answers it (any surface: web, CLI chat, bridges, API).
+		if q, asked := clarifyQuestion(calls); asked {
+			_ = e.Store.UpdateBranchStatus(ctx, branch.ID, string(StatusAwaitingInput), acc.ID, branch.StallCount)
+			_ = e.Store.UpdateRunStatus(ctx, run.ID, string(StatusAwaitingInput))
+			_ = e.Store.InsertInboxItem(ctx, store.InboxItem{
+				ID:          fmt.Sprintf("inbox_q_%s_%d", branch.ID, nextTurn),
+				RunID:       run.ID,
+				BranchID:    branch.ID,
+				ItemKind:    "question",
+				Title:       "The agent is asking a question",
+				Summary:     q,
+				ArtifactRef: sid,
+				Urgency:     "normal",
+			})
+			res.Status = StatusAwaitingInput
+			res.FinalSummary = q
+			return res, nil
+		}
 
 		if e.EnforceStallBreaker && e.Profile.MaxStalls > 0 && branch.StallCount >= e.Profile.MaxStalls {
 			_ = e.Store.UpdateBranchStatus(ctx, branch.ID, string(StatusStalled), acc.ID, branch.StallCount)
@@ -2028,7 +2082,7 @@ func (e *Executor) buildEpochInput(run store.Run, activeMem []compiler.MemoryEnt
 		ProjectInstructions: LoadProjectInstructions(run.WorkspacePath),
 		WorkspaceMode:       run.WorkspaceKind,
 		TaskGoal:            run.GoalSpec,
-		Syscalls:            compiler.DefaultCoreSyscalls(),
+		Syscalls:            CoreSyscalls(),
 		SkillIndex:          skillIndexFor(run.WorkspacePath, somaDir),
 		ActiveMemory:        activeMem,
 		Graveyard:           grave,
@@ -2087,6 +2141,11 @@ type LocalToolRunner struct {
 	// OnTriggersChanged is called after cronjob_manage changes triggers.yaml (e.g. to hot-reload
 	// the embedded daemon).
 	OnTriggersChanged func()
+	// DelegateFunc runs delegate_task subtasks as child branches (set by NewExecutor).
+	DelegateFunc func(ctx context.Context, call ToolCall, tasks []DelegateTask, maxTurns int) (ToolOutput, error)
+	// subagentDepth > 0 marks a runner used by a delegated child: delegation and other
+	// SubagentBlocked tools are refused.
+	subagentDepth int
 }
 
 // Close stops this runner's background jobs and releases anything registered through OnClose.
@@ -2472,7 +2531,7 @@ func (r *LocalToolRunner) Execute(ctx context.Context, call ToolCall) (ToolOutpu
 		q := strings.ToLower(strings.TrimSpace(query))
 		var sb strings.Builder
 		var matches int
-		for _, sc := range compiler.DefaultCoreSyscalls() {
+		for _, sc := range CoreSyscalls() {
 			if q == "" || strings.Contains(strings.ToLower(sc.Name), q) || strings.Contains(strings.ToLower(sc.Signature), q) {
 				fmt.Fprintf(&sb, "- [core] %s: %s\n", sc.Name, sc.Signature)
 				matches++
@@ -2640,8 +2699,7 @@ func (r *LocalToolRunner) Execute(ctx context.Context, call ToolCall) (ToolOutpu
 			return ToolOutput{}, errors.New("session_search: store not initialized")
 		}
 		query, _ := args["query"].(string)
-		q := strings.ToLower(strings.TrimSpace(query))
-		if q == "" {
+		if strings.TrimSpace(query) == "" {
 			return ToolOutput{}, errors.New("session_search requires non-empty query")
 		}
 		limitF, _ := args["limit"].(float64)
@@ -2652,58 +2710,11 @@ func (r *LocalToolRunner) Execute(ctx context.Context, call ToolCall) (ToolOutpu
 		if limit > 20 {
 			limit = 20
 		}
-		runs, err := r.vm.Store().ListRuns(ctx)
+		text, tier, err := searchSessions(ctx, r.vm.Store(), query, limit)
 		if err != nil {
 			return ToolOutput{}, err
 		}
-		terms := strings.Fields(q)
-		type scoredRun struct {
-			run   store.Run
-			score int
-		}
-		var matches []scoredRun
-		for _, rn := range runs {
-			hay := strings.ToLower(rn.ID + " " + rn.Title + " " + rn.GoalSpec + " " + rn.Status)
-			sc := 0
-			for _, term := range terms {
-				if strings.Contains(hay, term) {
-					sc++
-				}
-			}
-			if sc > 0 {
-				matches = append(matches, scoredRun{run: rn, score: sc})
-			}
-		}
-		sort.SliceStable(matches, func(i, j int) bool {
-			if matches[i].score != matches[j].score {
-				return matches[i].score > matches[j].score
-			}
-			return matches[i].run.CreatedAt > matches[j].run.CreatedAt
-		})
-		if len(matches) == 0 {
-			return ToolOutput{
-				NameHint:  "session_search.txt",
-				Content:   []byte(fmt.Sprintf("session_search: 0 past runs matching %q", query)),
-				TrustTier: "trusted_repo",
-			}, nil
-		}
-		if len(matches) > limit {
-			matches = matches[:limit]
-		}
-		var sb strings.Builder
-		fmt.Fprintf(&sb, "session_search: top %d past run(s) matching %q:\n", len(matches), query)
-		for i, m := range matches {
-			goal := m.run.GoalSpec
-			if len(goal) > 160 {
-				goal = goal[:157] + "..."
-			}
-			fmt.Fprintf(&sb, "%d. [%s] status=%s title=%q goal=%q\n", i+1, m.run.ID, m.run.Status, m.run.Title, goal)
-		}
-		return ToolOutput{
-			NameHint:  "session_search.txt",
-			Content:   []byte(strings.TrimRight(sb.String(), "\n")),
-			TrustTier: "trusted_repo",
-		}, nil
+		return ToolOutput{NameHint: "session_search.txt", Content: []byte(text), TrustTier: tier}, nil
 
 	case "skill_manage":
 		action, _ := args["action"].(string)
@@ -2789,6 +2800,12 @@ func (r *LocalToolRunner) Execute(ctx context.Context, call ToolCall) (ToolOutpu
 		}, nil
 
 	default:
+		if def, ok := lookupTool(call.Name); ok && def.Handler != nil {
+			if def.SubagentBlocked && r.subagentDepth > 0 {
+				return ToolOutput{}, fmt.Errorf("%s is not available to delegated subagents; report back to the parent instead", call.Name)
+			}
+			return def.Handler(ctx, r, call, args)
+		}
 		return ToolOutput{}, fmt.Errorf("%w: %q (use tool_search to inspect available syscalls)", ErrUnknownTool, call.Name)
 	}
 }

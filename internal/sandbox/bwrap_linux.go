@@ -153,7 +153,13 @@ func BuildBwrapArgs(spec ExecSpec) ([]string, error) {
 		)
 	}
 
-	for _, kv := range ScrubEnv(spec.ExtraEnv) {
+	rpcPath := ""
+	if spec.RPCSocket != "" {
+		hostDir := filepath.Dir(spec.RPCSocket)
+		args = append(args, "--bind", hostDir, rpcSandboxDir)
+		rpcPath = rpcSandboxDir + "/" + filepath.Base(spec.RPCSocket)
+	}
+	for _, kv := range ScrubEnv(envWithRPC(spec, rpcPath)) {
 		k, v, ok := strings.Cut(kv, "=")
 		if ok {
 			args = append(args, "--setenv", k, v)

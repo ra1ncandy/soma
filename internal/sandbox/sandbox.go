@@ -26,6 +26,26 @@ type ExecSpec struct {
 	ExtraEnv            map[string]string
 	AllowNetwork        bool
 	Timeout             time.Duration
+	// RPCSocket is a host unix socket the sandboxed process may connect to (the tool RPC of
+	// execute_code). Its in-sandbox path is passed as $SOMA_RPC_SOCKET. Nothing else on the
+	// host becomes reachable, even without network access.
+	RPCSocket string
+}
+
+// rpcSandboxDir is where bwrap mounts the directory holding RPCSocket.
+const rpcSandboxDir = "/soma-rpc"
+
+// envWithRPC returns spec.ExtraEnv plus SOMA_RPC_SOCKET=sandboxPath when an RPC socket is set.
+func envWithRPC(spec ExecSpec, sandboxPath string) map[string]string {
+	if spec.RPCSocket == "" {
+		return spec.ExtraEnv
+	}
+	env := make(map[string]string, len(spec.ExtraEnv)+1)
+	for k, v := range spec.ExtraEnv {
+		env[k] = v
+	}
+	env["SOMA_RPC_SOCKET"] = sandboxPath
+	return env
 }
 
 // ExecResult holds captured output, exit status, and backend metadata.

@@ -20,8 +20,8 @@ import (
 	"github.com/ra1ncandy/soma/internal/replay"
 	"github.com/ra1ncandy/soma/internal/sandbox"
 	"github.com/ra1ncandy/soma/internal/store"
-	"github.com/ra1ncandy/soma/internal/webui"
 	"github.com/ra1ncandy/soma/internal/vmem"
+	"github.com/ra1ncandy/soma/internal/webui"
 )
 
 const Version = "v0.4.0 (RFC-0001 v2.1 Complete — Shadow Gauntlet & Branching Search)"
@@ -266,9 +266,10 @@ func newResumeCmd() *cobra.Command {
 func newForkCmd() *cobra.Command {
 	var dir, label string
 	cmd := &cobra.Command{
-		Use:   "fork <step_id>",
-		Short: "Fork a speculative branch with an isolated workspace from step_id",
-		Args:  cobra.ExactArgs(1),
+		Use:     "fork <step_id>",
+		Aliases: []string{"rewind"},
+		Short:   "Fork (rewind) a branch at step_id: history and workspace files as they were after that step",
+		Args:    cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			absDir, err := filepath.Abs(dir)
 			if err != nil {

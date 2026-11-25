@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -143,8 +144,20 @@ var (
 
 // openAITools returns the canonical tool schema list, built once (it is immutable).
 func openAITools() []map[string]any {
-	openAIToolsOnce.Do(func() { openAIToolsCache = canonicalOpenAITools() })
+	openAIToolsOnce.Do(func() {
+		tools := append(canonicalOpenAITools(), registryWireSchemas()...)
+		sort.SliceStable(tools, func(i, j int) bool { return wireToolName(tools[i]) < wireToolName(tools[j]) })
+		openAIToolsCache = tools
+	})
 	return openAIToolsCache
+}
+
+func wireToolName(t map[string]any) string {
+	if fn, ok := t["function"].(map[string]any); ok {
+		n, _ := fn["name"].(string)
+		return n
+	}
+	return ""
 }
 
 func simpleTool(name, description string, required []string, props map[string]any) map[string]any {
@@ -823,7 +836,7 @@ func (p *OpenAICompatProvider) Generate(ctx context.Context, req GenerateRequest
 		retryAfterHeader = resp.Header.Get("Retry-After")
 
 		if statusCode == http.StatusOK && strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
-			completion, streamErr := readChatStream(resp.Body, cancelReq, p.StreamIdleTimeout, p.OnDelta)
+			completion, streamErr := readChatStream(resp.Body, cancelReq, p.StreamIdleTimeout, deltaSink(ctx, p.OnDelta))
 			_ = resp.Body.Close()
 			cancelReq()
 			if streamErr != nil {
@@ -1013,6 +1026,9 @@ func (p *OpenAICompatProvider) Generate(ctx context.Context, req GenerateRequest
 // known to be local; anything else (MCP tools, brokers, future tools) is assumed to reach outside
 // the sandbox, so it is subject to taint checks instead of being waved through as read-only.
 func inferToolEffectClass(toolName string) taint.EffectClass {
+	if def, ok := lookupTool(toolName); ok {
+		return def.Effect
+	}
 	switch toolName {
 	case "fs_read", "fs_list", "fs_grep", "page_slice", "page_grep", "page_search", "memory_search", "session_search", "bg_poll", "tool_search":
 		return taint.EffectReadOnly

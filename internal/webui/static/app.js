@@ -3,6 +3,9 @@
 
   const csrfToken = document.querySelector('meta[name="soma-csrf"]')?.content || "";
 
+  // Streamed model text per branch, filled by SSE "delta" events.
+  const liveText = new Map();
+
   const appState = {
     view: "tasks",
     connTab: "installed",
@@ -1224,6 +1227,10 @@
             else appState.openAccordions.delete(accKey);
           });
           feed.appendChild(det);
+          // Live model output streamed over SSE "delta" events (see connectSSE).
+          const live = el("div", { className: "live-stream", text: liveText.get(branch.id) || "" });
+          live.dataset.branch = branch.id;
+          feed.appendChild(live);
           return;
         }
 
@@ -4330,7 +4337,27 @@
   function connectSSE() {
     const es = new EventSource("/api/events");
     es.addEventListener("state", () => {
+      // A refresh means a step was committed or a tool started: the streamed text is now part of
+      // the recorded trace, so the live buffer starts over.
+      liveText.clear();
       refreshAll().catch(() => {});
+    });
+    es.addEventListener("delta", (ev) => {
+      let d;
+      try {
+        d = JSON.parse(ev.data);
+      } catch (_) {
+        return;
+      }
+      if (!d || !d.branch_id || typeof d.text !== "string") return;
+      const next = ((liveText.get(d.branch_id) || "") + d.text).slice(-20000);
+      liveText.set(d.branch_id, next);
+      for (const node of document.querySelectorAll(".live-stream")) {
+        if (node.dataset.branch === d.branch_id) {
+          node.textContent = next;
+          node.scrollIntoView({ block: "nearest" });
+        }
+      }
     });
     es.onerror = () => {
       // EventSource automatically reconnects.

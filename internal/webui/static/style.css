@@ -1841,3 +1841,14 @@ textarea.composer-input {
   opacity: 0.55;
   cursor: not-allowed;
 }
+
+/* Live model output streamed while a turn is generating. */
+.live-stream {
+  white-space: pre-wrap;
+  color: var(--text);
+  margin: 6px 0 0;
+  line-height: 1.5;
+}
+.live-stream:empty {
+  display: none;
+}

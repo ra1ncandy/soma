@@ -168,6 +168,9 @@ func (s *Store) DeleteRun(ctx context.Context, id string) (bool, error) {
 			WHERE provenance_step_id IN (SELECT id FROM steps WHERE run_id = ?)`, id); err != nil {
 			return err
 		}
+		if _, err := conn.ExecContext(ctx, `DELETE FROM transcript_fts WHERE run_id = ?`, id); err != nil {
+			return err
+		}
 		res, err := conn.ExecContext(ctx, `DELETE FROM runs WHERE id = ?`, id)
 		if err != nil {
 			return err
@@ -2040,6 +2043,28 @@ func (s *Store) SweepUnreferencedBlobs(ctx context.Context, minAge time.Duration
 		}
 		if json.Unmarshal(raw, &delta) == nil && delta.LiveTail.Viewport != nil && len(delta.LiveTail.Viewport.BlobHash) == 64 {
 			referenced[delta.LiveTail.Viewport.BlobHash] = true
+		}
+	}
+	// Workspace checkpoints: the manifest blob and every file blob it names.
+	manifests, err := s.CheckpointManifestHashes(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	for _, mh := range manifests {
+		referenced[mh] = true
+		raw, gErr := s.blobs.Get(mh)
+		if gErr != nil {
+			continue
+		}
+		var files map[string]struct {
+			Blob string `json:"b"`
+		}
+		if json.Unmarshal(raw, &files) == nil {
+			for _, f := range files {
+				if len(f.Blob) == 64 {
+					referenced[f.Blob] = true
+				}
+			}
 		}
 	}
 	return s.blobs.Sweep(referenced, minAge)

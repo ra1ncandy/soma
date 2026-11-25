@@ -65,6 +65,10 @@ func GenerateSBPL(spec ExecSpec) string {
 	if !spec.AllowNetwork {
 		b.WriteString("(deny network*)\n")
 	}
+	if spec.RPCSocket != "" {
+		fmt.Fprintf(&b, "(allow network-outbound (remote unix-socket (path-literal %q)))\n", spec.RPCSocket)
+		fmt.Fprintf(&b, "(allow file-read* file-write* (literal %q))\n", spec.RPCSocket)
+	}
 	return b.String()
 }
 
@@ -76,7 +80,7 @@ func (s *seatbeltBackend) Command(ctx context.Context, spec ExecSpec) (*exec.Cmd
 	args := append([]string{"-p", GenerateSBPL(spec), spec.Command}, spec.Args...)
 	cmd := exec.CommandContext(ctx, s.binPath, args...)
 	cmd.Dir = spec.WorkspaceDir
-	cmd.Env = ScrubEnv(spec.ExtraEnv)
+	cmd.Env = ScrubEnv(envWithRPC(spec, spec.RPCSocket))
 	return cmd, nil
 }
 
@@ -95,7 +99,7 @@ func (s *seatbeltBackend) Exec(ctx context.Context, spec ExecSpec) (ExecResult, 
 	args := append([]string{"-p", profile, spec.Command}, spec.Args...)
 	cmd := exec.CommandContext(runCtx, s.binPath, args...)
 	cmd.Dir = spec.WorkspaceDir
-	cmd.Env = ScrubEnv(spec.ExtraEnv)
+	cmd.Env = ScrubEnv(envWithRPC(spec, spec.RPCSocket))
 
 	start := time.Now()
 	var stdout, stderr bytes.Buffer

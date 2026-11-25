@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"os"
@@ -184,49 +183,15 @@ func newChatCmd() *cobra.Command {
 				execDag.GUIConfig = &dag.GUISubagentConfig{Provider: prov, ModelID: gm, MCPManager: mcpMgr}
 			}
 
-			fmt.Printf("soma chat (model=%s workspace=%s browser=%v desktop=%v)\n", modelID, absWS, enableBrowser, enableDesktop)
-			fmt.Println("Commands: /status, /exit")
-
-			scanner := bufio.NewScanner(os.Stdin)
-			for {
-				fmt.Print("\nsoma> ")
-				if !scanner.Scan() {
-					break
-				}
-				line := strings.TrimSpace(scanner.Text())
-				if line == "" {
-					continue
-				}
-				switch line {
-				case "/exit", "/quit":
-					return nil
-				case "/status":
-					runs, _ := st.ListRuns(cmd.Context())
-					fmt.Printf("runs=%d model=%s\n", len(runs), modelID)
-					continue
-				}
-				_, brID, err := execDag.StartRun(cmd.Context(), dag.RunRequest{
-					Title:         "chat",
-					WorkspacePath: absWS,
-					GoalSpec:      line,
-					AccountIDs:    []string{accID},
-				})
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "error: %v\n", err)
-					continue
-				}
-				res, err := execDag.ExecuteBranch(cmd.Context(), brID, maxTurns)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "error: %v\n", err)
-					continue
-				}
-				if res.FinalSummary != "" {
-					fmt.Println(res.FinalSummary)
-				} else {
-					fmt.Printf("[completed turns=%d tokens=%d cached=%d]\n", res.TurnsExecuted, res.TotalTokens, res.CacheReadToks)
-				}
+			out := cmd.OutOrStdout()
+			streamed := false
+			if p, ok := prov.(*dag.OpenAICompatProvider); ok {
+				// Stream model text as it arrives.
+				p.OnDelta = func(text string) { streamed = true; fmt.Fprint(out, text) }
 			}
-			return scanner.Err()
+			fmt.Fprintf(out, "soma chat (model=%s workspace=%s browser=%v desktop=%v) — /help for commands\n", modelID, absWS, enableBrowser, enableDesktop)
+			sess := &chatSession{st: st, ex: execDag, ws: absWS, accID: accID, modelID: modelID, maxTurns: maxTurns, out: out, streamed: &streamed}
+			return sess.loop(cmd.Context(), cmd.InOrStdin())
 		},
 	}
 	cmd.Flags().StringVar(&wsDir, "dir", ".", "Workspace directory (auto-initializes .soma/)")
