@@ -20,6 +20,7 @@ import (
 	"github.com/ra1ncandy/soma/internal/replay"
 	"github.com/ra1ncandy/soma/internal/sandbox"
 	"github.com/ra1ncandy/soma/internal/store"
+	"github.com/ra1ncandy/soma/internal/webui"
 	"github.com/ra1ncandy/soma/internal/vmem"
 )
 
@@ -110,7 +111,7 @@ func newInitCmd() *cobra.Command {
 			if _, err := os.Stat(cfgPath); errors.Is(err, os.ErrNotExist) {
 				cfg := projectConfig{
 					Version:       2,
-					DefaultModel:  "mock-worker-v1",
+					DefaultModel:  os.Getenv("SOMA_MODEL"),
 					DefaultTier:   "worker",
 					WorkspaceKind: wsKind,
 					APIBaseURL:    os.Getenv("SOMA_API_BASE"),
@@ -592,17 +593,33 @@ func selectProvider(workspaceDir string, useMock bool) (dag.ModelProvider, strin
 				if baseURL == "" {
 					baseURL = cfg.APIBaseURL
 				}
-				if model == "" {
+				// Older `soma init` wrote the mock model as the default; never send it to a real API.
+				if model == "" && !strings.HasPrefix(cfg.DefaultModel, "mock-") {
 					model = cfg.DefaultModel
 				}
 			}
 		}
 	}
 	if baseURL == "" {
-		return nil, "", errors.New("no provider configured (pass --mock or set SOMA_API_BASE)")
+		// Fall back to what the web dashboard configured (Settings → Models & Providers), so the
+		// CLI and the dashboard use the same accounts.
+		var st *store.Store
+		if s, err := openStore(workspaceDir); err == nil {
+			st = s
+			defer func() { _ = st.Close() }()
+		}
+		if prov, m, ok := webui.ResolveDefaultProviderFromHarness(context.Background(), st, workspaceDir); ok {
+			if _, isMock := prov.(*dag.MockProvider); !isMock {
+				if model != "" {
+					m = model
+				}
+				return prov, m, nil
+			}
+		}
+		return nil, "", errors.New("no provider configured: set SOMA_API_BASE and SOMA_MODEL, add a model in the dashboard (soma web → Settings → Models & Providers), or pass --mock")
 	}
 	if model == "" {
-		model = "gpt-6.2-sol"
+		return nil, "", fmt.Errorf("no model configured for %s: set SOMA_MODEL or default_model in .soma/config.yaml", baseURL)
 	}
 	prov := dag.NewOpenAICompatProvider(baseURL, os.Getenv("SOMA_API_KEY"))
 	if mt, err := strconv.Atoi(strings.TrimSpace(os.Getenv("SOMA_MAX_TOKENS"))); err == nil && mt > 0 {
