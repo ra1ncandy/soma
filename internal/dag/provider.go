@@ -1014,8 +1014,14 @@ func (p *OpenAICompatProvider) Generate(ctx context.Context, req GenerateRequest
 // the sandbox, so it is subject to taint checks instead of being waved through as read-only.
 func inferToolEffectClass(toolName string) taint.EffectClass {
 	switch toolName {
-	case "fs_read", "fs_list", "fs_grep", "page_slice", "page_grep", "page_search", "memory_search", "session_search", "publish_finding", "bg_poll", "web_search", "web_extract", "vision_analyze", "tool_search":
+	case "fs_read", "fs_list", "fs_grep", "page_slice", "page_grep", "page_search", "memory_search", "session_search", "bg_poll", "tool_search":
 		return taint.EffectReadOnly
+	case "web_search", "web_extract", "vision_analyze":
+		// Outbound requests: their arguments are an egress channel once the run is tainted.
+		return taint.EffectExternalRead
+	case "publish_finding":
+		// Persists shared memory, so it goes through the same quarantine as memory_write.
+		return taint.EffectWorkspaceWrite
 	case "fs_write", "fs_patch", "exec", "bg_exec", "bg_kill", "branch_fork", "browser_task", "desktop_task", "memory_write", "skill_manage", "cronjob_manage":
 		return taint.EffectWorkspaceWrite
 	default:

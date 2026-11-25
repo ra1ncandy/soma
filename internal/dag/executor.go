@@ -1076,6 +1076,7 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 				EffectClass:       tc.EffectClass,
 				ReferencedPageIDs: tc.ReferencedPageIDs,
 				ExplicitDeny:      tc.ExplicitDeny,
+				ArgsJSON:          tc.ArgsJSON,
 			})
 			if err != nil {
 				return res, err
@@ -1155,7 +1156,7 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 		canParallelReadOnly := len(planned) > 1 && e.AfterDispatchHook == nil
 		if canParallelReadOnly {
 			for _, pc := range planned {
-				if pc.decision == taint.DecisionDeny || pc.spec.EffectClass != taint.EffectReadOnly {
+				if pc.decision == taint.DecisionDeny || (pc.spec.EffectClass != taint.EffectReadOnly && pc.spec.EffectClass != taint.EffectExternalRead) {
 					canParallelReadOnly = false
 					break
 				}
@@ -1485,8 +1486,8 @@ func (e *Executor) recoverPendingActions(
 			_ = e.Store.MarkActionStatus(ctx, entry.ActionID, "aborted", "", "recovered prepared action before dispatch", "")
 		case "dispatched":
 			switch taint.EffectClass(entry.EffectClass) {
-			case taint.EffectReadOnly, taint.EffectWorkspaceWrite:
-				_ = e.Store.MarkActionStatus(ctx, entry.ActionID, "aborted", "", "recovered safe local action after crash", "")
+			case taint.EffectReadOnly, taint.EffectWorkspaceWrite, taint.EffectExternalRead:
+				_ = e.Store.MarkActionStatus(ctx, entry.ActionID, "aborted", "", "recovered side-effect-free or local action after crash", "")
 			case "idempotent_write":
 				var out ToolOutput
 				var recDone bool
@@ -1517,7 +1518,9 @@ func (e *Executor) recoverPendingActions(
 				}
 				extraL2 = append(extraL2, entryL2...)
 				pendingAppends = entryL2
-			case taint.EffectIrreversible:
+			default:
+				// external_write, irreversible_write and any unknown class: the side effect may
+				// already have happened outside the workspace, so never auto-retry.
 				if e.Reconciler != nil {
 					outcome, recOut, recErr := e.Reconciler.Reconcile(ctx, entry)
 					if recErr == nil && outcome == OutcomeSucceeded {
@@ -1533,15 +1536,15 @@ func (e *Executor) recoverPendingActions(
 						continue
 					}
 				}
-				// NEVER auto-retry uncertain irreversible writes!
-				_ = e.Store.MarkActionStatus(ctx, entry.ActionID, "ambiguous", "", "", "process crashed while irreversible_write was dispatched")
+				// NEVER auto-retry uncertain external or irreversible writes!
+				_ = e.Store.MarkActionStatus(ctx, entry.ActionID, "ambiguous", "", "", "process crashed while "+entry.EffectClass+" was dispatched")
 				_ = e.Store.InsertInboxItem(ctx, store.InboxItem{
 					ID:          "inbox_rec_" + entry.ActionID,
 					RunID:       run.ID,
 					BranchID:    branch.ID,
 					ItemKind:    "reconcile",
 					Title:       fmt.Sprintf("Reconcile ambiguous %s (%s)", entry.ToolName, entry.ActionID),
-					Summary:     "Crash occurred while irreversible_write was in-flight. Confirm external state via soma reconcile.",
+					Summary:     "Crash occurred while " + entry.EffectClass + " was in-flight. Confirm external state via soma reconcile.",
 					ArtifactRef: entry.ActionID,
 					Urgency:     "urgent",
 				})
@@ -1550,7 +1553,7 @@ func (e *Executor) recoverPendingActions(
 				return nil, &SuspendedReconcileError{
 					ActionID: entry.ActionID,
 					ToolName: entry.ToolName,
-					Reason:   "uncertain irreversible_write suspended safely",
+					Reason:   "uncertain " + entry.EffectClass + " suspended safely",
 				}
 			}
 		}
@@ -2135,7 +2138,7 @@ func (r *LocalToolRunner) Execute(ctx context.Context, call ToolCall) (ToolOutpu
 		return ToolOutput{
 			NameHint:  "bg_poll.txt",
 			Content:   []byte(out),
-			TrustTier: "trusted_repo",
+			TrustTier: shellOutputTier(r.AllowSandboxNetwork),
 		}, nil
 
 	case "bg_kill":
@@ -2150,7 +2153,7 @@ func (r *LocalToolRunner) Execute(ctx context.Context, call ToolCall) (ToolOutpu
 		return ToolOutput{
 			NameHint:  "bg_kill.txt",
 			Content:   []byte(out),
-			TrustTier: "trusted_repo",
+			TrustTier: shellOutputTier(r.AllowSandboxNetwork),
 		}, nil
 
 	case "web_search":
@@ -2194,12 +2197,12 @@ func (r *LocalToolRunner) Execute(ctx context.Context, call ToolCall) (ToolOutpu
 			if err != nil {
 				if errors.Is(err, sandbox.ErrCommandTimeout) {
 					body := fmt.Sprintf("exit_code=-1 (TIMEOUT after %s; use timeout_sec or bg_exec for longer commands)\n%s", timeout, string(res.Combined))
-					return ToolOutput{NameHint: "exec.log", Content: []byte(body), TrustTier: "trusted_repo"}, nil
+					return ToolOutput{NameHint: "exec.log", Content: []byte(body), TrustTier: shellOutputTier(r.AllowSandboxNetwork)}, nil
 				}
 				return ToolOutput{}, err
 			}
 			body := fmt.Sprintf("exit_code=%d\n%s", res.ExitCode, string(res.Combined))
-			return ToolOutput{NameHint: "exec.log", Content: []byte(body), TrustTier: "trusted_repo"}, nil
+			return ToolOutput{NameHint: "exec.log", Content: []byte(body), TrustTier: shellOutputTier(r.AllowSandboxNetwork)}, nil
 		}
 		if !r.AllowUnsandboxedExec {
 			return ToolOutput{}, ErrUnsandboxedExec

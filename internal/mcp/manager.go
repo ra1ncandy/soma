@@ -247,6 +247,23 @@ func (m *Manager) IsIsolatedDesktop(serverName string) bool {
 	return false
 }
 
+// ToolAnnotations returns the behaviour hints a server declared for one of its tools.
+// Hints are untrusted server metadata: callers may use them only to tighten policy.
+func (m *Manager) ToolAnnotations(serverName, toolName string) *sdkmcp.ToolAnnotations {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	ms, ok := m.servers[strings.TrimSpace(serverName)]
+	if !ok {
+		return nil
+	}
+	for _, t := range ms.tools {
+		if t.Name == toolName {
+			return t.Annotations
+		}
+	}
+	return nil
+}
+
 // ListServers returns sorted names of all connected MCP servers.
 func (m *Manager) ListServers() []string {
 	m.mu.RLock()

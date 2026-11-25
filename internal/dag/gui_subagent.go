@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
+
 	"github.com/ra1ncandy/soma/internal/compiler"
 	"github.com/ra1ncandy/soma/internal/mcp"
 	"github.com/ra1ncandy/soma/internal/store"
@@ -284,9 +286,15 @@ func mcpToolLooksReadOnly(tLower string) bool {
 	return false
 }
 
-// resolveMCPCallEffectClass classifies an mcp_call action so isolated Docker desktop/browser
-// interactions are EffectWorkspaceWrite (avoiding taint deadlock after observing screen data),
-// read-only snapshots/screenshots are EffectReadOnly, and host/remote MCP writes stay EffectExternalWrite.
+// resolveMCPCallEffectClass classifies an mcp_call action:
+//   - a tool the server declares destructive (destructiveHint=true) is irreversible_write and
+//     always needs approval;
+//   - on an isolated Docker desktop/browser server, observations are read_only and interactions
+//     workspace_write (avoiding taint deadlock after observing screen data);
+//   - elsewhere a read tool is external_read: it reaches a third party, so its arguments are
+//     bounded once the run is tainted. A tool counts as a read only if its name says so and the
+//     server does not contradict that with annotations (server hints only ever tighten policy);
+//   - everything else is external_write.
 func resolveMCPCallEffectClass(mgr *mcp.Manager, argsJSON string) taint.EffectClass {
 	var args map[string]any
 	if json.Unmarshal([]byte(argsJSON), &args) != nil {
@@ -295,11 +303,26 @@ func resolveMCPCallEffectClass(mgr *mcp.Manager, argsJSON string) taint.EffectCl
 	srv, _ := args["server"].(string)
 	tool, _ := args["tool"].(string)
 	tLower := strings.ToLower(strings.TrimSpace(tool))
-	if mcpToolLooksReadOnly(tLower) {
-		return taint.EffectReadOnly
+	var ann *sdkmcp.ToolAnnotations
+	if mgr != nil {
+		ann = mgr.ToolAnnotations(srv, tool)
+	}
+	if ann != nil && ann.DestructiveHint != nil && *ann.DestructiveHint && !ann.ReadOnlyHint {
+		return taint.EffectIrreversible
+	}
+	looksRead := mcpToolLooksReadOnly(tLower)
+	if ann != nil && !ann.ReadOnlyHint {
+		// The server published annotations and did not mark this tool read-only.
+		looksRead = false
 	}
 	if mgr != nil && mgr.IsIsolatedDesktop(srv) {
+		if looksRead || mcpToolLooksReadOnly(tLower) {
+			return taint.EffectReadOnly
+		}
 		return taint.EffectWorkspaceWrite
+	}
+	if looksRead {
+		return taint.EffectExternalRead
 	}
 	return taint.EffectExternalWrite
 }

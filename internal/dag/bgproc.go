@@ -23,6 +23,8 @@ type bgJob struct {
 	startedAt    time.Time
 	cmd          *exec.Cmd
 	sandboxed    bool
+	// networked jobs can download arbitrary content, so their output is untrusted.
+	networked bool
 
 	mu sync.Mutex
 	// buf holds the most recent output. dropped counts bytes discarded from its front, so
@@ -35,6 +37,15 @@ type bgJob struct {
 	exitErr         string
 	endedAt         time.Time
 	lastPage string
+}
+
+// shellOutputTier is the provenance of sandboxed shell output. With sandbox networking on, a
+// command can fetch arbitrary remote content (curl, git clone, pip), so its output is untrusted.
+func shellOutputTier(networked bool) string {
+	if networked {
+		return "untrusted_external"
+	}
+	return "trusted_repo"
 }
 
 func (j *bgJob) Write(p []byte) (int, error) {
@@ -135,6 +146,7 @@ func (m *BgProcessManager) Start(spec BgStartSpec) (string, error) {
 		startedAt:    time.Now(),
 		cmd:          cmd,
 		sandboxed:    sandboxed,
+		networked:    spec.AllowNetwork,
 	}
 	cmd.Stdout = job
 	cmd.Stderr = job
@@ -280,7 +292,7 @@ func (m *BgProcessManager) PollWait(ctx context.Context, vm *vmem.Manager, jobID
 			RunID:                runID,
 			NameHint:             job.id + ".log",
 			Content:              rawOut,
-			TrustTier:            "trusted_repo",
+			TrustTier:            shellOutputTier(job.networked),
 			InlineThresholdBytes: inlineThreshold,
 		})
 		if err == nil {
