@@ -910,7 +910,13 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 		})
 		if genErr != nil {
 			var rlErr *RateLimitError
-			if errors.As(genErr, &rlErr) {
+			var outage *TransientError
+			if !errors.As(genErr, &rlErr) && errors.As(genErr, &outage) && e.AllowFailover && len(e.AccountIDs) > 1 {
+				// The provider already retried; an account that keeps failing with 5xx is treated
+				// like a short rate limit so the branch fails over to the next account.
+				rlErr = &RateLimitError{AccountID: acc.ID, RetryAfter: time.Minute, Err: genErr}
+			}
+			if rlErr != nil {
 				_ = e.Scheduler.RecordRateLimit(ctx, acc.ID, rlErr.RetryAfter, rlErr.Error())
 				_ = e.releaseLease(ctx, acc.ID, 0)
 				if e.AllowFailover && failoverAttempts < len(e.AccountIDs)+1 {

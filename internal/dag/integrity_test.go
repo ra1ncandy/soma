@@ -214,6 +214,38 @@ func TestTerminalStatusesAndPollExemptStallBreaker(t *testing.T) {
 	})
 }
 
+// A provider outage (5xx after retries) on one account fails over to the next account instead
+// of ending the run.
+func TestOutageFailsOverToNextAccount(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), ".soma"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	for _, id := range []string{"down", "up"} {
+		if err := st.UpsertAccount(ctx, store.Account{ID: id, Provider: "local", ModelID: id, BillingMode: "local", MaxConcurrent: 2}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	prov := &scriptedProvider{fn: func(_ int, req GenerateRequest) (*GenerateResponse, error) {
+		if req.AccountID == "down" {
+			return nil, &TransientError{AccountID: "down", StatusCode: 503, Err: errors.New("unavailable")}
+		}
+		return &GenerateResponse{Done: true, FinalSummary: "served by " + req.AccountID, StateHash: "d"}, nil
+	}}
+	ex := NewExecutor(st, prov, &recordingToolRunner{}, compiler.WorkerProfile())
+	ex.AllowFailover = true
+	_, br, err := ex.StartRun(ctx, RunRequest{WorkspacePath: t.TempDir(), GoalSpec: "x", AccountIDs: []string{"down", "up"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := ex.ExecuteBranch(ctx, br, 4)
+	if err != nil || res.Status != StatusCompleted || res.FinalSummary != "served by up" {
+		t.Fatalf("want failover to 'up', got res=%+v err=%v", res, err)
+	}
+}
+
 // A crash while an external_write (MCP tool, broker call) was dispatched must never be
 // silently skipped or re-executed: it becomes ambiguous and the branch suspends for reconcile.
 func TestCrashRecovery_DispatchedExternalWriteSuspendsForReconcile(t *testing.T) {
