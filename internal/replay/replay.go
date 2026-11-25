@@ -101,15 +101,20 @@ func (r *Replayer) Replay(ctx context.Context, branchID string, opts ReplayOptio
 	switch opts.Mode {
 	case ModeExact:
 		for _, s := range ancestry {
-			frame, err := compiler.ReconstructFrame(ctx, r.Store, s.ID, prof)
-			if err != nil {
-				return nil, fmt.Errorf("exact replay step %s: %w", s.ID, err)
-			}
 			origAct := loadActionKey(r.Store, s)
 			toks := s.InputTokens + s.CacheReadTokens + s.OutputTokens
 			// Kernel-synthesised steps (user follow-ups, crash recovery, manual reconcile) never sent a
-			// compiled frame to a model, so they carry no frame hash to reproduce.
+			// compiled frame to a model, so they carry no frame hash to reproduce. Their deltas are
+			// still part of every later step's reconstruction, which is verified normally.
 			synthetic := s.ModelID == "user" || s.ModelID == "recovery" || s.ModelID == "reconciler"
+			var frame compiler.CompiledFrame
+			if !synthetic {
+				var err error
+				frame, err = compiler.ReconstructFrame(ctx, r.Store, s.ID, prof)
+				if err != nil && !errors.Is(err, compiler.ErrFrameHashMismatch) {
+					return nil, fmt.Errorf("exact replay step %s: %w", s.ID, err)
+				}
+			}
 			verified := synthetic || frame.CompiledFrameHash == s.CompiledFrameHash
 			report.StepsChecked++
 			if verified {
