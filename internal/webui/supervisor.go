@@ -12,6 +12,7 @@ import (
 	"github.com/ra1ncandy/soma/internal/bridge"
 	"github.com/ra1ncandy/soma/internal/compiler"
 	"github.com/ra1ncandy/soma/internal/daemon"
+	"github.com/ra1ncandy/soma/internal/dag"
 )
 
 // TriggerRunSummaryDTO reports the latest daemon execution status for a configured trigger.
@@ -112,6 +113,19 @@ func (rs *RuntimeSupervisor) Reload() {
 		Version:      rs.server.cfg.Version,
 		Provider:     prov,
 		RunStarter:   rs.runFromBridge,
+		BranchResumer: func(ctx context.Context, branchID string) error {
+			br, err := rs.server.store.GetBranch(ctx, branchID)
+			if err != nil {
+				return err
+			}
+			exec, _, err := rs.server.executorForRequest(ctx, "worker", br.ActiveAccountID)
+			if err != nil {
+				return err
+			}
+			_ = rs.server.store.UpdateBranchStatus(ctx, br.ID, string(dag.StatusRunning), br.ActiveAccountID, br.StallCount)
+			rs.server.runBranchAsync(exec, br.ID, rs.server.defaultMaxTurns())
+			return nil
+		},
 	})
 	var kClient *bridge.KernelClient
 	if ksErr == nil {

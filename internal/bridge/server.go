@@ -35,6 +35,9 @@ type ServerConfig struct {
 	Version      string
 	Provider     dag.ModelProvider
 	RunStarter   RunStarter
+	// BranchResumer continues a queued branch after an inbox approval. Defaults to executing it
+	// with the server's own provider.
+	BranchResumer func(ctx context.Context, branchID string) error
 }
 
 // KernelServer exposes narrow authenticated JSON endpoints over a Unix Domain Socket (0600).
@@ -43,6 +46,10 @@ type KernelServer struct {
 	cfg   ServerConfig
 	token string
 	inbox *inbox.Service
+
+	// runCtx scopes asynchronous runs to the server lifetime so Stop does not wait on them forever.
+	runCtx     context.Context
+	cancelRuns context.CancelFunc
 
 	mu       sync.Mutex
 	listener net.Listener
@@ -83,8 +90,12 @@ func NewKernelServer(st *store.Store, cfg ServerConfig) (*KernelServer, error) {
 		token: tok,
 		inbox: inbox.NewService(st),
 	}
+	ks.runCtx, ks.cancelRuns = context.WithCancel(context.Background())
 	if ks.cfg.RunStarter == nil {
 		ks.cfg.RunStarter = ks.defaultRunStarter
+	}
+	if ks.cfg.BranchResumer == nil {
+		ks.cfg.BranchResumer = ks.defaultBranchResumer
 	}
 	return ks, nil
 }
@@ -153,6 +164,9 @@ func (s *KernelServer) Stop(ctx context.Context) error {
 		err = srv.Shutdown(ctx)
 	} else if ln != nil {
 		err = ln.Close()
+	}
+	if s.cancelRuns != nil {
+		s.cancelRuns()
 	}
 	s.wg.Wait()
 	_ = os.Remove(s.cfg.SocketPath)
@@ -268,6 +282,7 @@ func (s *KernelServer) handleInboxAction(w http.ResponseWriter, r *http.Request,
 	}
 	var msg string
 	var err error
+	prior, _ := s.store.GetInboxItem(r.Context(), id)
 	if approve {
 		msg, err = s.inbox.Approve(r.Context(), id, actor)
 	} else {
@@ -281,7 +296,39 @@ func (s *KernelServer) handleInboxAction(w http.ResponseWriter, r *http.Request,
 		writeJSON(w, code, ErrorResponse{Error: err.Error()})
 		return
 	}
+	// An approval only queues the branch; continue it so approving from a chat channel actually
+	// lets the task proceed.
+	if approve && (prior.ItemKind == "approval" || prior.ItemKind == "reconcile") {
+		branchID := prior.BranchID
+		if branchID == "" && prior.ArtifactRef != "" {
+			if act, aErr := s.store.GetAction(r.Context(), prior.ArtifactRef); aErr == nil {
+				branchID = act.BranchID
+			}
+		}
+		if branchID != "" {
+			if br, bErr := s.store.GetBranch(r.Context(), branchID); bErr == nil && br.Status == string(dag.StatusQueued) {
+				if rErr := s.cfg.BranchResumer(r.Context(), branchID); rErr != nil {
+					msg += "; resume failed: " + rErr.Error()
+				} else {
+					msg += "; resumed"
+				}
+			}
+		}
+	}
 	writeJSON(w, http.StatusOK, InboxActionResponse{OK: true, Message: msg})
+}
+
+func (s *KernelServer) defaultBranchResumer(_ context.Context, branchID string) error {
+	if s.cfg.Provider == nil {
+		return errors.New("bridge server has no ModelProvider configured")
+	}
+	exec := dag.NewExecutor(s.store, s.cfg.Provider, nil, compiler.WorkerProfile())
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		_, _ = exec.ExecuteBranch(s.runCtx, branchID, 12)
+	}()
+	return nil
 }
 
 func (s *KernelServer) handleStartRun(w http.ResponseWriter, r *http.Request) {
@@ -342,10 +389,14 @@ func (s *KernelServer) defaultRunStarter(ctx context.Context, req StartRunReques
 	if req.Sync {
 		res, err := exec.ExecuteBranch(ctx, branchID, maxTurns)
 		if err != nil {
+			status := string(dag.StatusFailed)
+			if res != nil && res.Status != "" {
+				status = string(res.Status)
+			}
 			return StartRunResponse{
 				RunID:    runID,
 				BranchID: branchID,
-				Status:   string(res.Status),
+				Status:   status,
 				Summary:  err.Error(),
 			}, nil
 		}
@@ -360,7 +411,7 @@ func (s *KernelServer) defaultRunStarter(ctx context.Context, req StartRunReques
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		_, _ = exec.ExecuteBranch(context.Background(), branchID, maxTurns)
+		_, _ = exec.ExecuteBranch(s.runCtx, branchID, maxTurns)
 	}()
 	return StartRunResponse{
 		RunID:    runID,

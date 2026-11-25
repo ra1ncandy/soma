@@ -1081,6 +1081,18 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 			}
 			idemKey := sha256Hex([]byte(idemRaw))
 
+			// An operator approval authorises one dispatch of exactly this tool call. Without this an
+			// approved irreversible action would be re-evaluated to "ask" forever on resume.
+			if decision == taint.DecisionAsk {
+				approved, apErr := e.Store.ConsumeApprovedAction(ctx, branch.ID, tc.Name, argsHash)
+				if apErr != nil {
+					return res, fmt.Errorf("check operator approval: %w", apErr)
+				}
+				if approved {
+					decision = taint.DecisionAllow
+					reason = "approved by operator"
+				}
+			}
 			if decision == taint.DecisionAsk && strings.EqualFold(e.AutonomyMode, "autonomous") && tc.EffectClass != taint.EffectIrreversible {
 				decision = taint.DecisionAllow
 				reason = "auto-approved (autonomous mode)"

@@ -635,6 +635,33 @@ func (s *Store) CommitActionAndAppendStep(ctx context.Context, actionID, resultP
 	})
 }
 
+// ConsumeApprovedAction atomically claims one operator-approved action on branchID matching
+// toolName and argsHash, so a single approval authorises exactly one identical dispatch.
+func (s *Store) ConsumeApprovedAction(ctx context.Context, branchID, toolName, argsHash string) (bool, error) {
+	now := time.Now().Unix()
+	var consumed bool
+	err := s.WithWriteTx(ctx, func(conn *sql.Conn) error {
+		res, err := conn.ExecContext(ctx, `
+			UPDATE action_journal
+			SET status = 'approval_used', updated_at = ?
+			WHERE action_id = (
+				SELECT action_id FROM action_journal
+				WHERE branch_id = ? AND tool_name = ? AND args_hash = ? AND status = 'approved'
+				ORDER BY created_at ASC LIMIT 1
+			)`, now, branchID, toolName, argsHash)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		consumed = n > 0
+		return nil
+	})
+	return consumed, err
+}
+
 func scanAction(sc rowScanner) (ActionJournalEntry, error) {
 	var e ActionJournalEntry
 	var parentStep, resultPage, summary, errText sql.NullString

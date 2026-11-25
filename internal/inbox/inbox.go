@@ -67,8 +67,11 @@ func (s *Service) Approve(ctx context.Context, itemID, approver string) (string,
 				declassified++
 			}
 		}
-		if entry.Status == "prepared" || entry.Status == "dispatched" {
-			_ = s.store.MarkActionStatus(ctx, entry.ActionID, "aborted", "", "approved by "+approver+"; ready to resume", "")
+		if entry.Status == "prepared" {
+			// Recorded as approved (not aborted) so the executor dispatches the identical call on resume.
+			if err := s.store.MarkActionStatus(ctx, entry.ActionID, "approved", "", "approved by "+approver+"; ready to resume", ""); err != nil {
+				return "", fmt.Errorf("record approval for %s: %w", entry.ActionID, err)
+			}
 		}
 		branchID := entry.BranchID
 		if branchID == "" {
