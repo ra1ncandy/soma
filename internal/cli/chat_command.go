@@ -119,7 +119,9 @@ func newAskCmd() *cobra.Command {
 			}
 			if res.Status == dag.StatusCompleted {
 				if br, bErr := st.GetBranch(cmd.Context(), brID); bErr == nil && br.WorkspaceDir != "" && br.WorkspaceDir != absWS {
-					_, _ = execDag.Workspace.MergeBranchWorkspaces(cmd.Context(), absWS, []string{br.WorkspaceDir}, absWS)
+					if _, applyErr := execDag.Workspace.ApplyBranchWorkspace(cmd.Context(), absWS, br.WorkspaceDir); applyErr != nil {
+						fmt.Fprintf(os.Stderr, "warning: changes were NOT applied to %s: %v\n  branch workspace kept at %s\n", absWS, applyErr, br.WorkspaceDir)
+					}
 				}
 			}
 			if res.FinalSummary != "" {

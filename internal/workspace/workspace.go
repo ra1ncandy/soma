@@ -84,8 +84,35 @@ func (m *Manager) PrepareBranchWorkspace(ctx context.Context, st *store.Store, r
 		return "", "", fmt.Errorf("mkdir workspaces root: %w", err)
 	}
 
+	// A fork or swarm worker continues from its parent branch's files, not from the pristine project:
+	// the model's history already contains the parent's edits.
+	parentDir := ""
+	if branch.ParentBranchID != "" && st != nil {
+		if parent, pErr := st.GetBranch(ctx, branch.ParentBranchID); pErr == nil && parent.WorkspaceDir != "" &&
+			!sameCleanedPath(parent.WorkspaceDir, run.WorkspacePath) {
+			if info, sErr := os.Stat(parent.WorkspaceDir); sErr == nil && info.IsDir() {
+				parentDir = parent.WorkspaceDir
+			}
+		}
+	}
+
 	var strategy string
-	if reqStrat != StrategyCopySnapshot && isCleanGitRepoWithHead(ctx, run.WorkspacePath) {
+	switch {
+	case parentDir != "":
+		if err := copyWorkspaceSnapshot(parentDir, wsDir); err != nil {
+			return "", "", fmt.Errorf("copy parent branch workspace: %w", err)
+		}
+		strategy = StrategyCopySnapshot
+		// Relative to the project the fork starts from the same base as its parent.
+		if parentBase, ok := readManifest(baseManifestPath(parentDir)); ok {
+			if err := writeManifest(baseManifestPath(wsDir), parentBase); err != nil {
+				return "", "", fmt.Errorf("write fork base manifest: %w", err)
+			}
+		}
+		if forkState, err := buildManifest(wsDir); err == nil {
+			_ = writeManifest(forkManifestPath(wsDir), forkState)
+		}
+	case reqStrat != StrategyCopySnapshot && isCleanGitRepoWithHead(ctx, run.WorkspacePath):
 		cmd := exec.CommandContext(ctx, "git", "-C", run.WorkspacePath, "worktree", "add", "--detach", wsDir, "HEAD")
 		if out, err := cmd.CombinedOutput(); err == nil {
 			strategy = StrategyGitWorktree
@@ -97,11 +124,16 @@ func (m *Manager) PrepareBranchWorkspace(ctx context.Context, st *store.Store, r
 			}
 			strategy = StrategyCopySnapshot
 		}
-	} else {
+	default:
 		if err := copyWorkspaceSnapshot(run.WorkspacePath, wsDir); err != nil {
 			return "", "", fmt.Errorf("create copy snapshot: %w", err)
 		}
 		strategy = StrategyCopySnapshot
+	}
+	if _, ok := readManifest(baseManifestPath(wsDir)); !ok {
+		if err := recordBaseManifest(wsDir); err != nil {
+			return "", "", err
+		}
 	}
 
 	if st != nil {
@@ -127,6 +159,8 @@ func (m *Manager) CleanupBranchWorkspace(ctx context.Context, run store.Run, bra
 		cmd := exec.CommandContext(ctx, "git", "-C", run.WorkspacePath, "worktree", "remove", "--force", branch.WorkspaceDir)
 		_ = cmd.Run()
 	}
+	_ = os.Remove(baseManifestPath(branch.WorkspaceDir))
+	_ = os.Remove(forkManifestPath(branch.WorkspaceDir))
 	return os.RemoveAll(branch.WorkspaceDir)
 }
 
@@ -155,6 +189,21 @@ func isCleanGitRepoWithHead(ctx context.Context, dir string) bool {
 	inside := exec.CommandContext(ctx, "git", "-C", dir, "rev-parse", "--is-inside-work-tree")
 	out, err := inside.Output()
 	if err != nil || strings.TrimSpace(string(out)) != "true" {
+		return false
+	}
+	// `git worktree add` checks out the whole repository. When the workspace is a subdirectory of
+	// a larger repo that layout would not line up with the project directory, so use a copy instead.
+	top, err := exec.CommandContext(ctx, "git", "-C", dir, "rev-parse", "--show-toplevel").Output()
+	if err != nil {
+		return false
+	}
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return false
+	}
+	realDir, err1 := filepath.EvalSymlinks(absDir)
+	realTop, err2 := filepath.EvalSymlinks(strings.TrimSpace(string(top)))
+	if err1 != nil || err2 != nil || filepath.Clean(realDir) != filepath.Clean(realTop) {
 		return false
 	}
 	head := exec.CommandContext(ctx, "git", "-C", dir, "rev-parse", "--verify", "HEAD")
