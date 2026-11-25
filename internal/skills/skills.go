@@ -132,6 +132,10 @@ func LoadIndex(roots []string) ([]compiler.SkillMeta, error) {
 			if err != nil {
 				continue
 			}
+			if _, dup := seen[sk.Frontmatter.Name]; dup {
+				// Earlier roots take precedence (project over user-global).
+				continue
+			}
 			seen[sk.Frontmatter.Name] = compiler.SkillMeta{
 				Name:        sk.Frontmatter.Name,
 				Description: sk.Frontmatter.Description,
@@ -203,40 +207,13 @@ func ProposeSkillPatch(ctx context.Context, st *store.Store, skillName, unifiedD
 
 // CreateOrPatchSkill validates AAIF frontmatter and runs pre-activation security lint on content
 // in a temporary staging directory before writing <rootDir>/<name>/SKILL.md.
+// It is for operator-initiated writes (dashboard, CLI); agent runs go through ProposeSkillChange.
 func CreateOrPatchSkill(rootDir, name, content string) (Skill, []LintFinding, error) {
-	name = strings.TrimSpace(name)
-	if name != "" {
-		content = SyncTemplateFrontmatterName(content, name)
-	}
-	if !aaifNameRe.MatchString(name) || len(name) > 64 {
-		return Skill{}, nil, fmt.Errorf("%w: invalid skill name %q (must match ^[a-z0-9]+(-[a-z0-9]+)*$)", ErrInvalidSkill, name)
-	}
-	stageParent, err := os.MkdirTemp("", "soma-skill-stage-*")
+	sk, findings, content, err := ValidateSkillContent(name, content)
 	if err != nil {
-		return Skill{}, nil, err
+		return Skill{}, findings, err
 	}
-	defer func() { _ = os.RemoveAll(stageParent) }()
-
-	stageDir := filepath.Join(stageParent, name)
-	if err := os.MkdirAll(stageDir, 0o755); err != nil {
-		return Skill{}, nil, err
-	}
-	if err := os.WriteFile(filepath.Join(stageDir, "SKILL.md"), []byte(content), 0o644); err != nil {
-		return Skill{}, nil, err
-	}
-	sk, err := ParseSkillMD(stageDir)
-	if err != nil {
-		return Skill{}, nil, err
-	}
-	findings, err := LintSkillDir(stageDir)
-	if err != nil {
-		return Skill{}, nil, err
-	}
-	for _, f := range findings {
-		if f.Severity == "critical" {
-			return Skill{}, findings, fmt.Errorf("%w: %s (%s:%d)", ErrSkillLintBlocked, f.Detail, f.File, f.Line)
-		}
-	}
+	name = sk.Frontmatter.Name
 
 	targetDir := filepath.Join(rootDir, name)
 	if err := os.MkdirAll(targetDir, 0o755); err != nil {

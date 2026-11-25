@@ -1981,13 +1981,19 @@ func (e *Executor) buildEpochInput(run store.Run, activeMem []compiler.MemoryEnt
 	if sys == "" {
 		sys = defaultKernelSystemPrompt()
 	}
+	somaDir := ""
+	if e.Store != nil {
+		somaDir = e.Store.SomaDir()
+	}
 	return compiler.EpochInput{
-		SystemPrompt:  sys,
-		WorkspaceMode: run.WorkspaceKind,
-		TaskGoal:      run.GoalSpec,
-		Syscalls:      compiler.DefaultCoreSyscalls(),
-		ActiveMemory:  activeMem,
-		Graveyard:     grave,
+		SystemPrompt:        sys,
+		ProjectInstructions: LoadProjectInstructions(run.WorkspacePath),
+		WorkspaceMode:       run.WorkspaceKind,
+		TaskGoal:            run.GoalSpec,
+		Syscalls:            compiler.DefaultCoreSyscalls(),
+		SkillIndex:          skillIndexFor(run.WorkspacePath, somaDir),
+		ActiveMemory:        activeMem,
+		Graveyard:           grave,
 	}
 }
 
@@ -2290,6 +2296,14 @@ func (r *LocalToolRunner) Execute(ctx context.Context, call ToolCall) (ToolOutpu
 		if r.vm != nil {
 			st = r.vm.Store()
 		}
+		// A finding from a run that has seen untrusted content may carry injected instructions:
+		// share it with siblings for this run only, and quarantine the durable copy for review.
+		tainted := false
+		if st != nil && call.RunID != "" {
+			if untrusted, uErr := st.ListUntrustedPageIDs(ctx, call.RunID); uErr == nil && len(untrusted) > 0 {
+				tainted = true
+			}
+		}
 		f, err := bb.Publish(ctx, st, PeerFinding{
 			RunID:           call.RunID,
 			FromBranch:      call.BranchID,
@@ -2297,10 +2311,18 @@ func (r *LocalToolRunner) Execute(ctx context.Context, call ToolCall) (ToolOutpu
 			Kind:            "rule_notice",
 			Summary:         summary,
 			PageID:          pid,
-			PersistToMemory: true,
+			PersistToMemory: !tainted,
 		})
 		if err != nil {
 			return ToolOutput{}, err
+		}
+		if tainted && r.Memory != nil {
+			if _, err := r.Memory.Propose(ctx, memory.ProposeRequest{
+				Scope: "repo:" + call.RunID, Kind: "fact", Content: summary,
+				TrustTier: "untrusted_external", EvidencePageID: pid,
+			}); err != nil {
+				return ToolOutput{}, fmt.Errorf("publish_finding: quarantine durable copy: %w", err)
+			}
 		}
 		return ToolOutput{
 			NameHint:  "publish_finding.txt",
@@ -2650,10 +2672,7 @@ func (r *LocalToolRunner) Execute(ctx context.Context, call ToolCall) (ToolOutpu
 		action = strings.ToLower(strings.TrimSpace(action))
 		name, _ := args["name"].(string)
 		content, _ := args["content"].(string)
-		roots := r.SkillRoots
-		if len(roots) == 0 && call.WorkspaceDir != "" {
-			roots = []string{filepath.Join(call.WorkspaceDir, ".soma", "skills")}
-		}
+		roots := r.skillRoots(call)
 		if len(roots) == 0 {
 			return ToolOutput{}, errors.New("skill_manage: no skill root configured")
 		}
@@ -2684,24 +2703,25 @@ func (r *LocalToolRunner) Execute(ctx context.Context, call ToolCall) (ToolOutpu
 			}
 			return ToolOutput{}, fmt.Errorf("skill_manage: skill %q not found", name)
 		case "create", "patch":
-			// Block silent skill mutation if the run has observed untrusted external data.
-			if r.vm != nil && r.vm.Store() != nil && call.RunID != "" {
-				if untrusted, uErr := r.vm.Store().ListUntrustedPageIDs(ctx, call.RunID); uErr == nil && len(untrusted) > 0 {
-					_ = skills.ProposeSkillPatch(ctx, r.vm.Store(), name, content, "Proposed during tainted run; requires operator review")
-					return ToolOutput{
-						NameHint:  "skill_manage.txt",
-						Content:   []byte(fmt.Sprintf("skill_manage: run has untrusted external provenance; staged %q in Inbox for operator review instead of writing directly", name)),
-						TrustTier: "trusted_repo",
-					}, nil
+			// Agent runs never write SKILL.md directly: the validated, linted content is staged
+			// and applied only when an operator approves the inbox item (with history kept).
+			var st *store.Store
+			if r.vm != nil {
+				st = r.vm.Store()
+			}
+			reason := "Proposed by agent run " + call.RunID
+			if st != nil && call.RunID != "" {
+				if untrusted, uErr := st.ListUntrustedPageIDs(ctx, call.RunID); uErr == nil && len(untrusted) > 0 {
+					reason += " (WARNING: the run had observed untrusted external content)"
 				}
 			}
-			sk, _, err := skills.CreateOrPatchSkill(roots[0], name, content)
+			itemID, err := skills.ProposeSkillChange(ctx, st, roots[0], name, content, reason, call.RunID)
 			if err != nil {
 				return ToolOutput{}, err
 			}
 			return ToolOutput{
 				NameHint:  "skill_manage.txt",
-				Content:   []byte(fmt.Sprintf("skill_manage: validated, security-linted, and saved skill %q to %s", sk.Frontmatter.Name, sk.Dir)),
+				Content:   []byte(fmt.Sprintf("skill_manage: validated and security-linted skill %q; staged for operator approval as inbox item %s (it becomes active once approved)", strings.TrimSpace(name), itemID)),
 				TrustTier: "trusted_repo",
 			}, nil
 		default:

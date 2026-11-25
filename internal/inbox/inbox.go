@@ -8,6 +8,7 @@ import (
 	"github.com/ra1ncandy/soma/internal/compiler"
 	"github.com/ra1ncandy/soma/internal/dag"
 	"github.com/ra1ncandy/soma/internal/memory"
+	"github.com/ra1ncandy/soma/internal/skills"
 	"github.com/ra1ncandy/soma/internal/store"
 	"github.com/ra1ncandy/soma/internal/taint"
 )
@@ -96,6 +97,16 @@ func (s *Service) Approve(ctx context.Context, itemID, approver string) (string,
 		_ = s.store.UpdateInboxStatus(ctx, item.ID, "approved")
 		return fmt.Sprintf("reconciled action %s as succeeded", item.ArtifactRef), nil
 
+	case "skill_patch":
+		sk, err := skills.ApplySkillProposal(s.store, item.ArtifactRef)
+		if err != nil {
+			return "", fmt.Errorf("apply skill proposal %s: %w", item.ArtifactRef, err)
+		}
+		if err := s.store.UpdateInboxStatus(ctx, item.ID, "approved"); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("applied skill %s to %s (previous version kept in .history/)", sk.Frontmatter.Name, sk.Dir), nil
+
 	default:
 		if err := s.store.UpdateInboxStatus(ctx, item.ID, "approved"); err != nil {
 			return "", err
@@ -131,6 +142,8 @@ func (s *Service) Dismiss(ctx context.Context, itemID, operator string) (string,
 				return "", fmt.Errorf("reconcile failed %s: %w", item.ArtifactRef, err)
 			}
 		}
+	case "skill_patch":
+		skills.DiscardSkillProposal(s.store, item.ArtifactRef)
 	case "approval":
 		if item.ArtifactRef != "" {
 			if entry, err := s.store.GetAction(ctx, item.ArtifactRef); err == nil {

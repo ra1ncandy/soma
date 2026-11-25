@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/ra1ncandy/soma/internal/skills"
 	"github.com/ra1ncandy/soma/internal/taint"
 	"github.com/ra1ncandy/soma/internal/triggers"
 )
@@ -127,6 +128,21 @@ func cronjobEffectClass(argsJSON string) taint.EffectClass {
 		return taint.EffectReadOnly
 	}
 	return taint.EffectExternalWrite
+}
+
+// skillRoots returns the skill search path: explicit SkillRoots, else the shared default roots of
+// the project (never the throwaway branch workspace copy).
+func (r *LocalToolRunner) skillRoots(call ToolCall) []string {
+	if len(r.SkillRoots) > 0 {
+		return r.SkillRoots
+	}
+	if r.ProjectSomaDir != "" {
+		return skills.DefaultRoots(filepath.Dir(r.ProjectSomaDir), r.ProjectSomaDir)
+	}
+	if call.WorkspaceDir != "" {
+		return skills.DefaultRoots(call.WorkspaceDir, filepath.Join(call.WorkspaceDir, ".soma"))
+	}
+	return nil
 }
 
 func orDefault(s, def string) string {

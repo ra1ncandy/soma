@@ -92,7 +92,12 @@ func lintFile(absPath, relLabel string) ([]LintFinding, error) {
 	if err != nil {
 		return nil, err
 	}
-	text := string(raw)
+	return LintText(relLabel, string(raw)), nil
+}
+
+// LintText applies the security lint rules to arbitrary instruction text (skill bodies,
+// context files such as AGENTS.md, persona files).
+func LintText(relLabel, text string) []LintFinding {
 	var findings []LintFinding
 
 	// Check hidden Unicode zero-width and BiDi directional override characters.
@@ -123,7 +128,7 @@ func lintFile(absPath, relLabel string) ([]LintFinding, error) {
 			}
 		}
 	}
-	return findings, nil
+	return findings
 }
 
 func isHiddenControlRune(r rune) bool {

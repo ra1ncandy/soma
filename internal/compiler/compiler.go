@@ -56,9 +56,17 @@ type GraveyardEntry struct {
 	EvidencePageID    string `json:"evidence_page_id"`
 }
 
+// ContextFile is a project instruction file (AGENTS.md, CLAUDE.md, .cursorrules, a persona)
+// frozen into Layer 0 for the whole epoch.
+type ContextFile struct {
+	Path    string `json:"path"`
+	Content string `json:"content"`
+}
+
 // EpochInput holds all static/snapshot inputs used to freeze Layer 0 and Layer 1 for an epoch.
 type EpochInput struct {
-	SystemPrompt      string
+	SystemPrompt        string
+	ProjectInstructions []ContextFile
 	WorkspaceMode     string
 	TaskGoal          string
 	ContractSpec      string
@@ -252,6 +260,12 @@ func NewEpochSnapshot(epoch int, in EpochInput) EpochSnapshot {
 	if in.SystemPrompt != "" {
 		l0.WriteString(strings.TrimSpace(in.SystemPrompt))
 		l0.WriteByte('\n')
+	}
+	if len(in.ProjectInstructions) > 0 {
+		l0.WriteString("project_instructions:\n")
+		for _, cf := range in.ProjectInstructions {
+			fmt.Fprintf(&l0, "<file path=%q>\n%s\n</file>\n", cf.Path, strings.TrimSpace(cf.Content))
+		}
 	}
 	if in.WorkspaceMode != "" {
 		fmt.Fprintf(&l0, "workspace_mode: %s\n", in.WorkspaceMode)

@@ -3,9 +3,11 @@ package inbox
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/ra1ncandy/soma/internal/skills"
 	"github.com/ra1ncandy/soma/internal/store"
 )
 
@@ -144,16 +146,43 @@ func TestInboxApproveAndDismissAllKinds(t *testing.T) {
 		t.Fatalf("expected reconciled action status, got %+v err=%v", actRec, err)
 	}
 
-	// 4) skill_patch approve + idempotency error on double approve
-	if err := st.InsertInboxItem(ctx, store.InboxItem{
-		ID: "inbox_sk_1", ItemKind: "skill_patch", Title: "Patch skill", Summary: "diff", ArtifactRef: "my-skill",
-	}); err != nil {
-		t.Fatalf("InsertInboxItem sk: %v", err)
+	// 4) skill_patch: approval applies the staged proposal, keeps history, and is not repeatable.
+	root := filepath.Join(st.SomaDir(), "skills")
+	v1 := "---\nname: my-skill\ndescription: First version.\n---\nDo A.\n"
+	v2 := "---\nname: my-skill\ndescription: Second version.\n---\nDo B.\n"
+	if err := os.MkdirAll(filepath.Join(root, "my-skill"), 0o755); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := svc.Approve(ctx, "inbox_sk_1", "alice"); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "my-skill", "SKILL.md"), []byte(v1), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	skItem, err := skills.ProposeSkillChange(ctx, st, root, "my-skill", v2, "agent proposal", "run_inb")
+	if err != nil {
+		t.Fatalf("ProposeSkillChange: %v", err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(root, "my-skill", "SKILL.md")); string(got) != v1 {
+		t.Fatalf("proposal mutated the active skill before approval: %q", got)
+	}
+	if _, err := svc.Approve(ctx, skItem, "alice"); err != nil {
 		t.Fatalf("Approve skill_patch: %v", err)
 	}
-	if _, err := svc.Approve(ctx, "inbox_sk_1", "alice"); err == nil {
+	if got, _ := os.ReadFile(filepath.Join(root, "my-skill", "SKILL.md")); string(got) != v2 {
+		t.Fatalf("approved proposal not applied, SKILL.md=%q", got)
+	}
+	if hist, _ := os.ReadDir(filepath.Join(root, "my-skill", ".history")); len(hist) != 1 {
+		t.Fatalf("expected 1 history entry, got %d", len(hist))
+	}
+	if _, err := svc.Approve(ctx, skItem, "alice"); err == nil {
 		t.Fatalf("expected error on double approve")
+	}
+
+	// A legacy skill_patch item with no staged content must fail loudly, not "approve" a no-op.
+	if err := st.InsertInboxItem(ctx, store.InboxItem{
+		ID: "inbox_sk_legacy", ItemKind: "skill_patch", Title: "Patch skill", Summary: "diff", ArtifactRef: "my-skill",
+	}); err != nil {
+		t.Fatalf("InsertInboxItem legacy: %v", err)
+	}
+	if _, err := svc.Approve(ctx, "inbox_sk_legacy", "alice"); err == nil {
+		t.Fatal("legacy skill_patch without staged content was approved as a no-op")
 	}
 }
