@@ -23,7 +23,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"gopkg.in/yaml.v3"
 
 	"github.com/ra1ncandy/soma/internal/broker"
 	"github.com/ra1ncandy/soma/internal/compiler"
@@ -273,6 +272,9 @@ func NewExecutor(
 		}
 		if lt.Memory == nil {
 			lt.Memory = ex.Memory
+		}
+		if lt.ProjectSomaDir == "" && st != nil {
+			lt.ProjectSomaDir = st.SomaDir()
 		}
 	}
 	return ex
@@ -1046,6 +1048,8 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 					}
 				}
 				tc.EffectClass = resolveMCPCallEffectClass(mcpMgr, tc.ArgsJSON)
+			} else if tc.Name == "cronjob_manage" {
+				tc.EffectClass = cronjobEffectClass(tc.ArgsJSON)
 			} else if tc.EffectClass == "" {
 				tc.EffectClass = inferToolEffectClass(tc.Name)
 			}
@@ -2033,6 +2037,12 @@ type LocalToolRunner struct {
 	AllowUnsandboxedExec bool
 	// AllowSandboxNetwork permits outbound network access inside the OS sandbox (disables --unshare-net / deny network*).
 	AllowSandboxNetwork bool
+	// ProjectSomaDir is the project's .soma directory (not the branch workspace copy). Tools that
+	// change project-level configuration, such as cronjob_manage, write here so the daemon sees it.
+	ProjectSomaDir string
+	// OnTriggersChanged is called after cronjob_manage changes triggers.yaml (e.g. to hot-reload
+	// the embedded daemon).
+	OnTriggersChanged func()
 }
 
 // Close stops this runner's background jobs and releases anything registered through OnClose.
@@ -2699,93 +2709,7 @@ func (r *LocalToolRunner) Execute(ctx context.Context, call ToolCall) (ToolOutpu
 		}
 
 	case "cronjob_manage":
-		action, _ := args["action"].(string)
-		action = strings.ToLower(strings.TrimSpace(action))
-		if call.WorkspaceDir == "" {
-			return ToolOutput{}, errors.New("cronjob_manage: empty workspace dir")
-		}
-		trigPath := filepath.Join(call.WorkspaceDir, ".soma", "triggers.yaml")
-		type cronTrigger struct {
-			ID       string `yaml:"id"`
-			Type     string `yaml:"type"`
-			Interval string `yaml:"interval,omitempty"`
-			Prompt   string `yaml:"prompt,omitempty"`
-		}
-		type cronFile struct {
-			Version  int           `yaml:"version"`
-			Triggers []cronTrigger `yaml:"triggers"`
-		}
-		var cfg cronFile
-		cfg.Version = 2
-		if raw, rErr := os.ReadFile(trigPath); rErr == nil {
-			_ = yaml.Unmarshal(raw, &cfg)
-		}
-		switch action {
-		case "list":
-			if len(cfg.Triggers) == 0 {
-				return ToolOutput{NameHint: "cron.txt", Content: []byte("cronjob_manage: 0 scheduled triggers"), TrustTier: "trusted_repo"}, nil
-			}
-			var sb strings.Builder
-			for _, tr := range cfg.Triggers {
-				fmt.Fprintf(&sb, "- [%s] type=%s interval=%q prompt=%q\n", tr.ID, tr.Type, tr.Interval, tr.Prompt)
-			}
-			return ToolOutput{NameHint: "cron.txt", Content: []byte(strings.TrimRight(sb.String(), "\n")), TrustTier: "trusted_repo"}, nil
-		case "add":
-			id, _ := args["id"].(string)
-			schedule, _ := args["schedule"].(string)
-			prompt, _ := args["prompt"].(string)
-			id = strings.TrimSpace(id)
-			schedule = strings.TrimSpace(schedule)
-			prompt = strings.TrimSpace(prompt)
-			if id == "" || schedule == "" || prompt == "" {
-				return ToolOutput{}, errors.New("cronjob_manage add requires id, schedule, and prompt")
-			}
-			updated := false
-			for i := range cfg.Triggers {
-				if cfg.Triggers[i].ID == id {
-					cfg.Triggers[i] = cronTrigger{ID: id, Type: "cron", Interval: schedule, Prompt: prompt}
-					updated = true
-					break
-				}
-			}
-			if !updated {
-				cfg.Triggers = append(cfg.Triggers, cronTrigger{ID: id, Type: "cron", Interval: schedule, Prompt: prompt})
-			}
-			if err := os.MkdirAll(filepath.Dir(trigPath), 0o755); err != nil {
-				return ToolOutput{}, err
-			}
-			outBytes, err := yaml.Marshal(&cfg)
-			if err != nil {
-				return ToolOutput{}, err
-			}
-			if err := os.WriteFile(trigPath, outBytes, 0o644); err != nil {
-				return ToolOutput{}, err
-			}
-			return ToolOutput{NameHint: "cron.txt", Content: []byte(fmt.Sprintf("cronjob_manage: saved cron trigger %q (%s) in .soma/triggers.yaml", id, schedule)), TrustTier: "trusted_repo"}, nil
-		case "remove":
-			id, _ := args["id"].(string)
-			id = strings.TrimSpace(id)
-			var kept []cronTrigger
-			removed := false
-			for _, tr := range cfg.Triggers {
-				if tr.ID == id {
-					removed = true
-					continue
-				}
-				kept = append(kept, tr)
-			}
-			if !removed {
-				return ToolOutput{}, fmt.Errorf("cronjob_manage: trigger %q not found", id)
-			}
-			cfg.Triggers = kept
-			outBytes, _ := yaml.Marshal(&cfg)
-			if err := os.WriteFile(trigPath, outBytes, 0o644); err != nil {
-				return ToolOutput{}, err
-			}
-			return ToolOutput{NameHint: "cron.txt", Content: []byte(fmt.Sprintf("cronjob_manage: removed trigger %q", id)), TrustTier: "trusted_repo"}, nil
-		default:
-			return ToolOutput{}, fmt.Errorf("cronjob_manage: unsupported action %q (use list|add|remove)", action)
-		}
+		return r.cronjobManage(call, args)
 
 	case "branch_fork":
 		label, _ := args["label"].(string)

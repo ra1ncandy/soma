@@ -1813,6 +1813,10 @@ func (s *Server) newExecutor(prof compiler.ModelProfile) *dag.Executor {
 	vm := vmem.NewManager(s.store)
 	tools := dag.NewSandboxedToolRunner(vm, sbx)
 	tools.AllowSandboxNetwork = hCfg.Provider.AllowSandboxNetwork
+	if sup := s.supervisor; sup != nil {
+		// Reload asynchronously: the reload may wait for this very run's daemon epoch to stop.
+		tools.OnTriggersChanged = func() { go sup.Reload() }
+	}
 	// Every MCP manager created for this executor spawns server processes; track them so the run
 	// closes them when it ends instead of leaking a full set of connectors per run.
 	var (
