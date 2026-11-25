@@ -24,6 +24,18 @@ var versionedMigrations = []string{
 		created_at UNINDEXED,
 		tokenize = 'porter unicode61'
 	)`,
+	// v2: per-step workspace checkpoints (content-addressed manifests in the blob store).
+	`CREATE TABLE IF NOT EXISTS workspace_checkpoints (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+		branch_id TEXT NOT NULL,
+		step_id TEXT NOT NULL DEFAULT '',
+		manifest_hash TEXT NOT NULL,
+		files INTEGER NOT NULL DEFAULT 0,
+		created_at INTEGER NOT NULL
+	);
+	CREATE INDEX IF NOT EXISTS idx_workspace_checkpoints_branch_step ON workspace_checkpoints(branch_id, step_id);
+	CREATE INDEX IF NOT EXISTS idx_workspace_checkpoints_run ON workspace_checkpoints(run_id);`,
 }
 
 // SchemaVersion is the number of versioned migrations this binary knows.

@@ -454,6 +454,13 @@ func (e *Executor) ForkBranch(ctx context.Context, runID, fromStepID, label stri
 	if _, _, err := e.Workspace.PrepareBranchWorkspace(ctx, e.Store, run, branch); err != nil {
 		return "", fmt.Errorf("prepare forked workspace: %w", err)
 	}
+	// The fork's history ends at fromStepID, so its files must too (not the parent's current
+	// files). Without a checkpoint (older runs) the fork keeps the parent's current files.
+	if _, err := e.RestoreStepFiles(ctx, branchID, fromStepID); err != nil && !errors.Is(err, store.ErrNotFound) {
+		if _, cpErr := e.checkpointAtStep(ctx, fromStepID); cpErr == nil {
+			return "", fmt.Errorf("restore forked workspace to step %s: %w", fromStepID, err)
+		}
+	}
 	return branchID, nil
 }
 
@@ -735,6 +742,8 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 		branch.WorkspaceStrategy = strat
 	}
 	_ = e.Store.UpdateRunStatus(ctx, run.ID, string(StatusRunning))
+
+	e.checkpointStart(ctx, run, branch)
 
 	snap, snapID, l2, pendingDeltaAppends, nextTurn, err := e.loadOrInitEpochState(ctx, run, branch)
 	if err != nil {
@@ -1434,6 +1443,7 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 			return res, err
 		}
 		e.indexTranscript(ctx, run.ID, branch.ID, sid, nextPending)
+		e.checkpointAfterTurn(ctx, run.ID, branch, sid, calls)
 		if e.OnStep != nil {
 			e.OnStep(stepRow)
 		}

@@ -2045,6 +2045,28 @@ func (s *Store) SweepUnreferencedBlobs(ctx context.Context, minAge time.Duration
 			referenced[delta.LiveTail.Viewport.BlobHash] = true
 		}
 	}
+	// Workspace checkpoints: the manifest blob and every file blob it names.
+	manifests, err := s.CheckpointManifestHashes(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	for _, mh := range manifests {
+		referenced[mh] = true
+		raw, gErr := s.blobs.Get(mh)
+		if gErr != nil {
+			continue
+		}
+		var files map[string]struct {
+			Blob string `json:"b"`
+		}
+		if json.Unmarshal(raw, &files) == nil {
+			for _, f := range files {
+				if len(f.Blob) == 64 {
+					referenced[f.Blob] = true
+				}
+			}
+		}
+	}
 	return s.blobs.Sweep(referenced, minAge)
 }
 
