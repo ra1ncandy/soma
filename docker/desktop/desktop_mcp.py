@@ -179,6 +179,15 @@ TOOLS = [
         },
     },
     {
+        "name": "desktop_open_url",
+        "description": "Open a URL in Chromium inside the isolated desktop (adds https:// if missing).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"url": {"type": "string"}},
+            "required": ["url"],
+        },
+    },
+    {
         "name": "desktop_list_windows",
         "description": "List open windows inside the isolated desktop.",
         "inputSchema": {"type": "object", "properties": {}},
@@ -280,7 +289,16 @@ def handle_tool(name: str, args: dict) -> dict:
         return {"content": [{"type": "text", "text": f"sent key {keys}"}]}
 
     if name == "desktop_scroll":
-        clicks = int(args["clicks"])
+        if "seconds" in args and "clicks" not in args and "amount" not in args and "delta" not in args:
+            secs = max(0.2, min(10.0, float(args.get("seconds") or 1.0)))
+            time.sleep(secs)
+            return {"content": [{"type": "text", "text": f"waited {secs:.1f}s"}]}
+        raw_clicks = args.get("clicks", args.get("amount", args.get("delta", -3)))
+        clicks = int(raw_clicks)
+        if str(args.get("direction") or "").lower() == "down" and clicks > 0:
+            clicks = -clicks
+        elif str(args.get("direction") or "").lower() == "up" and clicks < 0:
+            clicks = -clicks
         if "x" in args and "y" in args:
             subprocess.run(["xdotool", "mousemove", "--sync", str(int(args["x"])), str(int(args["y"]))], env=ENV, check=True)
         btn = "4" if clicks > 0 else "5"
@@ -291,6 +309,16 @@ def handle_tool(name: str, args: dict) -> dict:
         cmd = str(args["command"]).strip()
         subprocess.Popen(["/bin/sh", "-c", cmd], env=ENV, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
         return {"content": [{"type": "text", "text": f"launched: {cmd}"}]}
+
+    if name == "desktop_open_url":
+        url = str(args.get("url") or "").strip()
+        if not url:
+            return {"isError": True, "content": [{"type": "text", "text": "desktop_open_url requires non-empty url"}]}
+        if not url.startswith(("http://", "https://", "file://")):
+            url = "https://" + url
+        cmd = f"chromium --no-sandbox --start-maximized {json.dumps(url)}"
+        subprocess.Popen(["/bin/sh", "-c", cmd], env=ENV, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        return {"content": [{"type": "text", "text": f"opened in Chromium: {url}"}]}
 
     if name == "desktop_list_windows":
         res = subprocess.run(["wmctrl", "-lG"], env=ENV, capture_output=True, text=True)

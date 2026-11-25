@@ -58,14 +58,14 @@ func (e *Executor) RunGUISubagent(ctx context.Context, runID, parentBranchID, mo
 	}
 	if maxSteps <= 0 {
 		if mode == "browser" {
-			maxSteps = 30
+			maxSteps = 20
 		} else {
-			maxSteps = 40
+			maxSteps = 15
 		}
 	}
-	maxCap := 100
+	maxCap := 25
 	if mode == "browser" {
-		maxCap = 80
+		maxCap = 30
 	}
 	if maxSteps > maxCap {
 		maxSteps = maxCap
@@ -201,8 +201,8 @@ func (e *Executor) RunGUISubagent(ctx context.Context, runID, parentBranchID, mo
 			"Rules:\n"+
 			"1. Do NOT call host `exec` — it is disabled here. To open a GUI app/URL inside the desktop, use desktop_launch_app(command=\"chromium --no-sandbox --start-maximized https://...\"). If desktop_exec is listed above, you may use it to run commands or install packages (sudo apt-get, pip, npm) inside the isolated desktop container.\n"+
 			"2. Start by calling desktop_screenshot() or desktop_list_windows() to see the current screen.\n"+
-			"3. Use desktop_click(x, y or ref), desktop_type(text, enter?), desktop_key(keys), and desktop_scroll(clicks, x?, y?) to interact.\n"+
-			"4. Once the goal is achieved and visible on screen, stop and return a concise 1-3 sentence summary.\n"+
+			"3. Use desktop_click(x, y or ref), desktop_type(text, enter?), desktop_key(keys), and desktop_scroll(clicks, x?, y?) to interact. Never repeat desktop_scroll more than twice without taking desktop_screenshot().\n"+
+			"4. Once the requested page/app is open and visible, stop immediately and return a concise 1-3 sentence summary.\n"+
 			"Sub-goal: %s",
 		mode, toolList.String(), subGoal,
 	)

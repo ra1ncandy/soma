@@ -69,6 +69,7 @@ func NewRootCmd() *cobra.Command {
 		newShadowCmd(),
 		newSearchCmd(),
 		newSwarmCmd(),
+		newHarborRunCmd(),
 		newExportTrajectoriesCmd(),
 	)
 	return root

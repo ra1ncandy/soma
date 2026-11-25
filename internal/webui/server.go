@@ -290,6 +290,7 @@ func NewServer(st *store.Store, cfg ServerConfig) (*Server, error) {
 	if srv.cfg.Provider == nil && !srv.cfg.UseMock {
 		srv.restoreProviderFromHarness(context.Background())
 	}
+	srv.reconcileOrphanedRuns(context.Background())
 	srv.supervisor = newRuntimeSupervisor(srv)
 	return srv, nil
 }
@@ -447,6 +448,7 @@ func (s *Server) Handler() http.Handler {
 			return
 		}
 		if r.Method == http.MethodGet && strings.HasPrefix(path, "/static/") {
+			w.Header().Set("Cache-Control", "no-store")
 			http.StripPrefix("/static/", staticSrv).ServeHTTP(w, r)
 			return
 		}
@@ -614,6 +616,11 @@ func (s *Server) serveIndex(w http.ResponseWriter) {
 		return
 	}
 	rendered := strings.Replace(string(raw), "__SOMA_CSRF__", s.csrf, 1)
+	ver := s.csrf
+	if len(ver) > 8 {
+		ver = ver[:8]
+	}
+	rendered = strings.ReplaceAll(rendered, "__SOMA_VER__", ver)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	_, _ = w.Write([]byte(rendered))
@@ -990,6 +997,33 @@ func (s *Server) activeProvider() dag.ModelProvider {
 	return prov
 }
 
+func (s *Server) reconcileOrphanedRuns(ctx context.Context) {
+	runs, err := s.store.ListRuns(ctx)
+	if err != nil {
+		return
+	}
+	inboxItems, _ := s.store.ListInboxItems(ctx, "pending")
+	pendingBranches := make(map[string]bool)
+	for _, it := range inboxItems {
+		if it.BranchID != "" {
+			pendingBranches[it.BranchID] = true
+		}
+	}
+	for _, r := range runs {
+		branches, _ := s.store.ListBranches(ctx, r.ID)
+		hadRunning := false
+		for _, b := range branches {
+			if b.Status == "running" || (b.Status == "queued" && !pendingBranches[b.ID]) {
+				_ = s.store.UpdateBranchStatus(ctx, b.ID, "stopped", b.ActiveAccountID, b.StallCount)
+				hadRunning = true
+			}
+		}
+		if r.Status == "running" || hadRunning {
+			_ = s.store.UpdateRunStatus(ctx, r.ID, "stopped")
+		}
+	}
+}
+
 func (s *Server) restoreProviderFromHarness(ctx context.Context) {
 	cfg := s.loadHarnessConfig()
 	accs, _ := s.store.ListAccounts(ctx)
@@ -1211,6 +1245,8 @@ func (s *Server) launchAsyncRunWithAccount(ctx context.Context, title, goal, pro
 	if err != nil {
 		return "", "", err
 	}
+	_ = s.store.UpdateBranchStatus(ctx, branchID, string(dag.StatusRunning), "", 0)
+	s.notify()
 	s.notify()
 	s.runBranchAsync(exec, branchID, maxTurns)
 	return runID, branchID, nil
@@ -1572,10 +1608,17 @@ func (s *Server) newExecutor(prof compiler.ModelProfile) *dag.Executor {
 	}
 
 	// Stream live tool dispatch and step completion events over SSE.
-	exec.AfterDispatchHook = func(_ context.Context, entry store.ActionJournalEntry) error {
+	exec.AfterDispatchHook = func(hookCtx context.Context, entry store.ActionJournalEntry) error {
 		label := friendlyToolTitle(entry.ToolName, entry.ArgsJSON, "")
+		parentID := ""
+		if br, bErr := s.store.GetBranch(hookCtx, entry.BranchID); bErr == nil && br.ParentBranchID != "" {
+			parentID = br.ParentBranchID
+		}
 		s.mu.Lock()
 		s.activeTools[entry.BranchID] = label
+		if parentID != "" {
+			s.activeTools[parentID] = label
+		}
 		s.desktopLastActive = time.Now()
 		s.mu.Unlock()
 		s.notify()

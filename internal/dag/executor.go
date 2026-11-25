@@ -1938,7 +1938,7 @@ func strconvUnquote(s string) (string, error) {
 }
 
 func defaultKernelSystemPrompt() string {
-	return "You are soma, executing inside an isolated branch workspace. Available workspace tools: fs_list, fs_grep, fs_read(path, start_line?, end_line?), fs_write, fs_patch, exec(command, timeout_sec?), bg_exec, bg_poll(job_id, wait_seconds?), bg_kill, page_grep(page_id, pattern, context_lines?, ignore_case?), page_slice, page_search, memory_search, publish_finding, web_extract, desktop_task(goal, start_url?). Efficiency & rigor rules: (0) Match effort and response length to the request: answer simple questions, greetings, or quick queries directly and concisely (1–3 sentences) without running unnecessary workspace tools or writing long reports; only use tools when the user asks you to inspect, build, edit, run, or verify something in the workspace. (1) Batch independent read-only calls (fs_list, fs_grep, fs_read, page_grep, page_slice) in a single turn — they execute in parallel. (2) Use fs_grep to locate symbols, log lines, configs, or motifs across files instead of reading whole directories; use fs_read with start_line/end_line or page_grep/page_slice/page_search on spilled @page_XXXX handles instead of guessing. (3) Prefer fs_patch for targeted edits to existing files to preserve untouched code/configs. (4) For heavy compute, tests, or long-running processes, pass timeout_sec to exec (up to 300s) or use bg_exec + bg_poll(job_id, wait_seconds). (5) When asked to open a website, browse interactively, or control a GUI/desktop, call desktop_task(goal, start_url?) directly — the host automatically starts the Virtual Desktop if it is not running (never try to start Docker inside exec). (6) For complex research and engineering tasks, form explicit hypotheses, verify edge cases and invariants with tests before declaring completion, then summarize concisely."
+	return "You are soma, executing inside an isolated branch workspace. Available workspace tools: fs_list, fs_grep, fs_read(path, start_line?, end_line?), fs_write, fs_patch, exec(command, timeout_sec?), bg_exec, bg_poll(job_id, wait_seconds?), bg_kill, page_grep(page_id, pattern, context_lines?, ignore_case?), page_slice, page_search, memory_search, publish_finding, web_extract, desktop_task(goal, start_url?). Efficiency & rigor rules: (0) Match effort and response length to the request: answer simple questions, greetings, or quick queries directly and concisely (1–3 sentences) without running unnecessary workspace tools or writing long reports; only use tools when the user asks you to inspect, build, edit, run, or verify something in the workspace. (1) Batch independent read-only calls (fs_list, fs_grep, fs_read, page_grep, page_slice) in a single turn — they execute in parallel. (2) Use relative paths inside `/workspace` (e.g. `artifacts/...`) — `/workspace` is shared with the Virtual Desktop (`desktop_task`), whereas `/tmp` is separate per container. (3) Use fs_grep to locate symbols or configs instead of reading whole directories; prefer fs_patch for targeted edits to existing files. (4) For heavy compute or servers, pass timeout_sec to exec (up to 300s) or use bg_exec + bg_poll. (5) For websites, UIs, or desktop apps, call desktop_task(goal, start_url?) directly — the host auto-starts the Virtual Desktop (server name is `docker-desktop` if using mcp_call; never run `docker` inside exec). (6) For complex engineering tasks, verify edge cases with tests before finishing, then summarize concisely."
 }
 
 func (e *Executor) buildEpochInput(run store.Run, activeMem []compiler.MemoryEntry, grave []compiler.GraveyardEntry) compiler.EpochInput {
@@ -2685,6 +2685,18 @@ func (r *LocalToolRunner) Execute(ctx context.Context, call ToolCall) (ToolOutpu
 				serverName = parsedSrv
 				toolName = parsedTool
 			}
+		}
+		// Auto-resolve common server aliases ("desktop" or empty) so smaller models don't waste turns guessing.
+		connected := r.MCPManager.ListServers()
+		if strings.EqualFold(strings.TrimSpace(serverName), "desktop") {
+			for _, srv := range connected {
+				if srv == "docker-desktop" {
+					serverName = srv
+					break
+				}
+			}
+		} else if strings.TrimSpace(serverName) == "" && len(connected) == 1 {
+			serverName = connected[0]
 		}
 		var toolArgs map[string]any
 		if rawArgs, ok := args["arguments_json"].(string); ok && strings.TrimSpace(rawArgs) != "" {

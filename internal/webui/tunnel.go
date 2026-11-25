@@ -19,9 +19,10 @@ var tryCloudflareURLRe = regexp.MustCompile(`https://[a-zA-Z0-9-]+\.trycloudflar
 
 // TunnelConfig persists cloudflared remote access settings in .soma/harness.json.
 type TunnelConfig struct {
-	Mode        string `json:"mode"`                   // "quick" | "token"
+	Mode        string `json:"mode"`                   // "quick" | "token" | "config"
 	TunnelToken string `json:"tunnel_token,omitempty"` // Cloudflare Zero Trust tunnel token (when mode == "token")
-	Hostname    string `json:"hostname,omitempty"`     // Optional custom hostname (when mode == "token")
+	ConfigPath  string `json:"config_path,omitempty"`  // Local cloudflared YAML config path (when mode == "config")
+	Hostname    string `json:"hostname,omitempty"`     // Optional custom hostname (when mode == "token" or "config")
 	AuthToken   string `json:"auth_token,omitempty"`   // Required dashboard Bearer / session token for external access
 	AutoStart   bool   `json:"auto_start,omitempty"`   // Automatically start cloudflared when soma web boots
 }
@@ -32,6 +33,7 @@ type TunnelDTO struct {
 	Running         bool   `json:"running"`
 	AutoStart       bool   `json:"auto_start"`
 	Mode            string `json:"mode"`
+	ConfigPath      string `json:"config_path,omitempty"`
 	PublicURL       string `json:"public_url,omitempty"`
 	Hostname        string `json:"hostname,omitempty"`
 	HasTunnelToken  bool   `json:"has_tunnel_token"`
@@ -71,7 +73,7 @@ func (tm *TunnelManager) Status(cfg TunnelConfig) TunnelDTO {
 		mode = "quick"
 	}
 	pub := tm.publicURL
-	if pub == "" && mode == "token" && strings.TrimSpace(cfg.Hostname) != "" && tm.running {
+	if pub == "" && (mode == "token" || mode == "config") && strings.TrimSpace(cfg.Hostname) != "" && tm.running {
 		pub = "https://" + strings.TrimPrefix(strings.TrimSpace(cfg.Hostname), "https://")
 	}
 	return TunnelDTO{
@@ -79,6 +81,7 @@ func (tm *TunnelManager) Status(cfg TunnelConfig) TunnelDTO {
 		Running:         tm.running,
 		AutoStart:       cfg.AutoStart,
 		Mode:            mode,
+		ConfigPath:      cfg.ConfigPath,
 		PublicURL:       pub,
 		Hostname:        cfg.Hostname,
 		HasTunnelToken:  strings.TrimSpace(cfg.TunnelToken) != "",
@@ -113,8 +116,13 @@ func (tm *TunnelManager) Start(parentCtx context.Context, localURL string, cfg T
 			return errors.New("tunnel: tunnel_token is required for named token mode")
 		}
 		args = []string{"tunnel", "--no-autoupdate", "run", "--token", strings.TrimSpace(cfg.TunnelToken)}
+	case "config":
+		if strings.TrimSpace(cfg.ConfigPath) == "" {
+			return errors.New("tunnel: config_path is required for config mode")
+		}
+		args = []string{"tunnel", "--no-autoupdate", "--config", strings.TrimSpace(cfg.ConfigPath), "run"}
 	default:
-		return fmt.Errorf("tunnel: unsupported mode %q (expected quick or token)", cfg.Mode)
+		return fmt.Errorf("tunnel: unsupported mode %q (expected quick, token, or config)", cfg.Mode)
 	}
 
 	tm.Stop()

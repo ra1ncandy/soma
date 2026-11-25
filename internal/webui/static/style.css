@@ -1202,15 +1202,65 @@ html, body {
   }
 
   .topbar {
-    padding: 10px 14px;
+    padding: 8px 12px;
+    gap: 8px;
   }
 
   #taskTopbar {
-    display: none;
+    display: none !important;
   }
 
-  .app.has-active-task #taskTopbar {
-    display: flex;
+  .task-banner {
+    padding: 5px 10px;
+    font-size: 12px;
+    gap: 8px;
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .task-banner-title {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .task-banner .connector-actions {
+    flex-shrink: 0;
+    gap: 6px;
+  }
+
+  .task-banner .btn-sm {
+    min-height: 26px;
+    padding: 3px 9px;
+    font-size: 11.5px;
+  }
+
+  .scroll-area {
+    padding: 10px;
+  }
+
+  .feed {
+    gap: 8px;
+  }
+
+  .toast {
+    top: 58px;
+    bottom: auto;
+    left: 12px;
+    right: 12px;
+    max-width: none;
+  }
+
+  .composer {
+    padding: 6px 8px 6px 10px;
+    gap: 6px;
+  }
+
+  .send-pill-btn {
+    width: 34px;
+    height: 34px;
   }
 
   .task-title { max-width: 68vw; }

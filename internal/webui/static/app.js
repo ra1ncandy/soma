@@ -431,7 +431,7 @@
 
     const run = getSelectedRun();
     const branch = getSelectedBranch(run);
-    const isRunning = Boolean(branch && branch.status === "running");
+    const isRunning = Boolean(branch && (branch.status === "running" || (branch.status === "queued" && run?.status === "running")));
 
     const anyRunning = (st.runs || []).some((r) => r.status === "running" || (r.branches || []).some((b) => b.status === "running"));
     const activeTaskDot = document.getElementById("activeTaskNavDot");
@@ -445,13 +445,13 @@
     const sendIcon = document.getElementById("sendBtnIcon");
     if (goalInput) {
       if (st.provider_mode === "read-only") {
-        goalInput.placeholder = "Add an AI model in Settings to start chatting…";
+        goalInput.placeholder = "Add an AI model in Settings to start…";
       } else if (isRunning) {
-        goalInput.placeholder = "soma is working on this task — click ■ to stop or wait to reply…";
+        goalInput.placeholder = "Working… click ■ to stop";
       } else if (appState.selectedRunId) {
-        goalInput.placeholder = "Reply or give follow-up instructions… (Shift+Enter for new line)";
+        goalInput.placeholder = "Reply or follow up…";
       } else {
-        goalInput.placeholder = "Ask soma to build, debug, or browse… (Shift+Enter for new line)";
+        goalInput.placeholder = "Ask soma to build, debug, or browse…";
       }
     }
 
@@ -496,7 +496,15 @@
       sendBtn.classList.add("stop-mode");
       sendBtn.title = "Stop running task";
       if (sendIcon) {
-        sendIcon.replaceChildren(el("rect", { x: 6, y: 6, width: 12, height: 12, rx: 2, fill: "currentColor", stroke: "none" }));
+        const rect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+        rect.setAttribute("x", "6");
+        rect.setAttribute("y", "6");
+        rect.setAttribute("width", "12");
+        rect.setAttribute("height", "12");
+        rect.setAttribute("rx", "2");
+        rect.setAttribute("fill", "currentColor");
+        rect.setAttribute("stroke", "none");
+        sendIcon.replaceChildren(rect);
       }
     } else {
       hint.classList.add("hidden");
@@ -504,7 +512,9 @@
       sendBtn.classList.remove("stop-mode");
       sendBtn.title = "Send (Enter)";
       if (sendIcon) {
-        sendIcon.replaceChildren(el("path", { d: "M5 12h14M13 5l7 7-7 7" }));
+        const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+        path.setAttribute("d", "M5 12h14M13 5l7 7-7 7");
+        sendIcon.replaceChildren(path);
       }
     }
 
@@ -927,7 +937,7 @@
       branchSel.classList.add("hidden");
     }
 
-    const isRunning = Boolean(branch && branch.status === "running");
+    const isRunning = Boolean(branch && (branch.status === "running" || (branch.status === "queued" && run.status === "running")));
     const isCompleted = Boolean(branch && branch.status === "completed");
     const canResume = Boolean(branch && !isRunning && !isCompleted);
 
@@ -944,7 +954,7 @@
       changesBar.replaceChildren(
         el("div", { className: "task-banner-title" },
           el("span", { className: "status-dot ok" }),
-          el("span", { text: `${cnt} file${cnt === 1 ? "" : "s"} modified in isolated sandbox workspace` })
+          el("span", { text: `${cnt} changed file${cnt === 1 ? "" : "s"}` })
         ),
         el("div", { className: "connector-actions" },
           el("button", {
@@ -1077,17 +1087,11 @@
     if (branch) {
       // Group steps into conversational turns delimited by user_message
       const turns = [];
-      let currentTurn = { key: "turn-0", steps: [] };
+      let currentTurn = { key: "turn-0", userStep: null, steps: [] };
       turns.push(currentTurn);
       for (const st of branch.steps || []) {
         if (st.step_type === "user_message") {
-          feed.appendChild(
-            el("div", { className: "chat-msg chat-msg-user" },
-              el("div", { className: "chat-msg-head" }, el("span", { text: "You" })),
-              renderMarkdownEl(st.reasoning || "")
-            )
-          );
-          currentTurn = { key: `turn-${st.id}`, steps: [] };
+          currentTurn = { key: `turn-${st.id}`, userStep: st, steps: [] };
           turns.push(currentTurn);
         } else {
           currentTurn.steps.push(st);
@@ -1147,6 +1151,14 @@
       };
 
       turns.forEach((turn, idx) => {
+        if (turn.userStep) {
+          feed.appendChild(
+            el("div", { className: "chat-msg chat-msg-user" },
+              el("div", { className: "chat-msg-head" }, el("span", { text: "You" })),
+              renderMarkdownEl(turn.userStep.reasoning || "")
+            )
+          );
+        }
         const isLastTurn = idx === turns.length - 1;
         const turnSteps = turn.steps;
         const turnIterating = isLastTurn && isRunning;
