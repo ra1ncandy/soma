@@ -62,6 +62,12 @@ func Open(somaDir string) (*Store, error) {
 		return nil, fmt.Errorf("apply schema migrations: %w", err)
 	}
 
+	if err := ensureColumn(writer, "accounts", "spent_day", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		_ = writer.Close()
+		_ = blobs.Close()
+		return nil, fmt.Errorf("apply schema upgrades: %w", err)
+	}
+
 	readerDSN := buildSQLiteDSN(dbPath, true)
 	reader, err := sql.Open("sqlite", readerDSN)
 	if err != nil {
@@ -90,6 +96,29 @@ func Open(somaDir string) (*Store, error) {
 		reader:  reader,
 		blobs:   blobs,
 	}, nil
+}
+
+// ensureColumn adds a column to an existing table when an older database predates it.
+func ensureColumn(db *sql.DB, table, column, decl string) error {
+	rows, err := db.Query("SELECT name FROM pragma_table_info(?)", table)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return err
+		}
+		if name == column {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = db.Exec("ALTER TABLE " + table + " ADD COLUMN " + column + " " + decl)
+	return err
 }
 
 func buildSQLiteDSN(dbPath string, readOnly bool) string {

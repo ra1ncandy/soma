@@ -1192,8 +1192,8 @@ func (s *Store) UpsertAccount(ctx context.Context, a Account) error {
 		_, err := conn.ExecContext(ctx, `
 			INSERT INTO accounts (
 				id, provider, model_id, billing_mode, max_concurrent, active_leases,
-				cooldown_until, daily_budget_usd, daily_spent_usd, last_error, updated_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				cooldown_until, daily_budget_usd, daily_spent_usd, last_error, updated_at, spent_day
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(id) DO UPDATE SET
 				provider = excluded.provider,
 				model_id = excluded.model_id,
@@ -1202,7 +1202,7 @@ func (s *Store) UpsertAccount(ctx context.Context, a Account) error {
 				daily_budget_usd = excluded.daily_budget_usd,
 				updated_at = excluded.updated_at`,
 			a.ID, a.Provider, a.ModelID, a.BillingMode, a.MaxConcurrent, a.ActiveLeases,
-			a.CooldownUntil, a.DailyBudgetUSD, a.DailySpentUSD, nullStr(a.LastError), a.UpdatedAt,
+			a.CooldownUntil, a.DailyBudgetUSD, a.DailySpentUSD, nullStr(a.LastError), a.UpdatedAt, spendDay(),
 		)
 		return err
 	})
@@ -1271,6 +1271,21 @@ func (s *Store) DeleteAccount(ctx context.Context, id string) (bool, error) {
 	return affected > 0, err
 }
 
+// staleLeaseSeconds bounds how long a lease may sit with no activity before it is treated as orphaned.
+const staleLeaseSeconds = 30 * 60
+
+func spendDay() string { return time.Now().Format("2006-01-02") }
+
+// rollDailySpendTx zeroes daily_spent_usd when the stored spend day is not today, so the
+// "daily" budget is per calendar day rather than a lifetime cap.
+func rollDailySpendTx(ctx context.Context, conn *sql.Conn, id string) error {
+	day := spendDay()
+	_, err := conn.ExecContext(ctx, `
+		UPDATE accounts SET daily_spent_usd = 0.0, spent_day = ?
+		WHERE id = ? AND spent_day != ?`, day, id, day)
+	return err
+}
+
 // AcquireLease atomically increments active_leases if off cooldown (in Unix milliseconds) and below max_concurrent.
 func (s *Store) AcquireLease(ctx context.Context, id string, nowUnixMs int64) error {
 	nowSec := time.Now().Unix()
@@ -1280,6 +1295,18 @@ func (s *Store) AcquireLease(ctx context.Context, id string, nowUnixMs int64) er
 			if errors.Is(err, sql.ErrNoRows) {
 				return ErrNotFound
 			}
+			return err
+		}
+		// Leases are in-flight model calls. A lease with no acquire/release activity for longer than
+		// any call can last was orphaned by a crash or kill; reclaim it instead of blocking forever.
+		if _, err := conn.ExecContext(ctx, `
+			UPDATE accounts SET active_leases = 0
+			WHERE id = ? AND active_leases > 0 AND updated_at < ?`,
+			id, nowSec-staleLeaseSeconds,
+		); err != nil {
+			return err
+		}
+		if err := rollDailySpendTx(ctx, conn, id); err != nil {
 			return err
 		}
 		res, err := conn.ExecContext(ctx, `
@@ -1309,6 +1336,9 @@ func (s *Store) AcquireLease(ctx context.Context, id string, nowUnixMs int64) er
 func (s *Store) ReleaseLease(ctx context.Context, id string, spentDeltaUSD float64) error {
 	nowSec := time.Now().Unix()
 	return s.WithWriteTx(ctx, func(conn *sql.Conn) error {
+		if err := rollDailySpendTx(ctx, conn, id); err != nil {
+			return err
+		}
 		res, err := conn.ExecContext(ctx, `
 			UPDATE accounts
 			SET active_leases = CASE WHEN active_leases > 0 THEN active_leases - 1 ELSE 0 END,
@@ -1809,7 +1839,7 @@ func (s *Store) TotalDailyMeteredSpend(ctx context.Context) (float64, error) {
 	var total float64
 	err := s.reader.QueryRowContext(ctx, `
 		SELECT COALESCE(SUM(daily_spent_usd), 0.0)
-		FROM accounts WHERE billing_mode = 'metered'`,
+		FROM accounts WHERE billing_mode = 'metered' AND spent_day = ?`, spendDay(),
 	).Scan(&total)
 	return total, err
 }

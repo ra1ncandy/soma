@@ -692,6 +692,14 @@ func (e *Executor) AppendFollowUpUserTurn(ctx context.Context, branchID, message
 	return nil
 }
 
+// releaseLease returns an account lease even when ctx is already cancelled (operator Stop, run
+// timeout). Releasing on the cancelled context would fail and leak the lease permanently.
+func (e *Executor) releaseLease(ctx context.Context, accountID string, spentUSD float64) error {
+	relCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	return e.Scheduler.Release(relCtx, accountID, spentUSD)
+}
+
 // ExecuteBranch runs or resumes branchID up to maxTurns, handling 429s, crashes, rollovers, and provenance.
 func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns int) (*BranchResult, error) {
 	if maxTurns <= 0 {
@@ -759,7 +767,7 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 	for turn := 0; turn < maxTurns; turn++ {
 		if ctx.Err() != nil {
 			if preacquiredAcc != nil {
-				_ = e.Scheduler.Release(ctx, preacquiredAcc.ID, 0)
+				_ = e.releaseLease(ctx, preacquiredAcc.ID, 0)
 			}
 			return res, ctx.Err()
 		}
@@ -849,7 +857,7 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 		})
 		deltaHash, _, err := e.Store.Blobs().Put(deltaBytes)
 		if err != nil {
-			_ = e.Scheduler.Release(ctx, acc.ID, 0)
+			_ = e.releaseLease(ctx, acc.ID, 0)
 			return res, err
 		}
 
@@ -865,7 +873,7 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 			var rlErr *RateLimitError
 			if errors.As(genErr, &rlErr) {
 				_ = e.Scheduler.RecordRateLimit(ctx, acc.ID, rlErr.RetryAfter, rlErr.Error())
-				_ = e.Scheduler.Release(ctx, acc.ID, 0)
+				_ = e.releaseLease(ctx, acc.ID, 0)
 				if e.AllowFailover && failoverAttempts < len(e.AccountIDs)+1 {
 					fbAcc, fbErr := e.Scheduler.Acquire(ctx, "", e.AccountIDs)
 					if fbErr == nil {
@@ -883,7 +891,7 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 							turn--
 							continue
 						}
-						_ = e.Scheduler.Release(ctx, fbAcc.ID, 0)
+						_ = e.releaseLease(ctx, fbAcc.ID, 0)
 					}
 				}
 				_ = e.Store.UpdateBranchStatus(ctx, branch.ID, string(StatusSuspendedQuota), acc.ID, branch.StallCount)
@@ -893,10 +901,10 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 					ResumeAt: time.Now().Add(rlErr.RetryAfter),
 				}
 			}
-			_ = e.Scheduler.Release(ctx, acc.ID, 0)
+			_ = e.releaseLease(ctx, acc.ID, 0)
 			return res, genErr
 		}
-		_ = e.Scheduler.Release(ctx, acc.ID, genResp.CostUSD)
+		_ = e.releaseLease(ctx, acc.ID, genResp.CostUSD)
 
 		res.TotalTokens += genResp.InputTokens + genResp.CacheReadTokens + genResp.OutputTokens
 		res.CacheReadToks += genResp.CacheReadTokens
