@@ -1,7 +1,6 @@
 package dag
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -25,30 +24,35 @@ type bgJob struct {
 	cmd          *exec.Cmd
 	sandboxed    bool
 
-	mu              sync.Mutex
-	buf             bytes.Buffer
-	done            bool
+	mu sync.Mutex
+	// buf holds the most recent output. dropped counts bytes discarded from its front, so
+	// dropped+len(buf) is the total ever written and polled is an absolute offset into that stream.
+	buf     []byte
+	dropped int64
+	polled  int64
+	done    bool
 	exitCode        int
 	exitErr         string
 	endedAt         time.Time
-	lastPage        string
-	lastPolledBytes int
+	lastPage string
 }
 
 func (j *bgJob) Write(p []byte) (int, error) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	// Cap in-memory buffer at 4 MiB per background job.
+	// Cap the in-memory buffer at 4 MiB per job, keeping the newest output: for a long-running
+	// server the recent log lines are the ones that matter, not the first 4 MiB it ever printed.
 	const maxBuf = 4 << 20
-	if j.buf.Len()+len(p) > maxBuf {
-		keep := maxBuf - j.buf.Len()
-		if keep <= 0 {
-			return len(p), nil
-		}
-		p = p[:keep]
+	j.buf = append(j.buf, p...)
+	if len(j.buf) > maxBuf {
+		cut := len(j.buf) - maxBuf/2
+		j.dropped += int64(cut)
+		j.buf = append(j.buf[:0], j.buf[cut:]...)
 	}
-	return j.buf.Write(p)
+	return len(p), nil
 }
+
+func (j *bgJob) totalLocked() int64 { return j.dropped + int64(len(j.buf)) }
 
 // BgProcessManager manages non-blocking background shell processes per workspace and spills
 // their live stdout/stderr streams into @page virtual memory handles on poll/kill.
@@ -211,10 +215,9 @@ func (m *BgProcessManager) PollWait(ctx context.Context, vm *vmem.Manager, jobID
 		for time.Now().Before(deadline) {
 			job.mu.Lock()
 			isDone := job.done
-			curBytes := job.buf.Len()
-			prevBytes := job.lastPolledBytes
+			hasNew := job.totalLocked() > job.polled
 			job.mu.Unlock()
-			if isDone || (curBytes > prevBytes && curBytes > 0) {
+			if isDone || hasNew {
 				break
 			}
 			select {
@@ -229,8 +232,18 @@ func (m *BgProcessManager) PollWait(ctx context.Context, vm *vmem.Manager, jobID
 	done := job.done
 	exitCode := job.exitCode
 	exitErr := job.exitErr
-	rawOut := append([]byte(nil), job.buf.Bytes()...)
-	job.lastPolledBytes = len(rawOut)
+	// Each poll reports the complete retained output, so the latest @page is always a full view.
+	// When nothing new arrived since the previous poll the earlier page is reused instead of
+	// copying, compressing and indexing megabytes into an identical one.
+	total := job.totalLocked()
+	unchanged := total == job.polled && job.lastPage != ""
+	prevPage := job.lastPage
+	skipped := job.dropped
+	var rawOut []byte
+	if !unchanged {
+		rawOut = append([]byte(nil), job.buf...)
+	}
+	job.polled = total
 	dur := time.Since(job.startedAt)
 	if done && !job.endedAt.IsZero() {
 		dur = job.endedAt.Sub(job.startedAt)
@@ -248,8 +261,13 @@ func (m *BgProcessManager) PollWait(ctx context.Context, vm *vmem.Manager, jobID
 	}
 
 	header := fmt.Sprintf("job_id=%s label=%q status=%s elapsed=%s bytes=%d",
-		job.id, label, stateStr, dur.Round(time.Millisecond), len(rawOut))
-
+		job.id, label, stateStr, dur.Round(time.Millisecond), total)
+	if skipped > 0 {
+		header += fmt.Sprintf("\n(the oldest %d bytes were discarded: the job exceeded its 4 MiB buffer; the newest output is kept)", skipped)
+	}
+	if unchanged {
+		return header + fmt.Sprintf("\n(no new output since the last poll; full output so far: @%s — use page_grep or page_slice)", prevPage), nil
+	}
 	if len(rawOut) == 0 {
 		return header + "\n(no output yet)", nil
 	}

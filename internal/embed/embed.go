@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"io"
 	"math"
 	"net/http"
@@ -425,6 +424,20 @@ func (e *LocalSimHashEmbedder) Embed(_ context.Context, texts []string, _ bool) 
 	return out, nil
 }
 
+const (
+	fnvOffset64 = 14695981039346656037
+	fnvPrime64  = 1099511628211
+)
+
+// fnv1a continues a 64-bit FNV-1a hash over s without allocating.
+func fnv1a(h uint64, s string) uint64 {
+	for i := 0; i < len(s); i++ {
+		h ^= uint64(s[i])
+		h *= fnvPrime64
+	}
+	return h
+}
+
 func (e *LocalSimHashEmbedder) embedOne(text string) []byte {
 	acc := make([]float32, e.dims)
 	toks := Tokenize(text)
@@ -432,11 +445,10 @@ func (e *LocalSimHashEmbedder) embedOne(text string) []byte {
 		return make([]byte, e.dims)
 	}
 
-	addFeature := func(feat string, weight float32) {
-		h := fnv.New64a()
-		_, _ = h.Write([]byte(feat))
-		seed := h.Sum64()
-		// Project each feature onto 8 sparse coordinates with deterministic Rademacher signs.
+	// project spreads one hashed feature over 8 sparse coordinates with deterministic Rademacher
+	// signs. Features are hashed with FNV-1a chained over their parts (prefix, token, ...), which
+	// yields exactly the hash of the concatenated string without building it.
+	project := func(seed uint64, weight float32) {
 		s := seed
 		for k := 0; k < 8; k++ {
 			s ^= s >> 12
@@ -452,22 +464,28 @@ func (e *LocalSimHashEmbedder) embedOne(text string) []byte {
 		}
 	}
 
+	var runeStarts []int
 	for pos, tok := range toks {
 		// Full token feature + Stemmed prefix + character 3-gram features for morphological similarity.
-		addFeature("tok:"+tok, 2.0)
+		project(fnv1a(fnv1a(fnvOffset64, "tok:"), tok), 2.0)
 		if len(tok) >= 5 {
-			addFeature("stem:"+tok[:5], 1.2)
+			project(fnv1a(fnv1a(fnvOffset64, "stem:"), tok[:5]), 1.2)
 		}
 		if len(tok) >= 4 {
-			addFeature("p4:"+tok[:4], 1.0)
+			project(fnv1a(fnv1a(fnvOffset64, "p4:"), tok[:4]), 1.0)
 		}
-		runes := []rune(tok)
-		for j := 0; j+3 <= len(runes); j++ {
-			addFeature("g3:"+string(runes[j:j+3]), 0.45)
+		runeStarts = runeStarts[:0]
+		for i := range tok {
+			runeStarts = append(runeStarts, i)
+		}
+		runeStarts = append(runeStarts, len(tok))
+		g3 := fnv1a(fnvOffset64, "g3:")
+		for j := 0; j+3 < len(runeStarts); j++ {
+			project(fnv1a(g3, tok[runeStarts[j]:runeStarts[j+3]]), 0.45)
 		}
 		// Bigram token feature for local phrase order.
 		if pos+1 < len(toks) {
-			addFeature("bi:"+tok+"_"+toks[pos+1], 1.25)
+			project(fnv1a(fnv1a(fnv1a(fnv1a(fnvOffset64, "bi:"), tok), "_"), toks[pos+1]), 1.25)
 		}
 	}
 	return QuantizeMatryoshkaInt8(acc, e.dims)

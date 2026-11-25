@@ -238,12 +238,19 @@ func (s *Service) Search(ctx context.Context, scopes, kinds []string, query stri
 
 	storedVecs := make(map[string][]byte, len(nodes))
 	if recs, err := s.store.GetEmbeddingsByTargets(ctx, "memory", ids); err == nil {
+		wantModel := ""
+		if s.embedder != nil {
+			wantModel = s.embedder.ModelID()
+		}
 		for _, r := range recs {
-			if r.ChunkIndex == 0 && len(r.VecInt8) > 0 {
+			// A vector from a different embedding model is not comparable with this embedder's
+			// query vector; treat it as missing so it is re-embedded below.
+			if r.ChunkIndex == 0 && len(r.VecInt8) > 0 && (wantModel == "" || r.ModelID == wantModel) {
 				storedVecs[r.TargetID] = r.VecInt8
 			}
 		}
 	}
+	var newEmbeddings []store.EmbeddingRecord
 
 	docs := make([]embed.Document, len(nodes))
 	for i, n := range nodes {
@@ -251,7 +258,7 @@ func (s *Service) Search(ctx context.Context, scopes, kinds []string, query stri
 		if len(vec) == 0 && s.embedder != nil {
 			if gen, gErr := s.embedder.Embed(ctx, []string{n.Content}, false); gErr == nil && len(gen) == 1 && len(gen[0]) > 0 {
 				vec = gen[0]
-				_ = s.store.UpsertEmbedding(ctx, store.EmbeddingRecord{
+				newEmbeddings = append(newEmbeddings, store.EmbeddingRecord{
 					Kind:       "memory",
 					TargetID:   n.ID,
 					ChunkIndex: 0,
@@ -269,6 +276,8 @@ func (s *Service) Search(ctx context.Context, scopes, kinds []string, query stri
 			Boost:   1.0,
 		}
 	}
+
+	_ = s.store.UpsertEmbeddings(ctx, newEmbeddings) // one transaction for all new vectors
 
 	ranked, err := embed.HybridSearch(ctx, s.embedder, query, docs, topK)
 	if err != nil {
