@@ -208,7 +208,8 @@ func TestWebhookAdaptersMattermostGoogleChatAndSidecar(t *testing.T) {
 	// Google Chat
 	gc := NewGoogleChatAdapter(gw, "", []string{"users/1"})
 	gcBody := []byte(`{"type":"MESSAGE","space":{"name":"spaces/1","type":"DM"},"message":{"text":"hello gchat","sender":{"name":"users/1"}}}`)
-	gcReq := httptest.NewRequest(http.MethodPost, "/gchat", bytes.NewReader(gcBody))
+	gc.InboundToken = "gc-secret"
+	gcReq := httptest.NewRequest(http.MethodPost, "/gchat?token=gc-secret", bytes.NewReader(gcBody))
 	gcRec := httptest.NewRecorder()
 	gc.Handler().ServeHTTP(gcRec, gcReq)
 	if gcRec.Code != http.StatusOK || !strings.Contains(gcRec.Body.String(), "echo:hello gchat") {

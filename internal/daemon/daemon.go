@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -73,6 +74,7 @@ type Daemon struct {
 	warmBranches map[string]warmBranchRef
 	sentinelSeq  atomic.Uint64
 	listenAddr   string
+	generatedWebhookSecret string
 	runCtx       context.Context
 }
 
@@ -481,15 +483,16 @@ func (d *Daemon) WebhookHandler() http.Handler {
 			http.Error(w, "read body failed", http.StatusBadRequest)
 			return
 		}
-		if d.Config.WebhookSecret != "" {
-			sig := r.Header.Get("X-Soma-Signature")
-			if sig == "" {
-				sig = r.Header.Get("X-Hub-Signature-256")
-			}
-			if !verifyHMACSHA256(d.Config.WebhookSecret, sig, body) {
-				http.Error(w, "invalid webhook signature", http.StatusUnauthorized)
-				return
-			}
+		// Webhooks start agent runs with attacker-chosen text, and this route sits in front of the
+		// dashboard's own auth, so it is never open: a secret is always required.
+		secret, secErr := d.webhookSecret()
+		if secErr != nil {
+			http.Error(w, "webhook secret unavailable", http.StatusInternalServerError)
+			return
+		}
+		if !webhookAuthorized(secret, r, body) {
+			http.Error(w, "invalid webhook signature (send X-Soma-Signature: sha256=<hmac of body> or X-Soma-Webhook-Secret; the secret is webhook_secret in triggers.yaml, or .soma/webhook_secret)", http.StatusUnauthorized)
+			return
 		}
 
 		var fields map[string]any
@@ -899,6 +902,51 @@ func matchesShorthandEvent(want string, fields map[string]any) bool {
 		}
 	}
 	return false
+}
+
+// webhookSecret returns the configured webhook_secret, or a per-project secret generated on first
+// use and stored in .soma/webhook_secret (0600) when none is configured.
+func (d *Daemon) webhookSecret() (string, error) {
+	if s := strings.TrimSpace(d.Config.WebhookSecret); s != "" {
+		return s, nil
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.generatedWebhookSecret != "" {
+		return d.generatedWebhookSecret, nil
+	}
+	if d.Store == nil {
+		return "", errors.New("daemon: no store for webhook secret")
+	}
+	path := filepath.Join(d.Store.SomaDir(), "webhook_secret")
+	if raw, err := os.ReadFile(path); err == nil && len(strings.TrimSpace(string(raw))) >= 32 {
+		d.generatedWebhookSecret = strings.TrimSpace(string(raw))
+		return d.generatedWebhookSecret, nil
+	}
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	secret := hex.EncodeToString(buf)
+	if err := os.WriteFile(path, []byte(secret+"\n"), 0o600); err != nil {
+		return "", err
+	}
+	d.generatedWebhookSecret = secret
+	return secret, nil
+}
+
+// webhookAuthorized accepts either an HMAC-SHA256 body signature (GitHub-style) or the secret
+// itself in a custom header. A custom header cannot be sent cross-site by a browser without a
+// CORS preflight, so both forms defeat drive-by POSTs to localhost.
+func webhookAuthorized(secret string, r *http.Request, body []byte) bool {
+	if tok := strings.TrimSpace(r.Header.Get("X-Soma-Webhook-Secret")); tok != "" {
+		return hmac.Equal([]byte(tok), []byte(secret))
+	}
+	sig := r.Header.Get("X-Soma-Signature")
+	if sig == "" {
+		sig = r.Header.Get("X-Hub-Signature-256")
+	}
+	return verifyHMACSHA256(secret, sig, body)
 }
 
 func verifyHMACSHA256(secret, header string, body []byte) bool {

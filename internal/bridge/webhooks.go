@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 )
@@ -107,8 +108,8 @@ func (a *MattermostAdapter) Handler() http.Handler {
 			http.Error(w, "bad json", http.StatusBadRequest)
 			return
 		}
-		if a.Config.OutgoingToken != "" && payload.Token != a.Config.OutgoingToken {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
+		if a.Config.OutgoingToken == "" || !hmac.Equal([]byte(payload.Token), []byte(a.Config.OutgoingToken)) {
+			http.Error(w, "unauthorized (mattermost outgoing token required)", http.StatusUnauthorized)
 			return
 		}
 		if a.Gateway == nil {
@@ -169,7 +170,10 @@ func (a *TeamsAdapter) Send(ctx context.Context, msg OutboundMessage) error {
 type GoogleChatAdapter struct {
 	Gateway    *Gateway
 	WebhookURL string
-	HTTPClient *http.Client
+	// InboundToken is the shared secret inbound event callbacks must present as ?token=.
+	// Defaults to $GOOGLE_CHAT_INBOUND_TOKEN; inbound events are refused when it is empty.
+	InboundToken string
+	HTTPClient   *http.Client
 }
 
 // NewGoogleChatAdapter constructs a Google Chat adapter.
@@ -177,7 +181,12 @@ func NewGoogleChatAdapter(gw *Gateway, webhookURL string, allowedUsers []string)
 	if gw != nil && len(allowedUsers) > 0 {
 		gw.SetStaticAllowlist("google-chat", allowedUsers)
 	}
-	return &GoogleChatAdapter{Gateway: gw, WebhookURL: webhookURL, HTTPClient: &http.Client{Timeout: 15 * time.Second}}
+	return &GoogleChatAdapter{
+		Gateway:      gw,
+		WebhookURL:   webhookURL,
+		InboundToken: strings.TrimSpace(os.Getenv("GOOGLE_CHAT_INBOUND_TOKEN")),
+		HTTPClient:   &http.Client{Timeout: 15 * time.Second},
+	}
 }
 
 // Name returns "google-chat".
@@ -222,6 +231,13 @@ func (a *GoogleChatAdapter) Handler() http.Handler {
 		}
 		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&ev); err != nil {
 			http.Error(w, "bad json", http.StatusBadRequest)
+			return
+		}
+		// Google Chat events carry no shared signature, and the sender fields are attacker-chosen
+		// for anyone who can reach this URL. Require a secret in the configured endpoint URL
+		// (…/webhooks/bridges/google-chat?token=<secret>).
+		if a.InboundToken == "" || !hmac.Equal([]byte(r.URL.Query().Get("token")), []byte(a.InboundToken)) {
+			http.Error(w, "unauthorized (set GOOGLE_CHAT_INBOUND_TOKEN and append ?token=<secret> to the endpoint URL)", http.StatusUnauthorized)
 			return
 		}
 		if ev.Type != "MESSAGE" || a.Gateway == nil {
@@ -302,24 +318,25 @@ func (a *WebhookBridgeAdapter) Handler() http.Handler {
 			http.Error(w, "read error", http.StatusBadRequest)
 			return
 		}
-		if a.Config.HMACSecret != "" {
-			sig := r.Header.Get("X-Soma-Signature")
-			mac := hmac.New(sha256.New, []byte(a.Config.HMACSecret))
-			mac.Write(body)
-			want := hex.EncodeToString(mac.Sum(nil))
-			if !hmac.Equal([]byte(want), []byte(strings.TrimPrefix(sig, "sha256="))) {
-				http.Error(w, "invalid signature", http.StatusUnauthorized)
-				return
-			}
+		if a.Config.HMACSecret == "" {
+			http.Error(w, "sidecar HMAC secret is not configured", http.StatusUnauthorized)
+			return
+		}
+		sig := r.Header.Get("X-Soma-Signature")
+		mac := hmac.New(sha256.New, []byte(a.Config.HMACSecret))
+		mac.Write(body)
+		want := hex.EncodeToString(mac.Sum(nil))
+		if !hmac.Equal([]byte(want), []byte(strings.TrimPrefix(sig, "sha256="))) {
+			http.Error(w, "invalid signature", http.StatusUnauthorized)
+			return
 		}
 		var in InboundMessage
 		if err := json.Unmarshal(body, &in); err != nil {
 			http.Error(w, "bad json", http.StatusBadRequest)
 			return
 		}
-		if in.Channel == "" {
-			in.Channel = a.Config.ChannelName
-		}
+		// The sidecar speaks only for its own channel; it must not borrow another channel's allowlist.
+		in.Channel = a.Config.ChannelName
 		if a.Gateway == nil {
 			http.Error(w, "gateway not configured", http.StatusInternalServerError)
 			return

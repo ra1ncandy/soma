@@ -109,11 +109,15 @@ func (a *SlackAdapter) Handler() http.Handler {
 			http.Error(w, "read error", http.StatusBadRequest)
 			return
 		}
-		if a.Config.SigningSecret != "" {
-			if !verifySlackSignature(a.Config.SigningSecret, r.Header.Get("X-Slack-Request-Timestamp"), r.Header.Get("X-Slack-Signature"), body) {
-				http.Error(w, "invalid slack signature", http.StatusUnauthorized)
-				return
-			}
+		// Fail closed: without a signing secret anyone who can reach this URL could impersonate
+		// an allowlisted Slack user.
+		if a.Config.SigningSecret == "" {
+			http.Error(w, "slack signing secret is not configured", http.StatusUnauthorized)
+			return
+		}
+		if !verifySlackSignature(a.Config.SigningSecret, r.Header.Get("X-Slack-Request-Timestamp"), r.Header.Get("X-Slack-Signature"), body) {
+			http.Error(w, "invalid slack signature", http.StatusUnauthorized)
+			return
 		}
 
 		var env struct {
