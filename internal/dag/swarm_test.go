@@ -232,7 +232,7 @@ func TestSwarmCoordinator_CooperativeBlackboardThreeWayMergeAndOracle(t *testing
 }
 
 type competitiveSwarmProvider struct {
-	mode      string
+	mode       string
 	trapFailed chan struct{}
 }
 

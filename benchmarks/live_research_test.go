@@ -417,10 +417,10 @@ func seedResearch3Workspace(dir string) error {
 		}
 	}
 	files := map[string]string{
-		"auth/tokens.py":  research3TokensPy,
-		"auth/store.py":   research3StorePy,
-		"api/files.py":    research3FilesPy,
-		"api/webhook.py":  research3WebhookPy,
+		"auth/tokens.py": research3TokensPy,
+		"auth/store.py":  research3StorePy,
+		"api/files.py":   research3FilesPy,
+		"api/webhook.py": research3WebhookPy,
 	}
 	for rel, content := range files {
 		if err := os.WriteFile(filepath.Join(dir, rel), []byte(content), 0o644); err != nil {

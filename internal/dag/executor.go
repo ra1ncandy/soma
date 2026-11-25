@@ -1024,13 +1024,13 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 
 		// Tool Call Turn (single or batched): pre-evaluate Data/Action-level taint policy across all calls BEFORE dispatching.
 		type plannedCall struct {
-			spec       ToolCallSpec
-			decision   taint.PolicyDecision
-			reason     string
-			actionID   string
-			argsHash   string
-			idemKey    string
-			provJSON   string
+			spec     ToolCallSpec
+			decision taint.PolicyDecision
+			reason   string
+			actionID string
+			argsHash string
+			idemKey  string
+			provJSON string
 		}
 		planned := make([]plannedCall, len(calls))
 		var allRefs []string
@@ -2011,9 +2011,9 @@ var ErrUnknownTool = errors.New("dag: unknown tool")
 
 // LocalToolRunner executes safe workspace-scoped operations (fs_list, fs_read, fs_write, fs_patch, exec, bg_exec, bg_poll, bg_kill, page_slice, page_grep, page_search, memory_search, publish_finding, web_search, web_extract, vision_analyze, broker_call, tool_search, branch_fork).
 type LocalToolRunner struct {
-	vm             *vmem.Manager
-	Sandbox        *sandbox.Manager
-	Broker         *broker.Router
+	vm      *vmem.Manager
+	Sandbox *sandbox.Manager
+	Broker  *broker.Router
 	// Memory is the memory service (with its configured embedder) used by memory_search/memory_write.
 	Memory         *memory.Service
 	MCPCatalog     *mcp.EpochCatalog

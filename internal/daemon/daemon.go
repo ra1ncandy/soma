@@ -30,12 +30,12 @@ import (
 
 // TriggerOutcome reports the deterministic result of evaluating or firing a Tier-0 trigger.
 type TriggerOutcome struct {
-	TriggerID      string `json:"trigger_id"`
-	IdempotencyKey string `json:"idempotency_key,omitempty"`
-	Status         string `json:"status"` // skipped | coalesced | inhibited | stopped | done | failed
-	Reason         string `json:"reason,omitempty"`
-	BranchID       string `json:"branch_id,omitempty"`
-	SentinelHash   string `json:"sentinel_hash,omitempty"`
+	TriggerID      string  `json:"trigger_id"`
+	IdempotencyKey string  `json:"idempotency_key,omitempty"`
+	Status         string  `json:"status"` // skipped | coalesced | inhibited | stopped | done | failed
+	Reason         string  `json:"reason,omitempty"`
+	BranchID       string  `json:"branch_id,omitempty"`
+	SentinelHash   string  `json:"sentinel_hash,omitempty"`
 	CostUSD        float64 `json:"cost_usd,omitempty"`
 }
 
@@ -53,11 +53,11 @@ type warmBranchRef struct {
 
 // Daemon implements soma's zero-token Tier-0 event pipeline, coalescer, inhibitory brakes, and TTL GC.
 type Daemon struct {
-	Store         *store.Store
-	Config        Config
-	WorkspaceDir  string
-	Provider      dag.ModelProvider
-	Profile       compiler.ModelProfile
+	Store          *store.Store
+	Config         Config
+	WorkspaceDir   string
+	Provider       dag.ModelProvider
+	Profile        compiler.ModelProfile
 	CommandRunner  CommandRunner
 	Handler        TriggerHandler
 	OutboundNotify func(ctx context.Context, channel, target, text string) error
@@ -70,12 +70,12 @@ type Daemon struct {
 	DispatchedCount  atomic.Int64
 	InhibitedCount   atomic.Int64
 
-	mu           sync.Mutex
-	warmBranches map[string]warmBranchRef
-	sentinelSeq  atomic.Uint64
-	listenAddr   string
+	mu                     sync.Mutex
+	warmBranches           map[string]warmBranchRef
+	sentinelSeq            atomic.Uint64
+	listenAddr             string
 	generatedWebhookSecret string
-	runCtx       context.Context
+	runCtx                 context.Context
 }
 
 // New constructs a Daemon configured for st and cfg.

@@ -17,9 +17,9 @@ import (
 type Mode string
 
 const (
-	ModeExact           Mode = "exact"
-	ModeCounterfactual  Mode = "counterfactual"
-	ModeSandboxBranch   Mode = "sandbox_branch"
+	ModeExact          Mode = "exact"
+	ModeCounterfactual Mode = "counterfactual"
+	ModeSandboxBranch  Mode = "sandbox_branch"
 )
 
 // ReplayOptions configures how Replay operates on a recorded branch.

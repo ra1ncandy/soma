@@ -121,7 +121,7 @@ func (s *SSHBackend) SupportsNetworkIsolation() bool { return true }
 func (s *SSHBackend) BuildArgs(spec ExecSpec) []string {
 	wsBase := "default"
 	if spec.WorkspaceDir != "" {
-		wsBase = filepath.Base( filepath.Clean(spec.WorkspaceDir))
+		wsBase = filepath.Base(filepath.Clean(spec.WorkspaceDir))
 	}
 	remoteDir := filepath.ToSlash(filepath.Join(s.RemoteRoot, wsBase))
 

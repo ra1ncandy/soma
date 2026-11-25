@@ -29,13 +29,13 @@ type bgJob struct {
 	mu sync.Mutex
 	// buf holds the most recent output. dropped counts bytes discarded from its front, so
 	// dropped+len(buf) is the total ever written and polled is an absolute offset into that stream.
-	buf     []byte
-	dropped int64
-	polled  int64
-	done    bool
-	exitCode        int
-	exitErr         string
-	endedAt         time.Time
+	buf      []byte
+	dropped  int64
+	polled   int64
+	done     bool
+	exitCode int
+	exitErr  string
+	endedAt  time.Time
 	lastPage string
 }
 

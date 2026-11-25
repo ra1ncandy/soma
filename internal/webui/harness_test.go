@@ -114,8 +114,8 @@ func TestServer_HarnessAndConnectorsCRUD(t *testing.T) {
 
 	// 5. Save Triggers & verify .soma/triggers.yaml written.
 	code, _ = postJSON("/api/harness/triggers", map[string]any{
-		"quiet_hours":             "23:00-07:00",
-		"max_pending_inbox":       5,
+		"quiet_hours":              "23:00-07:00",
+		"max_pending_inbox":        5,
 		"daily_metered_budget_usd": 12.5,
 		"triggers": []map[string]any{
 			{"ID": "nightly", "Type": "cron", "Interval": "24h", "Prompt": "Run health check"},

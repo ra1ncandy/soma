@@ -249,27 +249,42 @@ func TestTelegramAdapter_OffsetAllowlistCommandsAndAlerts(t *testing.T) {
 			UpdateID: 10,
 			Message: &tgMessage{
 				MessageID: 1,
-				From:      &struct { ID int64 "json:\"id\""; Username string "json:\"username\"" }{ID: 999, Username: "stranger"},
-				Chat:      struct { ID int64 "json:\"id\"" }{ID: 55},
-				Text:      "/status",
+				From: &struct {
+					ID       int64  "json:\"id\""
+					Username string "json:\"username\""
+				}{ID: 999, Username: "stranger"},
+				Chat: struct {
+					ID int64 "json:\"id\""
+				}{ID: 55},
+				Text: "/status",
 			},
 		},
 		{
 			UpdateID: 11,
 			Message: &tgMessage{
 				MessageID: 2,
-				From:      &struct { ID int64 "json:\"id\""; Username string "json:\"username\"" }{ID: 42, Username: "alice"},
-				Chat:      struct { ID int64 "json:\"id\"" }{ID: 55},
-				Text:      "/status@soma_bot",
+				From: &struct {
+					ID       int64  "json:\"id\""
+					Username string "json:\"username\""
+				}{ID: 42, Username: "alice"},
+				Chat: struct {
+					ID int64 "json:\"id\""
+				}{ID: 55},
+				Text: "/status@soma_bot",
 			},
 		},
 		{
 			UpdateID: 12,
 			Message: &tgMessage{
 				MessageID: 3,
-				From:      &struct { ID int64 "json:\"id\""; Username string "json:\"username\"" }{ID: 42, Username: "alice"},
-				Chat:      struct { ID int64 "json:\"id\"" }{ID: 55},
-				Text:      "/run verify tests",
+				From: &struct {
+					ID       int64  "json:\"id\""
+					Username string "json:\"username\""
+				}{ID: 42, Username: "alice"},
+				Chat: struct {
+					ID int64 "json:\"id\""
+				}{ID: 55},
+				Text: "/run verify tests",
 			},
 		},
 	}

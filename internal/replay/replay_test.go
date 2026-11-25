@@ -21,32 +21,32 @@ func (p *replayMockProvider) Generate(_ context.Context, req dag.GenerateRequest
 	switch req.TurnIndex {
 	case 1:
 		return &dag.GenerateResponse{
-			Reasoning: "read README",
-			ToolCall:  &dag.ToolCallSpec{Name: "fs_read", ArgsJSON: `{"path":"README.md"}`, EffectClass: taint.EffectReadOnly},
-			StateHash: "t1",
+			Reasoning:   "read README",
+			ToolCall:    &dag.ToolCallSpec{Name: "fs_read", ArgsJSON: `{"path":"README.md"}`, EffectClass: taint.EffectReadOnly},
+			StateHash:   "t1",
 			InputTokens: 100, CacheReadTokens: 800, OutputTokens: 20,
 		}, nil
 	case 2:
 		if p.mode == "diverge_turn2" {
 			return &dag.GenerateResponse{
-				Reasoning: "different tool",
-				ToolCall:  &dag.ToolCallSpec{Name: "fs_write", ArgsJSON: `{"path":"other.txt","content":"alt"}`, EffectClass: taint.EffectWorkspaceWrite},
-				StateHash: "t2_alt",
+				Reasoning:   "different tool",
+				ToolCall:    &dag.ToolCallSpec{Name: "fs_write", ArgsJSON: `{"path":"other.txt","content":"alt"}`, EffectClass: taint.EffectWorkspaceWrite},
+				StateHash:   "t2_alt",
 				InputTokens: 110, CacheReadTokens: 900, OutputTokens: 25,
 			}, nil
 		}
 		if p.mode == "sandbox_alt" {
 			return &dag.GenerateResponse{
-				Reasoning: "write sandbox file",
-				ToolCall:  &dag.ToolCallSpec{Name: "fs_write", ArgsJSON: `{"path":"sandbox.txt","content":"ok"}`, EffectClass: taint.EffectWorkspaceWrite},
-				StateHash: "t2_sbx",
+				Reasoning:   "write sandbox file",
+				ToolCall:    &dag.ToolCallSpec{Name: "fs_write", ArgsJSON: `{"path":"sandbox.txt","content":"ok"}`, EffectClass: taint.EffectWorkspaceWrite},
+				StateHash:   "t2_sbx",
 				InputTokens: 110, CacheReadTokens: 900, OutputTokens: 25,
 			}, nil
 		}
 		return &dag.GenerateResponse{
-			Reasoning: "write output",
-			ToolCall:  &dag.ToolCallSpec{Name: "fs_write", ArgsJSON: `{"path":"out.txt","content":"ok"}`, EffectClass: taint.EffectWorkspaceWrite},
-			StateHash: "t2",
+			Reasoning:   "write output",
+			ToolCall:    &dag.ToolCallSpec{Name: "fs_write", ArgsJSON: `{"path":"out.txt","content":"ok"}`, EffectClass: taint.EffectWorkspaceWrite},
+			StateHash:   "t2",
 			InputTokens: 120, CacheReadTokens: 950, OutputTokens: 30,
 		}, nil
 	default:

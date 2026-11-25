@@ -45,12 +45,12 @@ type HarnessConfig struct {
 
 // ProviderConfig configures the active LLM provider, embedder, and execution defaults.
 type ProviderConfig struct {
-	ProviderType      string `json:"provider_type"` // "auto" | "openai_compat" | "mock"
-	APIBase           string `json:"api_base"`
-	APIKey            string `json:"api_key,omitempty"`
-	ModelID           string `json:"model_id"`
-	EmbedModel        string `json:"embed_model"`
-	EmbedURL          string `json:"embed_url"`
+	ProviderType        string `json:"provider_type"` // "auto" | "openai_compat" | "mock"
+	APIBase             string `json:"api_base"`
+	APIKey              string `json:"api_key,omitempty"`
+	ModelID             string `json:"model_id"`
+	EmbedModel          string `json:"embed_model"`
+	EmbedURL            string `json:"embed_url"`
 	MaxTurns            int    `json:"max_turns"`
 	WorkspaceStrategy   string `json:"workspace_strategy"`    // "worktree" | "copy" | "direct"
 	SandboxMode         string `json:"sandbox_mode"`          // "auto" | "bwrap" | "seatbelt"
@@ -193,14 +193,14 @@ type PairingDTO struct {
 
 // ProviderDTO is the secret-safe provider view.
 type ProviderDTO struct {
-	Mode              string `json:"mode"`
-	ProviderType      string `json:"provider_type"`
-	APIBase           string `json:"api_base"`
-	HasAPIKey         bool   `json:"has_api_key"`
-	APIKeyMasked      string `json:"api_key_masked"`
-	ModelID           string `json:"model_id"`
-	EmbedModel        string `json:"embed_model"`
-	EmbedURL          string `json:"embed_url"`
+	Mode                string `json:"mode"`
+	ProviderType        string `json:"provider_type"`
+	APIBase             string `json:"api_base"`
+	HasAPIKey           bool   `json:"has_api_key"`
+	APIKeyMasked        string `json:"api_key_masked"`
+	ModelID             string `json:"model_id"`
+	EmbedModel          string `json:"embed_model"`
+	EmbedURL            string `json:"embed_url"`
 	MaxTurns            int    `json:"max_turns"`
 	WorkspaceStrategy   string `json:"workspace_strategy"`
 	SandboxMode         string `json:"sandbox_mode"`
@@ -339,11 +339,11 @@ type TelegramBridgeDTO struct {
 
 // TriggersConfigDTO represents .soma/triggers.yaml for the dashboard.
 type TriggersConfigDTO struct {
-	QuietHours            string              `json:"quiet_hours"`
-	MaxPendingInbox       int                 `json:"max_pending_inbox"`
-	DailyMeteredBudgetUSD float64             `json:"daily_metered_budget_usd"`
-	WebhookAddr           string              `json:"webhook_addr"`
-	GCInterval            string              `json:"gc_interval"`
+	QuietHours            string               `json:"quiet_hours"`
+	MaxPendingInbox       int                  `json:"max_pending_inbox"`
+	DailyMeteredBudgetUSD float64              `json:"daily_metered_budget_usd"`
+	WebhookAddr           string               `json:"webhook_addr"`
+	GCInterval            string               `json:"gc_interval"`
 	Triggers              []daemon.TriggerSpec `json:"triggers"`
 }
 
@@ -782,14 +782,14 @@ func (s *Server) buildHarnessDTO(ctx context.Context) HarnessDTO {
 	}
 	return HarnessDTO{
 		Provider: ProviderDTO{
-			Mode:              provMode,
-			ProviderType:      cfg.Provider.ProviderType,
-			APIBase:           cfg.Provider.APIBase,
-			HasAPIKey:         strings.TrimSpace(cfg.Provider.APIKey) != "",
-			APIKeyMasked:      maskSecret(cfg.Provider.APIKey),
-			ModelID:           modelID,
-			EmbedModel:        cfg.Provider.EmbedModel,
-			EmbedURL:          cfg.Provider.EmbedURL,
+			Mode:                provMode,
+			ProviderType:        cfg.Provider.ProviderType,
+			APIBase:             cfg.Provider.APIBase,
+			HasAPIKey:           strings.TrimSpace(cfg.Provider.APIKey) != "",
+			APIKeyMasked:        maskSecret(cfg.Provider.APIKey),
+			ModelID:             modelID,
+			EmbedModel:          cfg.Provider.EmbedModel,
+			EmbedURL:            cfg.Provider.EmbedURL,
 			MaxTurns:            cfg.Provider.MaxTurns,
 			WorkspaceStrategy:   cfg.Provider.WorkspaceStrategy,
 			SandboxMode:         cfg.Provider.SandboxMode,
@@ -877,8 +877,8 @@ func (s *Server) buildHarnessDTO(ctx context.Context) HarnessDTO {
 		DaemonRunning:  daemonRunning,
 		TriggerLastRun: trigLast,
 		Accounts:       accDTOs,
-		Desktop:  desk,
-		Tunnel:   tunnelDTO,
+		Desktop:        desk,
+		Tunnel:         tunnelDTO,
 	}
 }
 

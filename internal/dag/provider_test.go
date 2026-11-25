@@ -675,13 +675,13 @@ func TestOpenAICompatProvider_MultiTurnPrefixMonotonicity(t *testing.T) {
 		case 2:
 			// Inject a non-tool blackboard rule_notice so Turn 3 tests non-tool user message alignment too.
 			_, _ = ex.Blackboard.Publish(context.Background(), st, dag.PeerFinding{
-				ID:         "notice_t2",
-				RunID:      "run_mono",
-				FromBranch: "coordinator",
-				FromLabel:  "coord",
+				ID:           "notice_t2",
+				RunID:        "run_mono",
+				FromBranch:   "coordinator",
+				FromLabel:    "coord",
 				TargetBranch: branchID,
-				Kind:       "rule_notice",
-				Summary:    "Check both alpha and beta contents",
+				Kind:         "rule_notice",
+				Summary:      "Check both alpha and beta contents",
 			})
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"choices": []map[string]any{{

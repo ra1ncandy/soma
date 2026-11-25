@@ -7,19 +7,19 @@ import (
 )
 
 type styleset struct {
-	headerBar  lipgloss.Style
-	tabActive  lipgloss.Style
-	tabIdle    lipgloss.Style
-	panel      lipgloss.Style
-	title      lipgloss.Style
-	muted      lipgloss.Style
-	footer     lipgloss.Style
-	statusBar  lipgloss.Style
-	badgeOK    lipgloss.Style
-	badgeWarn  lipgloss.Style
-	badgeErr   lipgloss.Style
-	badgeInfo  lipgloss.Style
-	cursorRow  lipgloss.Style
+	headerBar lipgloss.Style
+	tabActive lipgloss.Style
+	tabIdle   lipgloss.Style
+	panel     lipgloss.Style
+	title     lipgloss.Style
+	muted     lipgloss.Style
+	footer    lipgloss.Style
+	statusBar lipgloss.Style
+	badgeOK   lipgloss.Style
+	badgeWarn lipgloss.Style
+	badgeErr  lipgloss.Style
+	badgeInfo lipgloss.Style
+	cursorRow lipgloss.Style
 }
 
 func defaultStyles() styleset {

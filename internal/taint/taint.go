@@ -43,11 +43,11 @@ type ActionPolicyInput struct {
 }
 
 // EvaluateAction applies data/action-level taint provenance rather than branch-wide lockdowns:
-// - Explicit deny always wins.
-// - Irreversible actions always require operator approval (DecisionAsk).
-// - Isolated workspace read/write stays autonomous even after reading untrusted_external pages.
-// - External writes block with DecisionAsk if any ReferencedPageID is untrusted_external and
-//   lacks a matching scoped declassification.
+//   - Explicit deny always wins.
+//   - Irreversible actions always require operator approval (DecisionAsk).
+//   - Isolated workspace read/write stays autonomous even after reading untrusted_external pages.
+//   - External writes block with DecisionAsk if any ReferencedPageID is untrusted_external and
+//     lacks a matching scoped declassification.
 func EvaluateAction(ctx context.Context, st *store.Store, in ActionPolicyInput) (PolicyDecision, string, error) {
 	if in.ExplicitDeny {
 		return DecisionDeny, fmt.Sprintf("tool %s denied by explicit policy", in.ToolName), nil

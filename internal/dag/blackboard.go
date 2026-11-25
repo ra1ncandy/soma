@@ -32,8 +32,8 @@ type PeerFinding struct {
 type Blackboard struct {
 	mu       sync.Mutex
 	seq      atomic.Uint64
-	findings map[string][]PeerFinding         // runID -> findings in publication order
-	seen     map[string]map[string]struct{}   // branchID -> findingID -> struct{}
+	findings map[string][]PeerFinding       // runID -> findings in publication order
+	seen     map[string]map[string]struct{} // branchID -> findingID -> struct{}
 }
 
 // NewBlackboard constructs an empty concurrency-safe Blackboard.
