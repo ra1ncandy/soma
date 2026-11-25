@@ -866,7 +866,10 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 
 		// Compile current frame; check Hybrid Epoch Rollover if ceiling crossed.
 		frame := compiler.Compile(snap, l2, tail, e.Profile)
-		if compiler.NeedsRollover(frame, e.Profile) && len(l2) > 0 {
+		modelInfo, haveModelInfo := modelCatalogFor(e.Store.SomaDir()).Lookup(acc.ModelID)
+		turnProfile := e.Profile
+		turnProfile.EpochTokenCeiling = epochCeilingFor(e.Profile.EpochTokenCeiling, modelInfo, haveModelInfo)
+		if compiler.NeedsRollover(frame, turnProfile) && len(l2) > 0 {
 			activeMem, graveyard, memErr := e.loadMemoryAndGraveyard(ctx, run.ID)
 			if memErr == nil {
 				baseIn := e.buildEpochInput(run, activeMem, graveyard)
@@ -957,6 +960,11 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 			_ = e.Store.UpdateBranchStatus(context.WithoutCancel(ctx), branch.ID, string(status), acc.ID, branch.StallCount)
 			res.Status = status
 			return res, genErr
+		}
+		if genResp.CostUSD == 0 && haveModelInfo {
+			// The provider did not report cost: price it from pricing.yaml so daily budgets and
+			// daemon brakes see real spend.
+			genResp.CostUSD = modelInfo.Cost(genResp.InputTokens, genResp.CacheReadTokens, genResp.CacheWriteTokens, genResp.OutputTokens)
 		}
 		_ = e.releaseLease(ctx, acc.ID, genResp.CostUSD)
 
