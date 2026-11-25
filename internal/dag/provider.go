@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -102,6 +103,15 @@ type OpenAICompatProvider struct {
 	ReasoningEffort      string
 	EnableTools          bool
 	PassReasoningContent bool // Opt-in: echo full reasoning_content on historical assistant tool turns (increases prompt tokens).
+	// DisableStream forces a single buffered response. Streaming is the default: it replaces the
+	// whole-request timeout with an idle timeout and lets cancellation take effect immediately.
+	DisableStream bool
+	// OnDelta, when set, receives assistant text as it streams.
+	OnDelta func(text string)
+	// StreamIdleTimeout overrides how long a stream may stay silent (default 180s).
+	StreamIdleTimeout time.Duration
+
+	streamUnsupported atomic.Bool
 }
 
 // NewOpenAICompatProvider creates a client targeting baseURL (e.g. https://opencode.ai/zen/go/v1).
@@ -111,10 +121,49 @@ func NewOpenAICompatProvider(baseURL, apiKey string) *OpenAICompatProvider {
 		APIKey:      apiKey,
 		MaxTokens:   16384,
 		EnableTools: true,
-		HTTPClient: &http.Client{
-			Timeout: 240 * time.Second,
+		// No whole-request timeout: a long generation that is still streaming must not be cut off.
+		// Waiting for the response to start is bounded here; a stalled stream by the idle timeout.
+		HTTPClient: &http.Client{Transport: providerTransport()},
+	}
+}
+
+func providerTransport() http.RoundTripper {
+	if dt, ok := http.DefaultTransport.(*http.Transport); ok {
+		tr := dt.Clone()
+		tr.ResponseHeaderTimeout = 240 * time.Second
+		return tr
+	}
+	return http.DefaultTransport
+}
+
+var (
+	openAIToolsOnce  sync.Once
+	openAIToolsCache []map[string]any
+)
+
+// openAITools returns the canonical tool schema list, built once (it is immutable).
+func openAITools() []map[string]any {
+	openAIToolsOnce.Do(func() { openAIToolsCache = canonicalOpenAITools() })
+	return openAIToolsCache
+}
+
+func simpleTool(name, description string, required []string, props map[string]any) map[string]any {
+	return map[string]any{
+		"type": "function",
+		"function": map[string]any{
+			"name":        name,
+			"description": description,
+			"parameters": map[string]any{
+				"type":       "object",
+				"properties": props,
+				"required":   required,
+			},
 		},
 	}
+}
+
+func strProp(desc string) map[string]any {
+	return map[string]any{"type": "string", "description": desc}
 }
 
 func canonicalOpenAITools() []map[string]any {
@@ -164,6 +213,18 @@ func canonicalOpenAITools() []map[string]any {
 				},
 			},
 		},
+		simpleTool("branch_fork", "Fork a sibling branch from the current step to explore an alternative approach in its own isolated workspace.",
+			[]string{"label"}, map[string]any{
+				"label":  strProp("Short name for the alternative approach"),
+				"reason": strProp("Why this fork is being created"),
+			}),
+		simpleTool("broker_call", "Call an external capability through a secretless broker (credentials are attached by the host, never visible here).",
+			[]string{"capability", "op"}, map[string]any{
+				"capability":  strProp("Configured broker capability name"),
+				"op":          strProp("Operation, e.g. GET or POST"),
+				"params_json": strProp("JSON object string of operation parameters"),
+				"target":      strProp("Optional target path or resource"),
+			}),
 		{
 			"type": "function",
 			"function": map[string]any{
@@ -447,6 +508,10 @@ func canonicalOpenAITools() []map[string]any {
 				},
 			},
 		},
+		simpleTool("tool_search", "Search available core syscalls and connected MCP tools (with their JSON schemas) by keyword.",
+			[]string{"query"}, map[string]any{
+				"query": strProp("Keyword to match against tool names and descriptions (empty lists everything)"),
+			}),
 		{
 			"type": "function",
 			"function": map[string]any{
@@ -663,9 +728,13 @@ func (p *OpenAICompatProvider) Generate(ctx context.Context, req GenerateRequest
 		maxToks = 16384
 	}
 
+	msgs := buildOpenAIMessages(req.Frame, p.PassReasoningContent)
+	if wantsExplicitCacheControl(req.ModelID) {
+		markCacheBreakpoints(msgs)
+	}
 	payload := map[string]any{
 		"model":       req.ModelID,
-		"messages":    buildOpenAIMessages(req.Frame, p.PassReasoningContent),
+		"messages":    msgs,
 		"temperature": 0.0,
 		"max_tokens":  maxToks,
 	}
@@ -673,11 +742,22 @@ func (p *OpenAICompatProvider) Generate(ctx context.Context, req GenerateRequest
 		payload["reasoning_effort"] = effort
 	}
 	if p.EnableTools {
-		payload["tools"] = canonicalOpenAITools()
+		payload["tools"] = openAITools()
 		payload["tool_choice"] = "auto"
 	}
 
-	body, err := json.Marshal(payload)
+	marshal := func(stream bool) ([]byte, error) {
+		if stream {
+			payload["stream"] = true
+			payload["stream_options"] = map[string]any{"include_usage": true}
+		} else {
+			delete(payload, "stream")
+			delete(payload, "stream_options")
+		}
+		return json.Marshal(payload)
+	}
+	streaming := !p.DisableStream && !p.streamUnsupported.Load()
+	body, err := marshal(streaming)
 	if err != nil {
 		return nil, err
 	}
@@ -688,20 +768,32 @@ func (p *OpenAICompatProvider) Generate(ctx context.Context, req GenerateRequest
 		client = http.DefaultClient
 	}
 
-	const maxAttempts = 4
+	const (
+		maxAttempts = 4
+		// A short rate limit is cheaper to wait out than to suspend the whole branch for.
+		maxInlineRateLimitWait = 10 * time.Second
+	)
 	var respBytes []byte
 	var statusCode int
 	var retryAfterHeader string
+	var parsed chatCompletion
+	haveParsed := false
+	waitedOnRateLimit := false // wait out at most one short rate limit per call
 	backoff := func(attempt int) time.Duration {
 		return time.Duration(1<<uint(attempt-1)) * 400 * time.Millisecond
 	}
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.BaseURL+"/chat/completions", bytes.NewReader(body))
+		reqCtx, cancelReq := context.WithCancel(ctx)
+		httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, p.BaseURL+"/chat/completions", bytes.NewReader(body))
 		if err != nil {
+			cancelReq()
 			return nil, err
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
 		httpReq.Header.Set("User-Agent", "soma/0.4")
+		if streaming {
+			httpReq.Header.Set("Accept", "text/event-stream")
+		}
 		if p.APIKey != "" {
 			httpReq.Header.Set("Authorization", "Bearer "+p.APIKey)
 		}
@@ -717,6 +809,7 @@ func (p *OpenAICompatProvider) Generate(ctx context.Context, req GenerateRequest
 
 		resp, err := client.Do(httpReq)
 		if err != nil {
+			cancelReq()
 			tErr := &TransientError{AccountID: req.AccountID, Err: err}
 			if attempt < maxAttempts && ctx.Err() == nil {
 				if sleepErr := sleepWithContext(ctx, backoff(attempt)); sleepErr != nil {
@@ -726,8 +819,37 @@ func (p *OpenAICompatProvider) Generate(ctx context.Context, req GenerateRequest
 			}
 			return nil, tErr
 		}
+		statusCode = resp.StatusCode
+		retryAfterHeader = resp.Header.Get("Retry-After")
+
+		if statusCode == http.StatusOK && strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
+			completion, streamErr := readChatStream(resp.Body, cancelReq, p.StreamIdleTimeout, p.OnDelta)
+			_ = resp.Body.Close()
+			cancelReq()
+			if streamErr != nil {
+				if ctx.Err() != nil {
+					return nil, ctx.Err()
+				}
+				// A stream that broke part-way is retried once at most: the tokens generated so
+				// far are already paid for, and repeating a multi-minute generation is expensive.
+				tErr := &TransientError{AccountID: req.AccountID, Err: streamErr}
+				if attempt < 2 {
+					if sleepErr := sleepWithContext(ctx, backoff(attempt)); sleepErr != nil {
+						return nil, tErr
+					}
+					continue
+				}
+				return nil, tErr
+			}
+			parsed = *completion
+			haveParsed = true
+			respBytes, _ = json.Marshal(completion)
+			break
+		}
+
 		b, readErr := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 		_ = resp.Body.Close()
+		cancelReq()
 		if readErr != nil {
 			tErr := &TransientError{AccountID: req.AccountID, Err: readErr}
 			if attempt < maxAttempts && ctx.Err() == nil {
@@ -739,9 +861,26 @@ func (p *OpenAICompatProvider) Generate(ctx context.Context, req GenerateRequest
 			return nil, tErr
 		}
 		respBytes = b
-		statusCode = resp.StatusCode
-		retryAfterHeader = resp.Header.Get("Retry-After")
 
+		// Endpoints that reject streaming parameters get one buffered retry, remembered afterwards.
+		if streaming && statusCode == http.StatusBadRequest && bytes.Contains(bytes.ToLower(b), []byte("stream")) {
+			p.streamUnsupported.Store(true)
+			streaming = false
+			if body, err = marshal(false); err != nil {
+				return nil, err
+			}
+			attempt--
+			continue
+		}
+		if statusCode == http.StatusTooManyRequests && attempt < maxAttempts && ctx.Err() == nil {
+			if wait := parseRetryAfter(retryAfterHeader); retryAfterHeader != "" && wait <= maxInlineRateLimitWait && !waitedOnRateLimit {
+				waitedOnRateLimit = true
+				if sleepErr := sleepWithContext(ctx, wait); sleepErr != nil {
+					break
+				}
+				continue
+			}
+		}
 		if statusCode >= 500 && attempt < maxAttempts && ctx.Err() == nil {
 			if sleepErr := sleepWithContext(ctx, backoff(attempt)); sleepErr != nil {
 				break
@@ -770,38 +909,10 @@ func (p *OpenAICompatProvider) Generate(ctx context.Context, req GenerateRequest
 		return nil, fmt.Errorf("upstream HTTP %d: %s", statusCode, string(respBytes))
 	}
 
-	var parsed struct {
-		Choices []struct {
-			FinishReason string `json:"finish_reason"`
-			Message      struct {
-				Content          string `json:"content"`
-				ReasoningContent string `json:"reasoning_content"`
-				ToolCalls        []struct {
-					ID       string `json:"id"`
-					Type     string `json:"type"`
-					Function struct {
-						Name      string `json:"name"`
-						Arguments string `json:"arguments"`
-					} `json:"function"`
-				} `json:"tool_calls"`
-			} `json:"message"`
-		} `json:"choices"`
-		Usage struct {
-			PromptTokens        int     `json:"prompt_tokens"`
-			CompletionTokens    int     `json:"completion_tokens"`
-			Cost                float64 `json:"cost"`
-			PromptTokensDetails struct {
-				CachedTokens int `json:"cached_tokens"`
-			} `json:"prompt_tokens_details"`
-			OpenCode struct {
-				Tokens struct {
-					CacheRead int `json:"cache_read"`
-				} `json:"tokens"`
-			} `json:"opencode"`
-		} `json:"usage"`
-	}
-	if err := json.Unmarshal(respBytes, &parsed); err != nil {
-		return nil, fmt.Errorf("decode chat completion: %w", err)
+	if !haveParsed {
+		if err := json.Unmarshal(respBytes, &parsed); err != nil {
+			return nil, fmt.Errorf("decode chat completion: %w", err)
+		}
 	}
 
 	cached := parsed.Usage.PromptTokensDetails.CachedTokens
@@ -813,13 +924,19 @@ func (p *OpenAICompatProvider) Generate(ctx context.Context, req GenerateRequest
 		uncached = parsed.Usage.PromptTokens
 	}
 
+	cacheWrite := parsed.Usage.PromptTokensDetails.CacheWriteTokens
+	if parsed.Usage.CacheCreationInputTokens > cacheWrite {
+		cacheWrite = parsed.Usage.CacheCreationInputTokens
+	}
+
 	gen := &GenerateResponse{
-		InputTokens:     uncached,
-		CacheReadTokens: cached,
-		OutputTokens:    parsed.Usage.CompletionTokens,
-		CostUSD:         parsed.Usage.Cost,
-		LatencyMS:       time.Since(start).Milliseconds(),
-		RawEmitted:      respBytes,
+		InputTokens:      uncached,
+		CacheWriteTokens: cacheWrite,
+		CacheReadTokens:  cached,
+		OutputTokens:     parsed.Usage.CompletionTokens,
+		CostUSD:          parsed.Usage.Cost,
+		LatencyMS:        time.Since(start).Milliseconds(),
+		RawEmitted:       respBytes,
 	}
 
 	if len(parsed.Choices) == 0 {

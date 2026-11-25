@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -170,6 +171,9 @@ func (e *Executor) RunGUISubagent(ctx context.Context, runID, parentBranchID, mo
 					}
 				}
 			}
+			// Map iteration order is random; an unsorted list would change the subagent's system
+			// prompt on every launch and defeat provider-side prompt caching.
+			sort.Strings(propKeys)
 			fmt.Fprintf(&toolList, "    - %s(%s): %s\n", t.Name, strings.Join(propKeys, ", "), t.Description)
 		}
 	}

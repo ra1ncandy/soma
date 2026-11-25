@@ -123,8 +123,8 @@ func TestOpenAICompatProvider_ToolsSessionCacheAnd429(t *testing.T) {
 		t.Fatalf("expected sticky run-scoped x-opencode-session header, got %q", gotSess)
 	}
 	rawTools, ok := lastReqBody["tools"].([]any)
-	if !ok || len(rawTools) != 24 {
-		t.Fatalf("expected 24 canonical tools in request body, got %d", len(rawTools))
+	if !ok || len(rawTools) != 27 {
+		t.Fatalf("expected 27 canonical tools in request body, got %d", len(rawTools))
 	}
 
 	// Call 2: normal completion without tool_calls -> Done=true.
