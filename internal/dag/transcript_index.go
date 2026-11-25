@@ -54,6 +54,53 @@ func (e *Executor) indexTranscript(ctx context.Context, runID, branchID, stepID 
 	_ = e.Store.IndexTranscript(context.WithoutCancel(ctx), out)
 }
 
+func searchRunMetadata(ctx context.Context, st *store.Store, query string, limit int) (string, string, error) {
+	runs, err := st.ListRuns(ctx)
+	if err != nil {
+		return "", "", err
+	}
+	terms := strings.Fields(strings.ToLower(query))
+	type scored struct {
+		run   store.Run
+		score int
+	}
+	var matches []scored
+	for _, rn := range runs {
+		hay := strings.ToLower(rn.ID + " " + rn.Title + " " + rn.GoalSpec)
+		sc := 0
+		for _, term := range terms {
+			if strings.Contains(hay, term) {
+				sc++
+			}
+		}
+		if sc > 0 {
+			matches = append(matches, scored{rn, sc})
+		}
+	}
+	sort.SliceStable(matches, func(i, j int) bool {
+		if matches[i].score != matches[j].score {
+			return matches[i].score > matches[j].score
+		}
+		return matches[i].run.CreatedAt > matches[j].run.CreatedAt
+	})
+	if len(matches) == 0 {
+		return fmt.Sprintf("session_search: no past conversation mentions %q", query), "trusted_repo", nil
+	}
+	if len(matches) > limit {
+		matches = matches[:limit]
+	}
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "session_search: %d past run(s) whose title or goal matches %q:\n", len(matches), query)
+	for i, m := range matches {
+		goal := []rune(m.run.GoalSpec)
+		if len(goal) > 160 {
+			goal = append(goal[:157], []rune("...")...)
+		}
+		fmt.Fprintf(&sb, "%d. run %s status=%s title=%q goal=%q\n", i+1, m.run.ID, m.run.Status, m.run.Title, string(goal))
+	}
+	return strings.TrimRight(sb.String(), "\n"), "trusted_repo", nil
+}
+
 // searchSessions renders ranked transcript hits grouped by run, falling back to run metadata.
 func searchSessions(ctx context.Context, st *store.Store, query string, limit int) (string, string, error) {
 	hits, err := st.SearchTranscripts(ctx, query, limit*4)
@@ -90,8 +137,8 @@ func searchSessions(ctx context.Context, st *store.Store, query string, limit in
 	}
 	var sb strings.Builder
 	if len(groups) == 0 {
-		fmt.Fprintf(&sb, "session_search: no past conversation mentions %q", query)
-		return sb.String(), tier, nil
+		// Runs recorded before the transcript index existed are still found by title and goal.
+		return searchRunMetadata(ctx, st, query, limit)
 	}
 	fmt.Fprintf(&sb, "session_search: %d past run(s) matching %q (best first):\n", len(groups), query)
 	for i, g := range groups {
