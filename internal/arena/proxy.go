@@ -1,0 +1,255 @@
+// Package arena runs soma and other agent harnesses on identical tasks with the same model and
+// reports only measured results. Both contestants talk to the model through a metering reverse
+// proxy, so call counts, tokens and cost are counted by the harness, not self-reported, and the
+// same call budget and spend cap apply to both.
+package arena
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"strings"
+	"sync"
+)
+
+// Usage is what the proxy measured for one contestant run.
+type Usage struct {
+	Calls        int     `json:"model_calls"`
+	InputTokens  int     `json:"input_tokens"`
+	CachedTokens int     `json:"cached_tokens"`
+	OutputTokens int     `json:"output_tokens"`
+	CostUSD      float64 `json:"cost_usd"`
+	Refused      int     `json:"refused_calls"`
+}
+
+// Price is USD per million tokens, used to enforce the spend cap.
+type Price struct {
+	Input, Cached, Output float64
+}
+
+// Proxy is a metering reverse proxy in front of an OpenAI-compatible endpoint.
+type Proxy struct {
+	upstream *url.URL
+	apiKey   string
+	price    Price
+	capUSD   float64
+
+	mu       sync.Mutex
+	session  string
+	maxCalls int
+	usage    map[string]*Usage
+	totalUSD float64
+
+	ln  net.Listener
+	srv *http.Server
+}
+
+// NewProxy starts a proxy on 127.0.0.1 that forwards to upstreamBase (e.g. https://api.x/v1) with
+// apiKey, refusing calls once a session's call budget or the global spend cap is reached.
+func NewProxy(upstreamBase, apiKey string, price Price, spendCapUSD float64) (*Proxy, error) {
+	u, err := url.Parse(strings.TrimRight(upstreamBase, "/"))
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return nil, fmt.Errorf("arena: invalid upstream base URL %q", upstreamBase)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return nil, err
+	}
+	p := &Proxy{upstream: u, apiKey: apiKey, price: price, capUSD: spendCapUSD, ln: ln, usage: map[string]*Usage{}}
+	p.srv = &http.Server{Handler: p}
+	go func() { _ = p.srv.Serve(ln) }()
+	return p, nil
+}
+
+// BaseURL is the OpenAI-compatible base URL contestants should use.
+func (p *Proxy) BaseURL() string { return "http://" + p.ln.Addr().String() + "/v1" }
+
+// Close stops the proxy.
+func (p *Proxy) Close() error { return p.srv.Close() }
+
+// Begin starts metering a new session with its own call budget.
+func (p *Proxy) Begin(session string, maxCalls int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.session = session
+	p.maxCalls = maxCalls
+	p.usage[session] = &Usage{}
+}
+
+// End returns the measured usage of a session.
+func (p *Proxy) End(session string) Usage {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if u := p.usage[session]; u != nil {
+		return *u
+	}
+	return Usage{}
+}
+
+// SpentUSD is the total measured spend so far.
+func (p *Proxy) SpentUSD() float64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.totalUSD
+}
+
+func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	p.mu.Lock()
+	u := p.usage[p.session]
+	refuse := ""
+	switch {
+	case u == nil:
+		refuse = "no active arena session"
+	case p.capUSD > 0 && p.totalUSD >= p.capUSD:
+		refuse = fmt.Sprintf("arena spend cap of $%.2f reached", p.capUSD)
+	case p.maxCalls > 0 && u.Calls >= p.maxCalls && isModelCall(r):
+		refuse = fmt.Sprintf("arena call budget of %d model calls exhausted", p.maxCalls)
+	}
+	if refuse != "" && u != nil {
+		u.Refused++
+	}
+	if refuse == "" && isModelCall(r) {
+		u.Calls++
+	}
+	p.mu.Unlock()
+	if refuse != "" {
+		// 400, not 429: agents must stop, not wait and retry.
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]string{"message": refuse, "type": "arena_budget"}})
+		return
+	}
+
+	rp := &httputil.ReverseProxy{
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			pr.SetURL(p.upstream)
+			// Contestants call {proxy}/v1/...; the upstream base already ends in its own version path.
+			pr.Out.URL.Path = strings.TrimRight(p.upstream.Path, "/") + strings.TrimPrefix(r.URL.Path, "/v1")
+			pr.Out.Host = p.upstream.Host
+			pr.Out.Header.Del("Authorization")
+			pr.Out.Header.Del("X-Api-Key")
+			if p.apiKey != "" {
+				pr.Out.Header.Set("Authorization", "Bearer "+p.apiKey)
+			}
+			pr.Out.Header.Del("Accept-Encoding") // keep bodies readable for metering
+		},
+		ModifyResponse: func(resp *http.Response) error {
+			// Only model calls are metered; metadata probes (model lists, capability lookups)
+			// pass through uncounted.
+			if isModelCall(r) {
+				resp.Body = &meteringBody{rc: resp.Body, onUsage: p.record, sse: strings.Contains(resp.Header.Get("Content-Type"), "event-stream")}
+			}
+			return nil
+		},
+		FlushInterval: -1,
+	}
+	rp.ServeHTTP(w, r)
+}
+
+func isModelCall(r *http.Request) bool {
+	return r.Method == http.MethodPost && (strings.HasSuffix(r.URL.Path, "/chat/completions") || strings.HasSuffix(r.URL.Path, "/responses") || strings.HasSuffix(r.URL.Path, "/messages"))
+}
+
+func (p *Proxy) record(in, cached, out int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	u := p.usage[p.session]
+	if u == nil {
+		return
+	}
+	u.InputTokens += in
+	u.CachedTokens += cached
+	u.OutputTokens += out
+	cost := (float64(in-cached)*p.price.Input + float64(cached)*p.price.Cached + float64(out)*p.price.Output) / 1e6
+	u.CostUSD += cost
+	p.totalUSD += cost
+}
+
+// meteringBody passes the response through unchanged and extracts token usage from it (a JSON
+// body, or the usage chunk of an SSE stream) when it is closed.
+type meteringBody struct {
+	rc      io.ReadCloser
+	buf     bytes.Buffer
+	sse     bool
+	onUsage func(in, cached, out int)
+	done    bool
+}
+
+func (m *meteringBody) Read(b []byte) (int, error) {
+	n, err := m.rc.Read(b)
+	if n > 0 && m.buf.Len() < 32<<20 {
+		m.buf.Write(b[:n])
+	}
+	return n, err
+}
+
+func (m *meteringBody) Close() error {
+	if !m.done {
+		m.done = true
+		in, cached, out := extractUsage(m.buf.Bytes(), m.sse)
+		m.onUsage(in, cached, out)
+	}
+	return m.rc.Close()
+}
+
+type usageJSON struct {
+	PromptTokens        int `json:"prompt_tokens"`
+	CompletionTokens    int `json:"completion_tokens"`
+	InputTokens         int `json:"input_tokens"`
+	OutputTokens        int `json:"output_tokens"`
+	PromptTokensDetails struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"`
+	InputTokensDetails struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"input_tokens_details"`
+}
+
+func (u usageJSON) split() (in, cached, out int) {
+	in = u.PromptTokens + u.InputTokens
+	cached = u.PromptTokensDetails.CachedTokens + u.InputTokensDetails.CachedTokens
+	out = u.CompletionTokens + u.OutputTokens
+	return
+}
+
+func extractUsage(body []byte, sse bool) (in, cached, out int) {
+	if !sse {
+		var v struct {
+			Usage usageJSON `json:"usage"`
+		}
+		if json.Unmarshal(body, &v) == nil {
+			return v.Usage.split()
+		}
+		return 0, 0, 0
+	}
+	sc := bufio.NewScanner(bytes.NewReader(body))
+	sc.Buffer(make([]byte, 0, 64*1024), 16<<20)
+	for sc.Scan() {
+		data, ok := strings.CutPrefix(sc.Text(), "data: ")
+		if !ok || data == "[DONE]" {
+			continue
+		}
+		var v struct {
+			Usage    *usageJSON `json:"usage"`
+			Response *struct {
+				Usage *usageJSON `json:"usage"`
+			} `json:"response"`
+		}
+		if json.Unmarshal([]byte(data), &v) != nil {
+			continue
+		}
+		if v.Usage != nil {
+			in, cached, out = v.Usage.split()
+		}
+		if v.Response != nil && v.Response.Usage != nil {
+			in, cached, out = v.Response.Usage.split()
+		}
+	}
+	return
+}
