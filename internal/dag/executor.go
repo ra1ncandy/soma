@@ -1100,7 +1100,7 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 			}
 			// With sandbox networking enabled a shell command can send data anywhere, so it is an
 			// external write and subject to the untrusted-provenance check, not a local edit.
-			if (tc.Name == "exec" || tc.Name == "bg_exec") && tc.EffectClass == taint.EffectWorkspaceWrite {
+			if (tc.Name == "exec" || tc.Name == "bg_exec" || tc.Name == "execute_code") && tc.EffectClass == taint.EffectWorkspaceWrite {
 				if lt, ok := e.Tools.(*LocalToolRunner); ok && lt.AllowSandboxNetwork {
 					tc.EffectClass = taint.EffectExternalWrite
 				}
