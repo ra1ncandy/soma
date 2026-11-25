@@ -42,6 +42,9 @@ type OAuthToken struct {
 	TokenType    string    `json:"token_type,omitempty"`
 	Scope        string    `json:"scope,omitempty"`
 	ExpiresAt    time.Time `json:"expires_at,omitempty"`
+	// ClientID is the client the token was issued to. It is needed to refresh tokens obtained
+	// through dynamic client registration, where the id is not part of the endpoint config.
+	ClientID string `json:"client_id,omitempty"`
 }
 
 // IsExpired reports whether the access token is expired (with a 60s clock-skew margin).
@@ -454,6 +457,7 @@ func BeginPKCEFlow(ctx context.Context, ep ServerEndpoint, store *TokenStore) (a
 			if exErr != nil {
 				return OAuthToken{}, exErr
 			}
+			tok.ClientID = cfg.ClientID
 			if sErr := store.Save(ep.Name, tok); sErr != nil {
 				return OAuthToken{}, sErr
 			}
@@ -549,10 +553,20 @@ func (h *StoredOAuthHandler) TokenSource(ctx context.Context) (oauth2.TokenSourc
 			}
 		}
 		if tokenEndpoint != "" {
-			if refreshed, rErr := RefreshAccessToken(ctx, tokenEndpoint, *h.Endpoint.OAuth, tok.RefreshToken, h.HTTPClient); rErr == nil {
-				tok = refreshed
-				_ = store.Save(h.Endpoint.Name, tok)
+			refreshCfg := *h.Endpoint.OAuth
+			if refreshCfg.ClientID == "" {
+				refreshCfg.ClientID = tok.ClientID
 			}
+			refreshed, rErr := RefreshAccessToken(ctx, tokenEndpoint, refreshCfg, tok.RefreshToken, h.HTTPClient)
+			if rErr != nil {
+				return nil, fmt.Errorf("mcp server %q: refresh OAuth token: %w (run `soma mcp auth %s`)", h.Endpoint.Name, rErr, h.Endpoint.Name)
+			}
+			if refreshed.RefreshToken == "" {
+				refreshed.RefreshToken = tok.RefreshToken
+			}
+			refreshed.ClientID = refreshCfg.ClientID
+			tok = refreshed
+			_ = store.Save(h.Endpoint.Name, tok)
 		}
 	}
 	return oauth2.StaticTokenSource(&oauth2.Token{

@@ -2023,11 +2023,25 @@ type LocalToolRunner struct {
 	HTTPClient     *http.Client
 	SearchEndpoint string
 	VisionBaseURL  string
+	// OnClose releases resources created for this runner (e.g. MCP server processes it spawned).
+	OnClose func()
 	// AllowUnsandboxedExec lets exec/bg_exec run a bare host shell when Sandbox is nil.
 	// It is off by default (fail-closed) and must never be enabled for model-driven runs.
 	AllowUnsandboxedExec bool
 	// AllowSandboxNetwork permits outbound network access inside the OS sandbox (disables --unshare-net / deny network*).
 	AllowSandboxNetwork bool
+}
+
+// Close stops this runner's background jobs and releases anything registered through OnClose.
+// A runner is created per run, so its jobs are unreachable (and would be orphaned) afterwards.
+func (r *LocalToolRunner) Close() error {
+	if r.BgProcs != nil {
+		r.BgProcs.KillAll()
+	}
+	if r.OnClose != nil {
+		r.OnClose()
+	}
+	return nil
 }
 
 // NewLocalToolRunner constructs a workspace-scoped tool runner with no OS sandbox. Its exec and

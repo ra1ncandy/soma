@@ -1351,11 +1351,19 @@ func (s *Server) runBranchAsync(exec *dag.Executor, branchID string, maxTurns in
 			}
 		}()
 		_, runErr := exec.ExecuteBranch(runCtx, branchID, maxTurns)
-		if closer, ok := exec.Tools.(interface{ Close() error }); ok {
-			_ = closer.Close()
-		}
+		closeExecutor(exec)
 		s.recordRunOutcome(branchID, runErr, timeout)
 	}()
+}
+
+// closeExecutor releases per-run resources (MCP server processes, background jobs) held by exec.
+func closeExecutor(exec *dag.Executor) {
+	if exec == nil {
+		return
+	}
+	if closer, ok := exec.Tools.(interface{ Close() error }); ok {
+		_ = closer.Close()
+	}
 }
 
 // recordRunOutcome persists a terminal status and an operator-visible notice when a run ends on an
@@ -1432,6 +1440,7 @@ func (s *Server) launchAsyncRunWithAccount(ctx context.Context, title, goal, pro
 
 	runID, branchID, err := exec.StartRun(ctx, s.buildRunRequest(title, goal, prof, accIDs))
 	if err != nil {
+		closeExecutor(exec)
 		return "", "", err
 	}
 	_ = s.store.UpdateBranchStatus(ctx, branchID, string(dag.StatusRunning), "", 0)
@@ -1616,6 +1625,7 @@ func (s *Server) handleContinueBranch(w http.ResponseWriter, r *http.Request, br
 		return
 	}
 	if err := exec.AppendFollowUpUserTurn(r.Context(), br.ID, msg); err != nil {
+		closeExecutor(exec)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
@@ -1776,7 +1786,30 @@ func (s *Server) newExecutor(prof compiler.ModelProfile) *dag.Executor {
 	vm := vmem.NewManager(s.store)
 	tools := dag.NewSandboxedToolRunner(vm, sbx)
 	tools.AllowSandboxNetwork = hCfg.Provider.AllowSandboxNetwork
-	if mcpMgr := s.connectConfiguredMCP(context.Background()); mcpMgr != nil {
+	// Every MCP manager created for this executor spawns server processes; track them so the run
+	// closes them when it ends instead of leaking a full set of connectors per run.
+	var (
+		ownedMu  sync.Mutex
+		ownedMCP []*mcp.Manager
+	)
+	own := func(m *mcp.Manager) *mcp.Manager {
+		if m != nil {
+			ownedMu.Lock()
+			ownedMCP = append(ownedMCP, m)
+			ownedMu.Unlock()
+		}
+		return m
+	}
+	tools.OnClose = func() {
+		ownedMu.Lock()
+		mgrs := ownedMCP
+		ownedMCP = nil
+		ownedMu.Unlock()
+		for _, m := range mgrs {
+			_ = m.Close()
+		}
+	}
+	if mcpMgr := own(s.connectConfiguredMCP(context.Background())); mcpMgr != nil {
 		tools.MCPManager = mcpMgr
 	}
 	exec := dag.NewExecutor(s.store, prov, tools, prof)
@@ -1858,14 +1891,14 @@ func (s *Server) newExecutor(prof compiler.ModelProfile) *dag.Executor {
 				}
 				s.touchDesktop()
 				s.notify()
-				if connected := s.connectConfiguredMCP(ctx); connected != nil {
+				if connected := own(s.connectConfiguredMCP(ctx)); connected != nil {
 					return connected, nil
 				}
 			}
 			if tools.MCPManager != nil && len(tools.MCPManager.ListServers()) > 0 {
 				return tools.MCPManager, nil
 			}
-			return s.connectConfiguredMCP(ctx), nil
+			return own(s.connectConfiguredMCP(ctx)), nil
 		},
 	}
 	return exec

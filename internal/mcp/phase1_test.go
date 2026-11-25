@@ -220,6 +220,7 @@ func TestManager_StreamableHTTPAndSSEAndOAuth(t *testing.T) {
 	}, nil)
 	sseSrv := httptest.NewServer(sseHandler)
 	defer sseSrv.Close()
+	defer func() { _ = mgr.Close() }() // close live sessions before the servers shut down
 
 	if err := mgr.Connect(ctx, ServerEndpoint{
 		Name:      "remote_sse",

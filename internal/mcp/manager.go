@@ -10,6 +10,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -89,7 +91,7 @@ func (m *Manager) Connect(ctx context.Context, ep ServerEndpoint) error {
 		if strings.TrimSpace(ep.URL) == "" {
 			return fmt.Errorf("mcp manager: sse server %q requires url", ep.Name)
 		}
-		hc := NewEndpointHTTPClient(ep, m.httpClient.HTTPClient)
+		hc := NewStreamingEndpointHTTPClient(ep, m.httpClient.HTTPClient)
 		client := sdkmcp.NewClient(&sdkmcp.Implementation{
 			Name:    "soma",
 			Version: "0.5.0",
@@ -113,7 +115,7 @@ func (m *Manager) Connect(ctx context.Context, ep ServerEndpoint) error {
 		if strings.TrimSpace(ep.URL) == "" {
 			return fmt.Errorf("mcp manager: streamable_http server %q requires url", ep.Name)
 		}
-		hc := NewEndpointHTTPClient(ep, m.httpClient.HTTPClient)
+		hc := NewStreamingEndpointHTTPClient(ep, m.httpClient.HTTPClient)
 		var oauthHandler *StoredOAuthHandler
 		if ep.OAuth != nil && ep.OAuth.Enabled {
 			m.mu.RLock()
@@ -168,14 +170,63 @@ func (m *Manager) Connect(ctx context.Context, ep ServerEndpoint) error {
 	return nil
 }
 
-// ConnectAll connects all enabled endpoints, returning any per-server errors aggregated cleanly.
+// connectDeadline bounds how long one server may take to start and answer initialize/tools/list
+// (first-run `npx -y` / `uvx` downloads are slow, but a server that never answers must not hang a run).
+const connectDeadline = 60 * time.Second
+
+// connectWithDeadline runs Connect without letting a hung server block the caller. The connect
+// itself keeps using ctx (transports tie the session's lifetime to it), so on timeout the attempt
+// is abandoned and, if it completes later, the stray session is closed.
+func (m *Manager) connectWithDeadline(ctx context.Context, ep ServerEndpoint, deadline time.Duration) error {
+	done := make(chan error, 1)
+	var abandoned atomic.Bool
+	go func() {
+		err := m.Connect(ctx, ep)
+		if err == nil && abandoned.Load() {
+			m.mu.Lock()
+			if ms, ok := m.servers[ep.Name]; ok {
+				if ms.session != nil {
+					_ = ms.session.Close()
+				}
+				delete(m.servers, ep.Name)
+			}
+			m.mu.Unlock()
+		}
+		done <- err
+	}()
+	timer := time.NewTimer(deadline)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-timer.C:
+		abandoned.Store(true)
+		return fmt.Errorf("mcp connect %s: no response within %s", ep.Name, deadline)
+	case <-ctx.Done():
+		abandoned.Store(true)
+		return ctx.Err()
+	}
+}
+
+// ConnectAll connects all enabled endpoints concurrently, each bounded by connectDeadline, and
+// returns any per-server errors aggregated in endpoint order.
 func (m *Manager) ConnectAll(ctx context.Context, endpoints []ServerEndpoint) error {
-	var errs []string
-	for _, ep := range endpoints {
+	errsByIdx := make([]error, len(endpoints))
+	var wg sync.WaitGroup
+	for i, ep := range endpoints {
 		if !ep.IsEnabled() {
 			continue
 		}
-		if err := m.Connect(ctx, ep); err != nil {
+		wg.Add(1)
+		go func(i int, ep ServerEndpoint) {
+			defer wg.Done()
+			errsByIdx[i] = m.connectWithDeadline(ctx, ep, connectDeadline)
+		}(i, ep)
+	}
+	wg.Wait()
+	var errs []string
+	for _, err := range errsByIdx {
+		if err != nil {
 			errs = append(errs, err.Error())
 		}
 	}
@@ -259,6 +310,18 @@ func (m *Manager) CallTool(ctx context.Context, serverName, toolName string, arg
 		return m.httpClient.CallTool(ctx, ms.ep, toolName, args)
 	}
 
+	// Bound the call by context rather than by the HTTP client, so a slow call fails on its own
+	// without closing the session. Stdio servers are only bounded when a timeout was configured
+	// (GUI and browser tools can legitimately run long).
+	if tr := ms.ep.EffectiveTransport(); ms.ep.TimeoutSeconds > 0 || tr == "sse" || tr == "streamable_http" {
+		callTimeout := ms.ep.EffectiveTimeout()
+		if ms.ep.TimeoutSeconds == 0 && callTimeout < 120*time.Second {
+			callTimeout = 120 * time.Second
+		}
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, callTimeout)
+		defer cancel()
+	}
 	res, err := ms.session.CallTool(ctx, &sdkmcp.CallToolParams{
 		Name:      toolName,
 		Arguments: args,

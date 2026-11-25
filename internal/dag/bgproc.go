@@ -165,6 +165,29 @@ func (m *BgProcessManager) Start(spec BgStartSpec) (string, error) {
 	return jobID, nil
 }
 
+// KillAll terminates every job that is still running. Call it when the owning run ends.
+func (m *BgProcessManager) KillAll() {
+	m.mu.Lock()
+	jobs := make([]*bgJob, 0, len(m.jobs))
+	for _, j := range m.jobs {
+		jobs = append(jobs, j)
+	}
+	m.mu.Unlock()
+	for _, job := range jobs {
+		job.mu.Lock()
+		done := job.done
+		job.mu.Unlock()
+		if done || job.cmd == nil || job.cmd.Process == nil {
+			continue
+		}
+		if job.sandboxed {
+			_ = job.cmd.Process.Kill()
+		} else {
+			killProcTree(job.cmd)
+		}
+	}
+}
+
 // Poll returns the current status and output of jobID, spilling outputs > inlineThreshold to @page.
 func (m *BgProcessManager) Poll(ctx context.Context, vm *vmem.Manager, jobID string, inlineThreshold int) (string, error) {
 	return m.PollWait(ctx, vm, jobID, inlineThreshold, 0)

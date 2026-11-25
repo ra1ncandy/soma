@@ -453,6 +453,7 @@ func (rs *RuntimeSupervisor) runFromBridge(ctx context.Context, req bridge.Start
 	if strings.EqualFold(req.Profile, "frontier") {
 		prof = compiler.FrontierProfile()
 	}
+	defer closeExecutor(exec)
 	runID, branchID, err := exec.StartRun(ctx, rs.server.buildRunRequest(title, req.Goal, prof, accIDs))
 	if err != nil {
 		return bridge.StartRunResponse{}, err

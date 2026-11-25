@@ -141,6 +141,28 @@ func (rt *headerRoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 	return base.RoundTrip(clone)
 }
 
+// NewStreamingEndpointHTTPClient is NewEndpointHTTPClient for SSE / streamable-HTTP sessions.
+// Those keep a response body open for the life of the session, so a whole-request Timeout would
+// tear the session down after that long. Only waiting for response headers is bounded; individual
+// tool calls are bounded by their context instead.
+func NewStreamingEndpointHTTPClient(ep ServerEndpoint, base *http.Client) *http.Client {
+	hc := NewEndpointHTTPClient(ep, base)
+	headerTimeout := hc.Timeout
+	hc.Timeout = 0
+	hrt, ok := hc.Transport.(*headerRoundTripper)
+	if !ok {
+		return hc
+	}
+	if hrt.base == nil {
+		if dt, ok := http.DefaultTransport.(*http.Transport); ok {
+			tr := dt.Clone()
+			tr.ResponseHeaderTimeout = headerTimeout
+			hrt.base = tr
+		}
+	}
+	return hc
+}
+
 // NewEndpointHTTPClient returns an *http.Client configured with ep's timeout, AuthToken, and expanded Headers.
 func NewEndpointHTTPClient(ep ServerEndpoint, base *http.Client) *http.Client {
 	var baseRT http.RoundTripper
