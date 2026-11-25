@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"path"
 	"strings"
 	"time"
 )
@@ -40,6 +41,9 @@ func NewHTTPBroker(policies ...EndpointPolicy) *HTTPBroker {
 		Policies: pm,
 		HTTPClient: &http.Client{
 			Timeout: 30 * time.Second,
+			// Never follow redirects: the injected credential header must only ever reach the
+			// allowlisted host and path, not wherever that host points next.
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
 	}
 }
@@ -82,6 +86,13 @@ func (h *HTTPBroker) validateAndParse(req BrokerRequest) (*url.URL, EndpointPoli
 	}
 	if !containsFold(pol.AllowedMethods, method) {
 		return nil, EndpointPolicy{}, "", fmt.Errorf("%w: method %s not allowed for %s", ErrPolicyDenied, method, pol.Domain)
+	}
+	// Compare the normalised path, so "/v1/../admin" cannot pass a "/v1/" prefix allowlist.
+	if cleaned := path.Clean("/" + u.Path); cleaned != u.Path && u.Path != "" {
+		if strings.HasSuffix(u.Path, "/") && cleaned != "/" {
+			cleaned += "/"
+		}
+		u.Path = cleaned
 	}
 	if len(pol.PathPrefixes) > 0 && !matchesAnyPrefix(u.Path, pol.PathPrefixes) {
 		return nil, EndpointPolicy{}, "", fmt.Errorf("%w: path %q outside allowlisted prefixes for %s", ErrPolicyDenied, u.Path, pol.Domain)

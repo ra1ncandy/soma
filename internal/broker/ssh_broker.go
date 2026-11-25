@@ -84,7 +84,7 @@ func NewSSHBroker(st *store.Store, ws *workspace.Manager, runner SSHCommandRunne
 
 func (s *SSHBroker) Name() string { return "ssh" }
 
-var forbiddenShellMeta = []string{";", "&&", "||", "|", "`", "$(", "\n", "\r", ">", "<"}
+var forbiddenShellMeta = []string{";", "&", "|", "`", "$(", "${", "\n", "\r", ">", "<"}
 
 // Validate enforces host allowlisting, shell metacharacter rejection, and command prefix allowlists.
 func (s *SSHBroker) Validate(req BrokerRequest) error {

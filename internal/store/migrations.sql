@@ -228,6 +228,35 @@ CREATE INDEX IF NOT EXISTS idx_memory_active ON memory_nodes(scope, status, vali
 CREATE INDEX IF NOT EXISTS idx_trigger_expires ON trigger_runs(expires_at);
 CREATE INDEX IF NOT EXISTS idx_inbox_pending ON inbox_items(status, created_at);
 
+-- Foreign-key columns: without these, deleting a run makes SQLite scan each child table once per
+-- deleted parent row to enforce the constraint (quadratic in run size).
+CREATE INDEX IF NOT EXISTS idx_branches_run ON branches(run_id);
+CREATE INDEX IF NOT EXISTS idx_branches_parent ON branches(parent_branch_id);
+CREATE INDEX IF NOT EXISTS idx_steps_run ON steps(run_id);
+CREATE INDEX IF NOT EXISTS idx_steps_parent ON steps(parent_step_id);
+CREATE INDEX IF NOT EXISTS idx_steps_obs_page ON steps(observation_page_id);
+CREATE INDEX IF NOT EXISTS idx_steps_snapshot ON steps(epoch_snapshot_id);
+CREATE INDEX IF NOT EXISTS idx_epoch_snapshots_run ON epoch_snapshots(run_id);
+CREATE INDEX IF NOT EXISTS idx_epoch_snapshots_branch ON epoch_snapshots(branch_id, epoch);
+CREATE INDEX IF NOT EXISTS idx_action_journal_run ON action_journal(run_id);
+CREATE INDEX IF NOT EXISTS idx_action_journal_parent ON action_journal(parent_step_id);
+CREATE INDEX IF NOT EXISTS idx_action_journal_page ON action_journal(result_page_id);
+CREATE INDEX IF NOT EXISTS idx_memory_prov_step ON memory_nodes(provenance_step_id);
+CREATE INDEX IF NOT EXISTS idx_memory_evidence_page ON memory_nodes(evidence_page_id);
+CREATE INDEX IF NOT EXISTS idx_memory_edges_to ON memory_edges(to_node_id);
+CREATE INDEX IF NOT EXISTS idx_memory_edges_prov ON memory_edges(provenance_step_id);
+CREATE INDEX IF NOT EXISTS idx_contracts_run ON contracts(run_id);
+CREATE INDEX IF NOT EXISTS idx_contract_runs_branch ON contract_runs(branch_id);
+CREATE INDEX IF NOT EXISTS idx_contract_runs_step ON contract_runs(step_id);
+CREATE INDEX IF NOT EXISTS idx_contract_runs_contract ON contract_runs(contract_id);
+CREATE INDEX IF NOT EXISTS idx_contract_runs_page ON contract_runs(output_page_id);
+CREATE INDEX IF NOT EXISTS idx_inbox_run ON inbox_items(run_id);
+CREATE INDEX IF NOT EXISTS idx_inbox_branch ON inbox_items(branch_id);
+CREATE INDEX IF NOT EXISTS idx_trigger_runs_branch ON trigger_runs(branch_id);
+CREATE INDEX IF NOT EXISTS idx_trigger_runs_trigger ON trigger_runs(trigger_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_remote_leases_branch ON remote_leases(branch_id);
+CREATE INDEX IF NOT EXISTS idx_pages_trust ON pages(run_id, trust_tier);
+
 -- 12. Matryoshka Int8 Vector Index (Memory Nodes & @page Chunks)
 CREATE TABLE IF NOT EXISTS embeddings (
     kind TEXT NOT NULL,
@@ -242,4 +271,5 @@ CREATE TABLE IF NOT EXISTS embeddings (
     created_at INTEGER NOT NULL,
     PRIMARY KEY (kind, target_id, chunk_index)
 );
-CREATE INDEX IF NOT EXISTS idx_embeddings_kind_target ON embeddings(kind, target_id);
+-- (kind, target_id) is a prefix of the primary key; a separate index only slowed writes.
+DROP INDEX IF EXISTS idx_embeddings_kind_target;

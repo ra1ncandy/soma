@@ -39,6 +39,25 @@ func newImportHermesCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// The report is printed to the terminal (and often pasted into issues): show that
+			// credentials were found without echoing them.
+			for i := range rep.MCPServers {
+				ep := &rep.MCPServers[i]
+				if ep.AuthToken != "" {
+					ep.AuthToken = "[redacted]"
+				}
+				for k := range ep.Headers {
+					ep.Headers[k] = "[redacted]"
+				}
+				for k := range ep.Env {
+					ep.Env[k] = "[redacted]"
+				}
+				if ep.OAuth != nil && ep.OAuth.ClientSecret != "" {
+					oc := *ep.OAuth
+					oc.ClientSecret = "[redacted]"
+					ep.OAuth = &oc
+				}
+			}
 			b, _ := json.MarshalIndent(rep, "", "  ")
 			fmt.Println(string(b))
 			return nil

@@ -110,7 +110,10 @@ func NewSSHBackend(targetHost, remoteRoot string, sshOpts ...string) *SSHBackend
 
 func (s *SSHBackend) Name() string { return "ssh:" + s.TargetHost }
 
-func (s *SSHBackend) Available() bool { return s.BinPath != "" && s.TargetHost != "" }
+// A target beginning with "-" would be parsed by ssh as an option (e.g. -oProxyCommand=...).
+func (s *SSHBackend) Available() bool {
+	return s.BinPath != "" && s.TargetHost != "" && !strings.HasPrefix(s.TargetHost, "-")
+}
 
 func (s *SSHBackend) SupportsNetworkIsolation() bool { return true }
 

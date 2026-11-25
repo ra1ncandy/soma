@@ -2353,8 +2353,13 @@ func (r *LocalToolRunner) Execute(ctx context.Context, call ToolCall) (ToolOutpu
 			}
 		}
 		eff := call.EffectClass
-		if effStr, ok := args["effect_class"].(string); ok && strings.TrimSpace(effStr) != "" {
-			eff = taint.EffectClass(strings.TrimSpace(effStr))
+		// The model may declare a call riskier than inferred, never safer: a self-declared
+		// "read_only" would skip the taint check on what is really an external write.
+		if effStr, ok := args["effect_class"].(string); ok {
+			switch declared := taint.EffectClass(strings.TrimSpace(effStr)); declared {
+			case taint.EffectExternalWrite, taint.EffectIrreversible:
+				eff = declared
+			}
 		}
 		if eff == "" {
 			if strings.EqualFold(op, "GET") || strings.EqualFold(op, "read") {

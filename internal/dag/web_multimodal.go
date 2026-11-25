@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -105,7 +106,11 @@ func NewSSRFSafeHTTPClient(timeout time.Duration) *http.Client {
 		KeepAlive: 15 * time.Second,
 	}
 	transport := &http.Transport{
-		Proxy: nil, // Do not allow environment HTTP_PROXY to bounce into internal networks.
+		// Idle connections are closed instead of lingering for as long as the remote allows.
+		IdleConnTimeout:     60 * time.Second,
+		MaxIdleConnsPerHost: 4,
+		TLSHandshakeTimeout: 10 * time.Second,
+		Proxy:               nil, // Do not allow environment HTTP_PROXY to bounce into internal networks.
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			host, port, err := net.SplitHostPort(addr)
 			if err != nil {
@@ -173,6 +178,18 @@ func CleanHTMLToText(raw []byte) string {
 	return strings.Join(out, "\n")
 }
 
+var (
+	sharedWebClientOnce sync.Once
+	sharedWebClient     *http.Client
+)
+
+// defaultWebClient returns one process-wide SSRF-safe client so web_search/web_extract reuse
+// connections (and TLS sessions) across calls instead of building a new transport every time.
+func defaultWebClient() *http.Client {
+	sharedWebClientOnce.Do(func() { sharedWebClient = NewSSRFSafeHTTPClient(15 * time.Second) })
+	return sharedWebClient
+}
+
 // ExecuteWebExtract fetches targetURL, extracts readable text, and marks TrustTier="untrusted_external"
 // so any spilled @page is tracked by soma's provenance taint engine.
 func ExecuteWebExtract(ctx context.Context, client *http.Client, targetURL string) (ToolOutput, error) {
@@ -182,7 +199,7 @@ func ExecuteWebExtract(ctx context.Context, client *http.Client, targetURL strin
 		return ToolOutput{}, fmt.Errorf("web_extract: %w", err)
 	}
 	if client == nil {
-		client = NewSSRFSafeHTTPClient(15 * time.Second)
+		client = defaultWebClient()
 	}
 
 	reqCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
@@ -238,7 +255,7 @@ func ExecuteWebSearch(ctx context.Context, client *http.Client, searchEndpoint, 
 	}
 	enforcePrivateBlock := client == nil
 	if client == nil {
-		client = NewSSRFSafeHTTPClient(15 * time.Second)
+		client = defaultWebClient()
 	}
 	if searchEndpoint == "" {
 		searchEndpoint = strings.TrimSpace(os.Getenv("SOMA_SEARCH_URL"))
