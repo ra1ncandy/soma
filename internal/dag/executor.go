@@ -271,6 +271,9 @@ func NewExecutor(
 		if lt.GUITaskFunc == nil {
 			lt.GUITaskFunc = ex.RunGUISubagent
 		}
+		if lt.Memory == nil {
+			lt.Memory = ex.Memory
+		}
 	}
 	return ex
 }
@@ -1045,6 +1048,13 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 				tc.EffectClass = resolveMCPCallEffectClass(mcpMgr, tc.ArgsJSON)
 			} else if tc.EffectClass == "" {
 				tc.EffectClass = inferToolEffectClass(tc.Name)
+			}
+			// With sandbox networking enabled a shell command can send data anywhere, so it is an
+			// external write and subject to the untrusted-provenance check, not a local edit.
+			if (tc.Name == "exec" || tc.Name == "bg_exec") && tc.EffectClass == taint.EffectWorkspaceWrite {
+				if lt, ok := e.Tools.(*LocalToolRunner); ok && lt.AllowSandboxNetwork {
+					tc.EffectClass = taint.EffectExternalWrite
+				}
 			}
 			// The model only declares the pages it chooses to cite. For anything leaving the
 			// sandbox, every untrusted page this run has observed is implied provenance: the
@@ -1984,6 +1994,15 @@ func detectWorkspaceKind(wsPath string) string {
 	return "generic"
 }
 
+// pageReadTier labels content read back out of an @page: untrusted pages stay untrusted, so
+// re-reading hostile web text through page_slice/page_grep/page_search cannot launder it.
+func pageReadTier(pageTier string) string {
+	if pageTier == "untrusted_external" {
+		return "untrusted_external"
+	}
+	return "trusted_repo"
+}
+
 // ErrUnknownTool is returned by LocalToolRunner when a tool name does not match any registered syscall.
 var ErrUnknownTool = errors.New("dag: unknown tool")
 
@@ -1992,6 +2011,8 @@ type LocalToolRunner struct {
 	vm             *vmem.Manager
 	Sandbox        *sandbox.Manager
 	Broker         *broker.Router
+	// Memory is the memory service (with its configured embedder) used by memory_search/memory_write.
+	Memory         *memory.Service
 	MCPCatalog     *mcp.EpochCatalog
 	MCPManager     *mcp.Manager
 	ForkBranchFunc func(ctx context.Context, runID, fromBranchID, label, reason string) (string, error)
@@ -2201,7 +2222,7 @@ func (r *LocalToolRunner) Execute(ctx context.Context, call ToolCall) (ToolOutpu
 		if err != nil {
 			return ToolOutput{}, err
 		}
-		return ToolOutput{NameHint: "slice.txt", Content: []byte(out), TrustTier: "trusted_repo"}, nil
+		return ToolOutput{NameHint: "slice.txt", Content: []byte(out), TrustTier: pageReadTier(r.vm.PageTrustTier(ctx, pid))}, nil
 
 	case "page_grep":
 		pid, _ := args["page_id"].(string)
@@ -2213,7 +2234,7 @@ func (r *LocalToolRunner) Execute(ctx context.Context, call ToolCall) (ToolOutpu
 		if err != nil {
 			return ToolOutput{}, err
 		}
-		return ToolOutput{NameHint: "grep.txt", Content: []byte(out), TrustTier: "trusted_repo"}, nil
+		return ToolOutput{NameHint: "grep.txt", Content: []byte(out), TrustTier: pageReadTier(r.vm.PageTrustTier(ctx, pid))}, nil
 
 	case "page_search":
 		if r.vm == nil {
@@ -2221,11 +2242,11 @@ func (r *LocalToolRunner) Execute(ctx context.Context, call ToolCall) (ToolOutpu
 		}
 		query, _ := args["query"].(string)
 		pid, _ := args["page_id"].(string)
-		out, err := r.vm.Search(ctx, call.RunID, query, pid, 5)
+		out, tier, err := r.vm.SearchWithTier(ctx, call.RunID, query, pid, 5)
 		if err != nil {
 			return ToolOutput{}, err
 		}
-		return ToolOutput{NameHint: "page_search.txt", Content: []byte(out), TrustTier: "trusted_repo"}, nil
+		return ToolOutput{NameHint: "page_search.txt", Content: []byte(out), TrustTier: pageReadTier(tier)}, nil
 
 	case "publish_finding":
 		summary, _ := args["summary"].(string)
@@ -2270,7 +2291,12 @@ func (r *LocalToolRunner) Execute(ctx context.Context, call ToolCall) (ToolOutpu
 		if strings.TrimSpace(scope) != "" {
 			scopes = []string{strings.TrimSpace(scope)}
 		}
-		memSvc := memory.NewService(r.vm.Store())
+		// Use the executor's memory service so queries are embedded with the same model as the
+		// stored vectors; a fresh service would fall back to the default embedder.
+		memSvc := r.Memory
+		if memSvc == nil {
+			memSvc = memory.NewService(r.vm.Store())
+		}
 		hits, err := memSvc.Search(ctx, scopes, nil, query, 5)
 		if err != nil {
 			return ToolOutput{}, err
@@ -2498,7 +2524,10 @@ func (r *LocalToolRunner) Execute(ctx context.Context, call ToolCall) (ToolOutpu
 				tier = "untrusted_external"
 			}
 		}
-		memSvc := memory.NewService(r.vm.Store())
+		memSvc := r.Memory
+		if memSvc == nil {
+			memSvc = memory.NewService(r.vm.Store())
+		}
 		node, err := memSvc.Propose(ctx, memory.ProposeRequest{
 			Scope:     scope,
 			Kind:      kind,

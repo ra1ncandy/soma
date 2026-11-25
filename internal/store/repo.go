@@ -2000,6 +2000,43 @@ func (s *Store) UpsertEmbedding(ctx context.Context, rec EmbeddingRecord) error 
 	})
 }
 
+// UpsertEmbeddings stores a batch of embedding records in one transaction.
+func (s *Store) UpsertEmbeddings(ctx context.Context, recs []EmbeddingRecord) error {
+	if len(recs) == 0 {
+		return nil
+	}
+	now := time.Now().Unix()
+	return s.WithWriteTx(ctx, func(conn *sql.Conn) error {
+		for _, rec := range recs {
+			if rec.CreatedAt == 0 {
+				rec.CreatedAt = now
+			}
+			if rec.Dims == 0 {
+				rec.Dims = len(rec.VecInt8)
+			}
+			if _, err := conn.ExecContext(ctx, `
+				INSERT INTO embeddings (
+					kind, target_id, chunk_index, start_line, end_line,
+					model_id, dims, vec_int8, snippet, created_at
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				ON CONFLICT(kind, target_id, chunk_index) DO UPDATE SET
+					start_line = excluded.start_line,
+					end_line = excluded.end_line,
+					model_id = excluded.model_id,
+					dims = excluded.dims,
+					vec_int8 = excluded.vec_int8,
+					snippet = excluded.snippet,
+					created_at = excluded.created_at`,
+				rec.Kind, rec.TargetID, rec.ChunkIndex, rec.StartLine, rec.EndLine,
+				rec.ModelID, rec.Dims, rec.VecInt8, rec.Snippet, rec.CreatedAt,
+			); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 // GetEmbeddingsByTargets fetches all stored embedding chunks for kind and targetIDs ordered by target_id, chunk_index.
 func (s *Store) GetEmbeddingsByTargets(ctx context.Context, kind string, targetIDs []string) ([]EmbeddingRecord, error) {
 	if len(targetIDs) == 0 {

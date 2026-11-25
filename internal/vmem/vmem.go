@@ -170,9 +170,23 @@ func (m *Manager) Slice(ctx context.Context, pageID string, startLine, endLine i
 	var b strings.Builder
 	fmt.Fprintf(&b, "@%s lines %d..%d of %d:\n", page.ID, startLine, endLine, len(lines))
 	for i := startLine; i <= endLine; i++ {
-		fmt.Fprintf(&b, "L%d: %s\n", i, lines[i-1])
+		// Cap line length: a page that is one enormous line (minified JSON) would otherwise be
+		// returned whole and immediately re-spilled into a new page, forever.
+		fmt.Fprintf(&b, "L%d: %s\n", i, truncateLine(lines[i-1], MaxSliceLineChars))
 	}
 	return strings.TrimRight(b.String(), "\n"), nil
+}
+
+// MaxSliceLineChars bounds each line returned by Slice; use page_grep to locate text inside longer lines.
+const MaxSliceLineChars = 2000
+
+// PageTrustTier returns the provenance tier recorded for pageID ("" if unknown).
+func (m *Manager) PageTrustTier(ctx context.Context, pageID string) string {
+	page, err := m.store.GetPage(ctx, strings.TrimPrefix(strings.TrimSpace(pageID), "@"))
+	if err != nil {
+		return ""
+	}
+	return page.TrustTier
 }
 
 // Grep searches a spilled @page with a Go regex and returns up to maxMatches numbered lines.
@@ -262,6 +276,13 @@ func (m *Manager) GrepWithOptions(ctx context.Context, pageID, pattern string, m
 // Search performs Hybrid BM25 + Matryoshka int8 Vector RRF search across 40-line chunks of spilled @page blobs
 // in runID (or a specific pageIDFilter if non-empty), returning top-K matching line ranges.
 func (m *Manager) Search(ctx context.Context, runID, query, pageIDFilter string, topK int) (string, error) {
+	out, _, err := m.SearchWithTier(ctx, runID, query, pageIDFilter, topK)
+	return out, err
+}
+
+// SearchWithTier is Search plus the least-trusted provenance tier among the pages it quoted, so
+// callers can keep untrusted page content tainted when it is read back.
+func (m *Manager) SearchWithTier(ctx context.Context, runID, query, pageIDFilter string, topK int) (string, string, error) {
 	if topK <= 0 {
 		topK = 5
 	}
@@ -274,25 +295,46 @@ func (m *Manager) Search(ctx context.Context, runID, query, pageIDFilter string,
 	if pageIDFilter != "" {
 		p, err := m.store.GetPage(ctx, pageIDFilter)
 		if err != nil {
-			return "", err
+			return "", "", err
 		}
 		pages = []store.Page{p}
 	} else {
+		// Only this run's pages: falling back to other runs' pages would hand a fresh run content
+		// (possibly hostile web text) it never observed, outside its taint record.
 		var err error
 		pages, err = m.store.ListRunPages(ctx, runID, 50)
 		if err != nil {
-			return "", err
-		}
-		if len(pages) == 0 && runID != "" {
-			pages, err = m.store.ListRunPages(ctx, "", 50)
-			if err != nil {
-				return "", err
-			}
+			return "", "", err
 		}
 	}
 	if len(pages) == 0 {
-		return "page_search: no spilled @page handles available", nil
+		return "page_search: no spilled @page handles available", "", nil
 	}
+	tierByPage := make(map[string]string, len(pages))
+	pageIDs := make([]string, 0, len(pages))
+	for _, pg := range pages {
+		tierByPage[pg.ID] = pg.TrustTier
+		pageIDs = append(pageIDs, pg.ID)
+	}
+
+	// One query for every page's cached chunk vectors. Vectors from a different embedding model or
+	// dimension are not comparable with this embedder's query vector, so they are ignored.
+	cachedByPage := make(map[string]map[int][]byte, len(pages))
+	if m.embedder != nil {
+		if recs, err := m.store.GetEmbeddingsByTargets(ctx, "page_chunk", pageIDs); err == nil {
+			wantModel := m.embedder.ModelID()
+			for _, r := range recs {
+				if len(r.VecInt8) == 0 || r.ModelID != wantModel {
+					continue
+				}
+				if cachedByPage[r.TargetID] == nil {
+					cachedByPage[r.TargetID] = make(map[int][]byte)
+				}
+				cachedByPage[r.TargetID][r.ChunkIndex] = r.VecInt8
+			}
+		}
+	}
+	var newEmbeddings []store.EmbeddingRecord
 
 	const chunkLines = 40
 	type chunkMeta struct {
@@ -311,19 +353,14 @@ func (m *Manager) Search(ctx context.Context, runID, query, pageIDFilter string,
 		if err != nil {
 			continue
 		}
-		_ = m.store.TouchPage(ctx, pg.ID)
 		lines := splitLines(raw)
 		if len(lines) == 0 {
 			continue
 		}
 
-		cachedVecs := make(map[int][]byte)
-		if recs, err := m.store.GetEmbeddingsByTargets(ctx, "page_chunk", []string{pg.ID}); err == nil {
-			for _, r := range recs {
-				if len(r.VecInt8) > 0 {
-					cachedVecs[r.ChunkIndex] = r.VecInt8
-				}
-			}
+		cachedVecs := cachedByPage[pg.ID]
+		if cachedVecs == nil {
+			cachedVecs = make(map[int][]byte)
 		}
 
 		var uncachedIdx []int
@@ -363,7 +400,7 @@ func (m *Manager) Search(ctx context.Context, runID, query, pageIDFilter string,
 				for j, cIdx := range uncachedIdx {
 					cachedVecs[cIdx] = vecs[j]
 					cm := uncachedMeta[j]
-					_ = m.store.UpsertEmbedding(ctx, store.EmbeddingRecord{
+					newEmbeddings = append(newEmbeddings, store.EmbeddingRecord{
 						Kind:       "page_chunk",
 						TargetID:   pg.ID,
 						ChunkIndex: cIdx,
@@ -389,12 +426,22 @@ func (m *Manager) Search(ctx context.Context, runID, query, pageIDFilter string,
 		}
 	}
 
+	// Persist all newly computed chunk vectors in a single transaction.
+	_ = m.store.UpsertEmbeddings(ctx, newEmbeddings)
+
 	ranked, err := embed.HybridSearch(ctx, m.embedder, query, docs, topK)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	if len(ranked) == 0 {
-		return fmt.Sprintf("page_search: 0 matches for %q across %d page(s)", query, len(pages)), nil
+		return fmt.Sprintf("page_search: 0 matches for %q across %d page(s)", query, len(pages)), "", nil
+	}
+	tier := ""
+	for _, r := range ranked {
+		if tierByPage[metaByDocID[r.ID].pageID] == "untrusted_external" {
+			tier = "untrusted_external"
+			break
+		}
 	}
 
 	var out strings.Builder
@@ -407,7 +454,7 @@ func (m *Manager) Search(ctx context.Context, runID, query, pageIDFilter string,
 		out.WriteString(compactChunkSnippet(cm.text, query, 10))
 		out.WriteByte('\n')
 	}
-	return strings.TrimRight(out.String(), "\n"), nil
+	return strings.TrimRight(out.String(), "\n"), tier, nil
 }
 
 func compactChunkSnippet(chunkText, query string, maxLines int) string {

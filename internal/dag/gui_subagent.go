@@ -259,6 +259,27 @@ func (e *Executor) RunGUISubagent(ctx context.Context, runID, parentBranchID, mo
 	}, nil
 }
 
+// mcpToolLooksReadOnly recognises observation-only MCP tools by name. GUI servers (browser_*,
+// desktop_*) use loose keywords for their screenshot/snapshot/inspection tools; for any other
+// server only a leading read verb counts, so names that merely contain "get_" or "network"
+// (forget_user, delete_network, create_snapshot) stay gated as external writes.
+func mcpToolLooksReadOnly(tLower string) bool {
+	if strings.HasPrefix(tLower, "browser_") || strings.HasPrefix(tLower, "desktop_") {
+		for _, kw := range []string{"snapshot", "screenshot", "a11y", "list_", "get_", "console", "network", "crop"} {
+			if strings.Contains(tLower, kw) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, verb := range []string{"get_", "list_", "read_", "search_", "find_", "describe_", "query_", "fetch_"} {
+		if strings.HasPrefix(tLower, verb) {
+			return true
+		}
+	}
+	return false
+}
+
 // resolveMCPCallEffectClass classifies an mcp_call action so isolated Docker desktop/browser
 // interactions are EffectWorkspaceWrite (avoiding taint deadlock after observing screen data),
 // read-only snapshots/screenshots are EffectReadOnly, and host/remote MCP writes stay EffectExternalWrite.
@@ -270,10 +291,7 @@ func resolveMCPCallEffectClass(mgr *mcp.Manager, argsJSON string) taint.EffectCl
 	srv, _ := args["server"].(string)
 	tool, _ := args["tool"].(string)
 	tLower := strings.ToLower(strings.TrimSpace(tool))
-	if strings.Contains(tLower, "snapshot") || strings.Contains(tLower, "screenshot") ||
-		strings.Contains(tLower, "a11y") || strings.Contains(tLower, "list_") ||
-		strings.Contains(tLower, "get_") || strings.Contains(tLower, "console") ||
-		strings.Contains(tLower, "network") || strings.Contains(tLower, "crop") {
+	if mcpToolLooksReadOnly(tLower) {
 		return taint.EffectReadOnly
 	}
 	if mgr != nil && mgr.IsIsolatedDesktop(srv) {
