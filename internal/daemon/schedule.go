@@ -23,6 +23,19 @@ type Schedule struct {
 	dom     [32]bool // 1..31
 	months  [13]bool // 1..12
 	dow     [7]bool  // 0..6 (0 = Sunday)
+	// domAny/dowAny record an unrestricted ("*") field. Standard cron fires when EITHER day
+	// field matches if both are restricted, and only ANDs them when one is a wildcard.
+	domAny bool
+	dowAny bool
+}
+
+func (s Schedule) dayMatches(t time.Time) bool {
+	domOK := s.dom[t.Day()]
+	dowOK := s.dow[int(t.Weekday())]
+	if !s.domAny && !s.dowAny {
+		return domOK || dowOK
+	}
+	return domOK && dowOK
 }
 
 // ParseSchedule parses either a duration ("15m", "1h", "7d") or a 5-field cron expression.
@@ -76,6 +89,8 @@ func ParseSchedule(expr string) (Schedule, error) {
 		return Schedule{}, fmt.Errorf("cron day-of-week %q: %w", fields[4], err)
 	}
 	copy(s.dow[:], dowSet[:7])
+	s.domAny = strings.HasPrefix(fields[2], "*")
+	s.dowAny = strings.HasPrefix(fields[4], "*")
 
 	return s, nil
 }
@@ -162,7 +177,7 @@ func (s Schedule) Next(now time.Time) time.Time {
 			cand = time.Date(cand.Year(), cand.Month()+1, 1, 0, 0, 0, 0, cand.Location())
 			continue
 		}
-		if !s.dom[cand.Day()] || !s.dow[int(cand.Weekday())] {
+		if !s.dayMatches(cand) {
 			cand = time.Date(cand.Year(), cand.Month(), cand.Day()+1, 0, 0, 0, 0, cand.Location())
 			continue
 		}

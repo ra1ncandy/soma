@@ -138,7 +138,14 @@ func (d *Daemon) defaultCommandRunner(ctx context.Context, command, workspaceDir
 		cmd.Dir = workspaceDir
 	}
 	cmd.Env = sandbox.ScrubEnv(nil)
-	out, err := cmd.CombinedOutput()
+	// A grandchild that keeps the output pipe open must not block Wait past the timeout, and a
+	// runaway command must not buffer unbounded output.
+	cmd.WaitDelay = 2 * time.Second
+	buf := &limitedBuffer{limit: 1 << 20}
+	cmd.Stdout = buf
+	cmd.Stderr = buf
+	err := cmd.Run()
+	out := buf.Bytes()
 	if err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
@@ -653,12 +660,57 @@ func (d *Daemon) Start(ctx context.Context) error {
 	return runErr
 }
 
-func (d *Daemon) runPoller(ctx context.Context, spec TriggerSpec) {
-	sched, err := ParseSchedule(spec.Interval)
-	if err != nil {
-		sched = Schedule{Interval: time.Minute}
+// limitedBuffer keeps at most limit bytes of command output and discards the rest.
+type limitedBuffer struct {
+	mu    sync.Mutex
+	buf   []byte
+	limit int
+}
+
+func (l *limitedBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if room := l.limit - len(l.buf); room > 0 {
+		if len(p) > room {
+			l.buf = append(l.buf, p[:room]...)
+		} else {
+			l.buf = append(l.buf, p...)
+		}
 	}
-	timer := time.NewTimer(sched.NextDelay(d.now()))
+	return len(p), nil
+}
+
+func (l *limitedBuffer) Bytes() []byte {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]byte(nil), l.buf...)
+}
+
+// pollerSchedule resolves a trigger's schedule. Sentinel/watch triggers without an interval poll
+// every minute; any schedule that fails to parse disables the trigger rather than silently
+// becoming "every minute" (which would run a mis-typed daily job 1,440 times a day).
+func pollerSchedule(spec TriggerSpec) (Schedule, error) {
+	if strings.TrimSpace(spec.Interval) == "" && spec.Type != "cron" {
+		return Schedule{Interval: time.Minute}, nil
+	}
+	return ParseSchedule(spec.Interval)
+}
+
+func (d *Daemon) runPoller(ctx context.Context, spec TriggerSpec) {
+	sched, err := pollerSchedule(spec)
+	if err != nil {
+		if d.OnOutcome != nil {
+			d.OnOutcome(TriggerOutcome{TriggerID: spec.ID, Status: "invalid_schedule", Reason: err.Error()})
+		}
+		return
+	}
+	// Sleep in short hops against the wall clock: a single long timer runs on the monotonic clock,
+	// which does not advance while the machine is suspended, so a 09:00 job would fire hours late.
+	next := sched.Next(d.now())
+	sleepFor := func() time.Duration {
+		return min(max(next.Sub(d.now()), 0), time.Minute)
+	}
+	timer := time.NewTimer(sleepFor())
 	defer timer.Stop()
 
 	for {
@@ -666,6 +718,10 @@ func (d *Daemon) runPoller(ctx context.Context, spec TriggerSpec) {
 		case <-ctx.Done():
 			return
 		case <-timer.C:
+			if d.now().Before(next) {
+				timer.Reset(sleepFor())
+				continue
+			}
 			if spec.Type == "cron" {
 				now := d.now()
 				bucketSec := int64(60)
@@ -676,7 +732,7 @@ func (d *Daemon) runPoller(ctx context.Context, spec TriggerSpec) {
 					TriggerID:   spec.ID,
 					Source:      "cron",
 					Payload:     []byte(spec.Prompt),
-					PayloadHash: sha256Hex([]byte(fmt.Sprintf("%s|%d", spec.ID, now.Unix()/bucketSec))),
+					PayloadHash: sha256Hex([]byte(cronFireKey(spec.ID, sched, next, bucketSec))),
 					Fields:      map[string]any{"trigger_id": spec.ID},
 					ReceivedAt:  now,
 				}
@@ -685,16 +741,54 @@ func (d *Daemon) runPoller(ctx context.Context, spec TriggerSpec) {
 					Count:          1,
 					IdempotencyKey: DeriveIdempotencyKey(spec, ev, now),
 				})
-				timer.Reset(sched.NextDelay(d.now()))
+				next = sched.Next(d.now())
+				timer.Reset(sleepFor())
 				continue
 			}
 			out, _ := d.EvaluateSentinel(ctx, spec)
 			if out.Status == "stopped" {
 				return
 			}
-			timer.Reset(sched.NextDelay(d.now()))
+			next = sched.Next(d.now())
+			timer.Reset(sleepFor())
 		}
 	}
+}
+
+// cronFireKey identifies one scheduled firing. Cron schedules key on the local wall-clock minute so
+// the repeated hour at the end of daylight saving time does not fire the same job twice.
+func cronFireKey(triggerID string, sched Schedule, scheduled time.Time, bucketSec int64) string {
+	if sched.IsCron {
+		return triggerID + "|" + scheduled.Format("2006-01-02T15:04")
+	}
+	return fmt.Sprintf("%s|%d", triggerID, scheduled.Unix()/bucketSec)
+}
+
+// maxWatchedDirs caps recursive fsnotify registration (inotify watches are a limited resource).
+const maxWatchedDirs = 2000
+
+// addWatchTree registers dir and its subdirectories, since inotify watches are not recursive.
+func addWatchTree(watcher *fsnotify.Watcher, watched map[string]bool, dir string) {
+	_ = filepath.WalkDir(dir, func(p string, de os.DirEntry, err error) error {
+		if err != nil || !de.IsDir() {
+			return nil
+		}
+		switch de.Name() {
+		case ".git", ".soma", "node_modules", ".venv", "__pycache__":
+			if p != dir {
+				return filepath.SkipDir
+			}
+		}
+		if len(watched) >= maxWatchedDirs {
+			return filepath.SkipAll
+		}
+		if !watched[p] {
+			if addErr := watcher.Add(p); addErr == nil {
+				watched[p] = true
+			}
+		}
+		return nil
+	})
 }
 
 func (d *Daemon) runFSNotify(ctx context.Context, specs []TriggerSpec) {
@@ -726,7 +820,9 @@ func (d *Daemon) runFSNotify(ctx context.Context, specs []TriggerSpec) {
 			} else if errors.Is(statErr, os.ErrNotExist) {
 				watchDir = filepath.Dir(absPath)
 			}
-			if !watchedDirs[watchDir] {
+			if watchDir == absPath {
+				addWatchTree(watcher, watchedDirs, watchDir) // a watched directory covers its whole tree
+			} else if !watchedDirs[watchDir] {
 				if addErr := watcher.Add(watchDir); addErr == nil {
 					watchedDirs[watchDir] = true
 				}
@@ -752,6 +848,11 @@ func (d *Daemon) runFSNotify(ctx context.Context, specs []TriggerSpec) {
 				continue
 			}
 			evPath := filepath.Clean(ev.Name)
+			if ev.Op&fsnotify.Create != 0 {
+				if info, statErr := os.Stat(evPath); statErr == nil && info.IsDir() {
+					addWatchTree(watcher, watchedDirs, evPath) // follow directories created later
+				}
+			}
 			for _, tgt := range targets {
 				if evPath == tgt.path || strings.HasPrefix(evPath, tgt.path+string(filepath.Separator)) {
 					now := d.now()
@@ -1012,6 +1113,11 @@ func ValidateConfig(cfg Config) error {
 		seen[tr.ID] = true
 		if tr.Type != "webhook" && tr.Type != "sentinel" && tr.Type != "watch" && tr.Type != "fsnotify" && tr.Type != "cron" {
 			return fmt.Errorf("trigger %s has unsupported type %q", tr.ID, tr.Type)
+		}
+		if tr.Type == "cron" || tr.Type == "sentinel" || tr.Type == "watch" {
+			if _, err := pollerSchedule(tr); err != nil {
+				return fmt.Errorf("trigger %s: %w", tr.ID, err)
+			}
 		}
 	}
 	return nil

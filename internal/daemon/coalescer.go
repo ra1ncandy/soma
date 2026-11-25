@@ -34,6 +34,41 @@ type Coalescer struct {
 	mu      sync.Mutex
 	pending map[string]*pendingBucket
 	wg      sync.WaitGroup
+	// slots bounds how many trigger handlers (agent runs) execute at once, so a burst of events
+	// cannot start an unbounded number of runs.
+	slots chan struct{}
+}
+
+// maxConcurrentDispatch is the number of trigger handlers allowed to run simultaneously.
+const maxConcurrentDispatch = 4
+
+// dispatch runs emit on its own goroutine once a slot is free. Callers (webhook HTTP handlers,
+// the fsnotify loop) never block on the handler, which may be a full agent run.
+func (c *Coalescer) dispatch(ctx context.Context, emit func(CoalescedEvent), ce CoalescedEvent) {
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		select {
+		case c.slots <- struct{}{}:
+		case <-ctx.Done():
+			return
+		}
+		defer func() { <-c.slots }()
+		if ctx.Err() != nil {
+			return
+		}
+		emit(ce)
+	}()
+}
+
+// bucketKey separates unrelated events of one trigger: with an idempotency_key template (e.g. a
+// pull-request number) each distinct key debounces on its own instead of the latest event
+// silently replacing the others.
+func bucketKey(spec TriggerSpec, ev Event) string {
+	if strings.TrimSpace(spec.IdempotencyKey) == "" {
+		return spec.ID
+	}
+	return spec.ID + "|" + DeriveIdempotencyKey(spec, ev, ev.ReceivedAt)
 }
 
 type pendingBucket struct {
@@ -47,6 +82,7 @@ type pendingBucket struct {
 func NewCoalescer() *Coalescer {
 	return &Coalescer{
 		pending: make(map[string]*pendingBucket),
+		slots:   make(chan struct{}, maxConcurrentDispatch),
 	}
 }
 
@@ -113,14 +149,15 @@ func (c *Coalescer) Submit(ctx context.Context, spec TriggerSpec, ev Event, emit
 			Count:          1,
 			IdempotencyKey: DeriveIdempotencyKey(spec, ev, ev.ReceivedAt),
 		}
-		emit(ce)
+		c.dispatch(ctx, emit, ce)
 		return
 	}
 
+	key := bucketKey(spec, ev)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if b, ok := c.pending[spec.ID]; ok {
+	if b, ok := c.pending[key]; ok {
 		b.latest = ev
 		b.count++
 		return
@@ -131,17 +168,17 @@ func (c *Coalescer) Submit(ctx context.Context, spec TriggerSpec, ev Event, emit
 		latest: ev,
 		count:  1,
 	}
-	c.pending[spec.ID] = b
+	c.pending[key] = b
 	c.wg.Add(1)
 	b.timer = time.AfterFunc(deb, func() {
 		defer c.wg.Done()
 		c.mu.Lock()
-		cur, exists := c.pending[spec.ID]
+		cur, exists := c.pending[key]
 		if !exists {
 			c.mu.Unlock()
 			return
 		}
-		delete(c.pending, spec.ID)
+		delete(c.pending, key)
 		c.mu.Unlock()
 
 		if ctx.Err() != nil {
@@ -152,7 +189,7 @@ func (c *Coalescer) Submit(ctx context.Context, spec TriggerSpec, ev Event, emit
 			Count:          cur.count,
 			IdempotencyKey: DeriveIdempotencyKey(cur.spec, cur.latest, cur.latest.ReceivedAt),
 		}
-		emit(ce)
+		c.dispatch(ctx, emit, ce)
 	})
 }
 
