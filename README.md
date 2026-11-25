@@ -47,10 +47,10 @@ SOMA_API_BASE="https://api.openai.com/v1" SOMA_API_KEY="$OPENAI_API_KEY" SOMA_MO
 ## What `soma` Includes
 
 ### Web Dashboard (`soma web`)
-- **Chat-First Task Runner**: Live SSE step and tool streaming, compact collapsible thinking/tool traces (`Thought for Xs · N steps · M tools`), branch switching, task rename/delete, and `Enter` to send.
+- **Chat-First Task Runner**: Live step and tool updates over SSE (model text appears per step, not token by token yet), compact collapsible thinking/tool traces (`Thought for Xs · N steps · M tools`), branch switching, task rename/delete, and `Enter` to send.
 - **Safe Workspace Isolation + Diff/Apply**: Runs tasks in isolated `git worktree`s or copy snapshots with an inline **Review Diff & Apply to Project** bar (unified diffs + 3-way merge), or optional `direct` in-place mode.
 - **Approvals Inbox**: Rich context (task title, tool name, arguments, proposed memory content) with **Approve & Resume** that automatically unblocks and resumes paused branches.
-- **Unified Model Pool & Role Routing**: Configure multiple providers/models in `.soma/harness.json` tagged by role (`default`, `worker`, `frontier`, `gui`, `fallback`) with automatic persistence across restarts and per-message model selection.
+- **Unified Model Pool & Role Routing**: Configure multiple providers/models in `.soma/harness.json` tagged by role (`default`, `worker`, `frontier`, `gui`, `fallback`) with automatic persistence across restarts and per-message account selection. The CLI (`soma ask/chat/run`) uses the same default account when `SOMA_API_BASE` is not set. All providers are reached through the OpenAI-compatible chat-completions API today.
 - **Remote Access**: Built-in Cloudflare Tunnel integration with token auth, `HttpOnly` session cookies, and `soma web install-service` systemd user service support.
 
 ### Isolated Virtual Desktop (`soma desktop`)
@@ -60,20 +60,22 @@ SOMA_API_BASE="https://api.openai.com/v1" SOMA_API_KEY="$OPENAI_API_KEY" SOMA_MO
 - **Container-Scoped Package Managers & Lifecycle**: Includes passwordless `sudo`, `apt-get`, `pip`, `npm`, `git`, `wget`, and `unzip` inside the ephemeral `--rm` container (never touching your host OS), plus automatic 5-minute idle stop and clean shutdown on exit.
 
 ### Connectors, Channel Bridges & Automations
-- **MCP Connectors (`soma mcp`)**: 49+ built-in presets, Claude/Cursor/OpenCode config importers, stdio & streamable HTTP transports, OAuth 2.0, tool allow/deny filters, and partial env-var merging without wiping saved secrets.
-- **11 Messaging Channel Bridges (`soma bridge`)**: Discord, Telegram, Slack, Matrix, Mattermost, Teams, Google Chat, Email, WhatsApp, Signal, and SMS with DM pairing/allowlists — supervised directly inside `soma web` or via CLI.
-- **Tier-0 Automations (`soma daemon`)**: Embedded zero-token sentinel, `fsnotify`, HMAC-SHA256 webhooks, 5-field cron (`0 9 * * 1-5`) + duration schedules (`15m`, `7d`), burst coalescing, and safety brakes (quiet hours, max pending approvals, daily budget).
+- **MCP Connectors (`soma mcp`)**: 47 built-in presets (plus 2 Docker desktop presets in the dashboard), Claude Code / Cursor / Codex / Hermes config importers, stdio, SSE & streamable HTTP transports, OAuth 2.1 (PKCE), tool allow/deny filters, and partial env-var merging without wiping saved secrets. Tool `destructiveHint` annotations are honoured: such tools always need approval.
+- **Messaging Channel Bridges (`soma bridge`)**: text bridges with DM pairing/allowlists, supervised inside `soma web` or via CLI. Two-way today: Telegram, Slack (Events API), Matrix, Mattermost, Google Chat. Discord handles slash commands only. Teams and Email are send-only. WhatsApp, Signal and SMS need an external sidecar that speaks soma's signed webhook protocol. Each message starts a new run (no per-chat conversation memory yet).
+- **Tier-0 Automations (`soma daemon`)**: Embedded zero-token sentinel, `fsnotify`, HMAC-SHA256 webhooks, 5-field cron (`0 9 * * 1-5`) + duration schedules (`15m`, `7d`), optional per-trigger debounce, and safety brakes (quiet hours, max pending approvals, daily budget). The agent can schedule its own cron jobs (`cronjob_manage`); they are notify-only by default, cannot touch operator-defined triggers, and need approval in a tainted run.
 
 ### Fail-Closed Security & Autonomy Controls
-- **OS Sandboxing (`internal/sandbox`)**: Linux `bubblewrap` (`--unshare-pid/ipc/uts/cgroup`, `--cap-drop ALL`, `--clearenv`, read-only `/usr` + pinned `EROFS` oracle files), macOS Seatbelt, ephemeral Docker, and Remote SSH. Always fails closed (`FailIfUnavailable: true`) — never executes bare host commands.
-- **Granular Access Controls**: Opt-in **"Allow outbound internet access inside sandboxed commands"** (`AllowNetwork`, keeping workspace/secret isolation intact) and **Standard vs. High Autonomy** modes (auto-approving non-irreversible external/MCP actions while still gating irreversible writes).
-- **Secretless Brokers & Provenance Taint (`internal/broker`, `internal/taint`)**: Zero raw API keys/SSH keys inside sandboxes; *CaMeL*-style run-wide provenance tainting for `untrusted_external` web/MCP reads and *MINJA* anti-poisoning quarantine for learned memories.
+- **OS Sandboxing (`internal/sandbox`)**: Linux `bubblewrap` (`--unshare-pid/ipc/uts/cgroup`, `--cap-drop ALL`, `--clearenv`, read-only `/usr`; oracle files are mounted read-only while the oracle runs) and macOS Seatbelt. Agent shell tools always fail closed — no backend, no execution. Docker and SSH backends exist in code but are not wired into runs yet. Daemon sentinel commands from `triggers.yaml` (written by the operator) run on the host.
+- **Granular Access Controls**: Opt-in **"Allow outbound internet access inside sandboxed commands"** (`AllowNetwork`; output of networked commands is then treated as untrusted) and **Standard vs. High Autonomy** modes (auto-approving non-irreversible external/MCP actions while still gating irreversible writes such as MCP tools marked destructive).
+- **Provenance Taint (`internal/taint`)**: Zero raw API keys inside sandboxes; *CaMeL*-style run-wide provenance tainting for `untrusted_external` web/MCP reads, egress limits on web fetches and searches once a run is tainted (long or encoded arguments need approval), and *MINJA* anti-poisoning quarantine for learned memories and peer findings. Secretless HTTP/SSH/FS brokers are implemented and tested but not yet reachable from agent runs.
+- **Skills Under Review**: Agent-proposed `SKILL.md` changes are linted and staged; they take effect only after operator approval, with the previous version kept in `.history/`. Project instructions (`AGENTS.md`, `CLAUDE.md`, `.cursorrules`, `.soma/persona.md`) and the skill index are frozen into the prompt each epoch; files matching injection patterns are blocked.
 
 ### Durable Kernel Core
 - **4-Layer Monotonic Prompt Compiler (`L0`–`L3`)**: Keeps prompt prefixes byte-stable within an epoch for provider-side KV-cache reuse.
-- **Content-Addressed Virtual Memory (`@page_XXXX`)**: Zstd blob spilling with `page_grep`, `page_slice`, and hybrid Code-BM25 + 256-dim Matryoshka `int8` Vector RRF (`page_search`).
-- **Bi-Temporal Provenance Memory Graph**: Point-in-time `QueryAsOf`, conflict detection (`SUPERSEDES`/`MERGES`), and `global` / `workspace` / `repo` scopes.
-- **External Oracles, Speculative Search & Swarms**: `CommandOracle` (`EROFS`-pinned), `ArtifactOracle`, `soma search` with Graveyard backtracking, `soma swarm` with Layer-2 Blackboard + 3-way `git merge-file`, and `soma export-trajectories` for oracle-verified SFT / contrastive DPO/GRPO datasets.
+- **Content-Addressed Virtual Memory (`@page_XXXX`)**: Zstd blob spilling with `page_grep`, `page_slice`, and hybrid Code-BM25 + `int8` vector RRF (`page_search`). Vectors are lexical feature hashes by default; configure an embeddings endpoint (`SOMA_EMBED_URL`) for semantic retrieval with 256-dim Matryoshka truncation.
+- **Provenance Memory**: memory nodes with validity intervals, `SUPERSEDES`/`MERGES` edges, and `global` / `workspace` / `repo` scopes.
+- **Durability & Replay**: 2-phase action journal; a crash during any external write suspends the branch for reconciliation instead of retrying; rate-limited branches resume automatically in `soma web`; running out of turns records `budget_exhausted` (resumable); exact replay verifies every model step's frame hash, including multi-turn conversations.
+- **External Oracles, Speculative Search & Swarms**: `CommandOracle` (hash-pinned files), `ArtifactOracle`, `soma search` with Graveyard backtracking, `soma swarm` with Layer-2 Blackboard + 3-way `git merge-file`, and `soma export-trajectories` for oracle-verified SFT / contrastive DPO datasets.
 
 ---
 
@@ -84,7 +86,7 @@ SOMA_API_BASE="https://api.openai.com/v1" SOMA_API_KEY="$OPENAI_API_KEY" SOMA_MO
 │                            OPERATOR & BRIDGE SURFACE                          │
 │  Web Dashboard (`soma web` · SSE, Diff/Apply, Virtual Desktop noVNC, Tunnel)  │
 │  CLI (`soma ask/chat/run/search/swarm/mcp/bridge/...`) │ 4-Tab Bubble Tea TUI │
-│  11 Channel Bridges (Discord, Telegram, Slack, Matrix, Email, Webhooks, IPC)  │
+│  Channel Bridges (Telegram, Slack, Matrix, Discord, Webhook sidecars, IPC)    │
 └───────────────────────────────────────┬───────────────────────────────────────┘
                                         │
 ┌───────────────────────────────────────▼───────────────────────────────────────┐
@@ -119,7 +121,7 @@ SOMA_API_BASE="https://api.openai.com/v1" SOMA_API_KEY="$OPENAI_API_KEY" SOMA_MO
 │   FAIL-CLOSED SANDBOX & TAINT ENGINE   │  │    TIER-0 PROACTIVITY DAEMON      │
 │  • Linux bwrap (--unshare-net optional)│  │  • 0-Token Shell/SQL Sentinels    │
 │  • macOS Seatbelt (Landlock probe only) │  │  • 5-Field Cron + Webhooks (HMAC) │
-│  • Ephemeral Docker Desktop (noVNC)    │  │  • fsnotify + 30s Coalescer       │
+│  • Ephemeral Docker Desktop (noVNC)    │  │  • fsnotify + Debounce Coalescer  │
 │  • Secretless HTTP/SSH/FS Brokers      │  │  • Embedded in `soma web` & CLI   │
 │  • Data/Action Provenance Taint        │  │  • 4 Hard Circuit Brakes & TTL GC │
 └────────────────────────────────────────┘  └───────────────────────────────────┘
@@ -149,7 +151,7 @@ Run `soma <command> --help` for flags and examples, or see [Quickstart](#quickst
   --subgoal "backend:Implement compute_timeout() in backend.py and publish finding" \
   --subgoal "tests:Write test_app.py verifying backend.py contract from Blackboard"
 
-# Export oracle-verified SFT and contrastive DPO/GRPO trajectories
+# Export oracle-verified SFT and contrastive DPO trajectories
 ./bin/soma export-trajectories --dir /tmp/demo --format sft --verified-only --out sft.jsonl
 ./bin/soma export-trajectories --dir /tmp/demo --format dpo --verified-only --out dpo.jsonl
 ```

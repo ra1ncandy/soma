@@ -12,6 +12,8 @@
    - Every observation from an untrusted source (`web_search`, `web_extract`, MCP tools, untrusted broker reads) must be persisted as an `@page` tagged `untrusted_external` — even when small enough to display inline.
    - Once a run observes any `untrusted_external` page, every subsequent `external_write` in that run (in both `dag.Executor` and `broker.Router`) must union all run-wide untrusted pages into its provenance check, regardless of whether the model explicitly cites them.
    - Unknown/unrecognized tools (MCP tools, custom brokers) must default to `external_write`, never `read_only`.
+   - Outbound reads (`web_search`, `web_extract`, `vision_analyze`, read-looking MCP tools) are `external_read`, never `read_only`: their arguments are an egress channel and are bounded by `taint.LowBandwidthEgress` once the run is tainted. MCP annotations may only tighten a classification (`destructiveHint: true` → `irreversible_write`).
+   - Any action class other than `read_only`, `workspace_write` or `external_read` that was `dispatched` when the process died must become `ambiguous` and suspend for reconcile.
    - `irreversible_write` actions must always require approval. Tainted `external_write` actions must block (`DecisionAsk` / `ErrApprovalRequired`) until deterministically declassified via `taint.DeclassifyStructured` or explicitly approved in the Operator Inbox.
 
 3. **Secretless Brokers & Outbound SSRF Guard**

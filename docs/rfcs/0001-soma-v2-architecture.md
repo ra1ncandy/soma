@@ -14,6 +14,8 @@
 ## 1. Executive Summary, Core Thesis & Positioning
 
 ### 1.1 The Broken Assumption Behind Current Agent Harnesses
+
+> **Evidence note (Nov 2026).** The Hermes figures in this RFC (rate-limit deaths, orphan reaps, compactions, Curator edits) come from one operator's private 9-day fleet telemetry. The raw logs are not in this repository and the numbers are not reproducible from it, so they are motivation, not measurements. The B1–B6 suites are scripted conformance tests of soma's own mechanisms and do not run Hermes. The competitive table in §1.3 describes Hermes as of the RFC draft; Hermes has since added several of the listed capabilities (for example opt-in checkpoints, container backends and secret stripping). Measured head-to-head results will be published only from `internal/arena`-style runs that execute both agents.
 Mainstream AI coding and personal agent harnesses—**OpenClaw**, **Hermes**, **Claude Code**, and **Codex CLI**—all share the same 2024 architectural root: **an agent is a mutable linear chat transcript that directly executes side effects.**
 
 That single abstraction creates the systemic failures observed across production autonomous runs:
