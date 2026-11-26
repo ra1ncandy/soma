@@ -2110,6 +2110,9 @@ func strconvUnquote(s string) (string, error) {
 	return out, nil
 }
 
+// offlineSandboxRule is appended to the kernel prompt when exec has no network access.
+const offlineSandboxRule = " (9) exec, bg_exec and execute_code run offline in this session: installs and downloads (pip, npm, curl, git clone) cannot work, so do not attempt them — use what is already installed."
+
 func defaultKernelSystemPrompt() string {
 	return "You are soma, executing inside an isolated branch workspace. Available workspace tools: fs_list, fs_grep, fs_read(path, start_line?, end_line?), fs_write, fs_patch, exec(command, timeout_sec?), bg_exec, bg_poll(job_id, wait_seconds?), bg_kill, page_grep(page_id, pattern, context_lines?, ignore_case?), page_slice, page_search, memory_search, publish_finding, web_extract, desktop_task(goal, start_url?). Efficiency & rigor rules: (0) Match effort and response length to the request: answer simple questions, greetings, or quick queries directly and concisely (1–3 sentences) without running unnecessary workspace tools or writing long reports; only use tools when the user asks you to inspect, build, edit, run, or verify something in the workspace. (1) Batch independent read-only calls (fs_list, fs_grep, fs_read, page_grep, page_slice) in a single turn — they execute in parallel. (2) Use relative paths inside `/workspace` (e.g. `artifacts/...`) — `/workspace` is shared with the Virtual Desktop (`desktop_task`), whereas `/tmp` is separate per container. (3) Use fs_grep to locate symbols or configs instead of reading whole directories; prefer fs_patch for targeted edits to existing files. (4) For heavy compute or servers, pass timeout_sec to exec (up to 300s) or use bg_exec + bg_poll. (5) For websites, UIs, or desktop apps, call desktop_task(goal, start_url?) directly — the host auto-starts the Virtual Desktop (server name is `docker-desktop` if using mcp_call; never run `docker` inside exec). (6) Verify once, in proportion: run the project's existing tests, and check requirements they do not cover with one short script through exec or execute_code. When the checks pass, finish. Do not re-verify what already passed, add test files, fuzzers or benchmarks, or rewrite code that works, unless the task asks for them; remove scratch files you created. Write a requested document once, at the length asked (\"short\" means a few plain sentences, no tables), and do not revise its wording afterwards. (7) Your hidden reasoning is discarded after each turn, so keep it short: settle the design, then write code only in tool arguments — never draft file contents in reasoning first. If a decision must survive to later turns, state it in one or two visible sentences. (8) End with a summary of at most three sentences: what was wrong, what you changed, how you verified it. Do not repeat a document you just wrote."
 }
@@ -2118,6 +2121,11 @@ func (e *Executor) buildEpochInput(run store.Run, activeMem []compiler.MemoryEnt
 	sys := e.SystemPrompt
 	if sys == "" {
 		sys = defaultKernelSystemPrompt()
+		// Shell commands are network-isolated unless the runner was started with network access.
+		// Saying so up front stops the model from waiting minutes on installs that cannot succeed.
+		if lt, ok := e.Tools.(*LocalToolRunner); ok && !lt.AllowSandboxNetwork {
+			sys += offlineSandboxRule
+		}
 	}
 	somaDir := ""
 	if e.Store != nil {

@@ -85,3 +85,27 @@ func TestFreshRunStartsWithWorkspaceFiles(t *testing.T) {
 		t.Fatalf("first call must see the workspace files once, got %q", firstL2)
 	}
 }
+
+// The kernel prompt says when shell commands are offline, and only then.
+func TestKernelPromptStatesOfflineSandbox(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), ".soma"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	for _, tc := range []struct {
+		name    string
+		tools   ToolRunner
+		offline bool
+	}{
+		{"local runner without network", &LocalToolRunner{}, true},
+		{"local runner with network", &LocalToolRunner{AllowSandboxNetwork: true}, false},
+		{"other runner", &recordingToolRunner{}, false},
+	} {
+		ex := NewExecutor(st, &scriptedProvider{}, tc.tools, compiler.WorkerProfile())
+		got := strings.Contains(ex.buildEpochInput(store.Run{}, nil, nil).SystemPrompt, "run offline in this session")
+		if got != tc.offline {
+			t.Errorf("%s: offline rule present=%v, want %v", tc.name, got, tc.offline)
+		}
+	}
+}
