@@ -847,6 +847,7 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 			ResearchStatus:      fmt.Sprintf("workspace=%s (%s)", filepath.Base(branch.WorkspaceDir), branch.WorkspaceStrategy),
 			LastOracleError:     lastOracleError,
 			StepBudgetRemaining: maxTurns - turn,
+			StepBudgetTotal:     maxTurns,
 			AccountQuotaSummary: fmt.Sprintf("%s:%s", acc.ID, acc.ModelID),
 			StallCount:          branch.StallCount,
 			MaxStalls:           e.Profile.MaxStalls,

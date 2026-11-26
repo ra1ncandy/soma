@@ -59,7 +59,24 @@ func attachSessionMCP(ctx context.Context, wsDir string, enableBrowser, enableDe
 	return mgr, nil
 }
 
+// shouldApplyAsk decides whether `soma ask` applies the isolated branch workspace to the project.
+// "on-stop" (default) applies whatever the agent produced whenever the run ends without a pending
+// human decision — a budget-exhausted, stalled or failed run must not silently discard all of its
+// work. Runs suspended for an approval or a crash reconciliation are never applied: an action is
+// still waiting on the operator. "completed" applies only finished runs; "never" never applies.
+func shouldApplyAsk(mode string, status dag.BranchStatus) bool {
+	switch mode {
+	case "never":
+		return false
+	case "completed":
+		return status == dag.StatusCompleted
+	default:
+		return status != dag.StatusSuspendedApproval && status != dag.StatusSuspendedReconcile
+	}
+}
+
 func newAskCmd() *cobra.Command {
+	var applyMode string
 	var wsDir, profileName, guiModel string
 	var useMock, enableBrowser, enableDesktop bool
 	var maxTurns int
@@ -112,16 +129,26 @@ func newAskCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			res, err := execDag.ExecuteBranch(cmd.Context(), brID, maxTurns)
-			if err != nil {
-				return err
+			res, runErr := execDag.ExecuteBranch(cmd.Context(), brID, maxTurns)
+			status := dag.StatusFailed
+			if res != nil {
+				status = res.Status
 			}
-			if res.Status == dag.StatusCompleted {
-				if br, bErr := st.GetBranch(cmd.Context(), brID); bErr == nil && br.WorkspaceDir != "" && br.WorkspaceDir != absWS {
-					if _, applyErr := execDag.Workspace.ApplyBranchWorkspace(cmd.Context(), absWS, br.WorkspaceDir); applyErr != nil {
+			if shouldApplyAsk(applyMode, status) {
+				if br, bErr := st.GetBranch(context.WithoutCancel(cmd.Context()), brID); bErr == nil && br.WorkspaceDir != "" && br.WorkspaceDir != absWS {
+					rep, applyErr := execDag.Workspace.ApplyBranchWorkspace(context.WithoutCancel(cmd.Context()), absWS, br.WorkspaceDir)
+					switch {
+					case applyErr != nil:
 						fmt.Fprintf(os.Stderr, "warning: changes were NOT applied to %s: %v\n  branch workspace kept at %s\n", absWS, applyErr, br.WorkspaceDir)
+					case status != dag.StatusCompleted && len(rep.AddedFiles)+len(rep.ModifiedFiles)+len(rep.DeletedFiles) > 0:
+						fmt.Fprintf(os.Stderr, "note: the run stopped with status %s; its partial changes were applied to %s (rewind with: soma rewind <step_id>)\n", status, absWS)
 					}
 				}
+			} else if res != nil && status != dag.StatusCompleted {
+				fmt.Fprintf(os.Stderr, "note: the run stopped with status %s; changes were left in the branch workspace (soma web → Review Diff, or rerun with --apply on-stop)\n", status)
+			}
+			if runErr != nil {
+				return runErr
 			}
 			if res.FinalSummary != "" {
 				fmt.Println(res.FinalSummary)
@@ -138,6 +165,7 @@ func newAskCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&enableBrowser, "browser", false, "Attach @playwright/mcp browser automation")
 	cmd.Flags().BoolVar(&enableDesktop, "desktop", false, "Attach isolated Docker desktop (Xvfb + XFCE + noVNC + AT-SPI2)")
 	cmd.Flags().IntVar(&maxTurns, "max-turns", 40, "Maximum turns")
+	cmd.Flags().StringVar(&applyMode, "apply", "on-stop", "Apply the branch workspace to the project: on-stop (whenever the run ends without a pending approval), completed, never")
 	return cmd
 }
 

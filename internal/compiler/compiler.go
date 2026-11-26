@@ -125,13 +125,29 @@ type ViewportFrame struct {
 	DataURI  string `json:"-"`
 }
 
+// BudgetLow reports that the run is in its last quarter of turns (at least the last 3), when the
+// model must stop exploring and polishing and make sure the deliverable is complete. It is only
+// known for steps that recorded the total budget.
+func (t LiveTailState) BudgetLow() bool {
+	if t.StepBudgetTotal <= 0 || t.StepBudgetRemaining <= 0 {
+		return false
+	}
+	threshold := t.StepBudgetTotal / 4
+	if threshold < 3 {
+		threshold = 3
+	}
+	return t.StepBudgetRemaining <= threshold
+}
+
 // LiveTailState represents uncached Layer 3 telemetry rebuilt every turn.
 type LiveTailState struct {
-	WorkspaceKind       string         `json:"workspace_kind"`
-	GitDiffStat         string         `json:"git_diff_stat,omitempty"`
-	ResearchStatus      string         `json:"research_status,omitempty"`
-	LastOracleError     string         `json:"last_oracle_error,omitempty"`
-	StepBudgetRemaining int            `json:"step_budget_remaining"`
+	WorkspaceKind       string `json:"workspace_kind"`
+	GitDiffStat         string `json:"git_diff_stat,omitempty"`
+	ResearchStatus      string `json:"research_status,omitempty"`
+	LastOracleError     string `json:"last_oracle_error,omitempty"`
+	StepBudgetRemaining int    `json:"step_budget_remaining"`
+	// StepBudgetTotal is the turn budget of this run of the branch (0 = unknown, older steps).
+	StepBudgetTotal     int            `json:"step_budget_total,omitempty"`
 	AccountQuotaSummary string         `json:"account_quota_summary,omitempty"`
 	StallCount          int            `json:"stall_count"`
 	MaxStalls           int            `json:"max_stalls"`
@@ -385,6 +401,11 @@ func Compile(snap EpochSnapshot, l2 []LogEntry, tail LiveTailState, profile Mode
 	}
 	fmt.Fprintf(&l3Buf, "budget_remaining: %d | stalls: %d/%d | quota: %s\n",
 		tail.StepBudgetRemaining, tail.StallCount, tail.MaxStalls, tail.AccountQuotaSummary)
+	if tail.BudgetLow() {
+		fmt.Fprintf(&l3Buf, "TURN BUDGET LOW: %d of %d turns left. Stop exploring, adding tests or polishing. "+
+			"Make sure the requested change is complete and saved, verify it once, then finish with your summary.\n",
+			tail.StepBudgetRemaining, tail.StepBudgetTotal)
+	}
 
 	l0 := snap.Layer0Text
 	l1 := snap.Layer1Text
