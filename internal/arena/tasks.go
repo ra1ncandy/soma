@@ -12,7 +12,9 @@ import (
 // held out: they are never written into the workspace the agent sees, and both contestants get
 // exactly the same Goal text and call budget.
 type Task struct {
-	ID       string
+	ID string
+	// Tier groups tasks: "starter" (empty means starter) or "hard".
+	Tier     string
 	Goal     string
 	MaxCalls int
 	Files    map[string]string
@@ -201,9 +203,27 @@ print("PASS")
 	},
 }
 
+// TasksForTier returns the tasks of a tier ("starter", "hard" or "all").
+func TasksForTier(tier string) []Task {
+	var out []Task
+	for _, t := range AllTasks() {
+		tt := t.Tier
+		if tt == "" {
+			tt = "starter"
+		}
+		if tier == "all" || tier == tt {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// AllTasks is every registered task, starter tier first.
+func AllTasks() []Task { return append(append([]Task(nil), Tasks...), HardTasks...) }
+
 // TaskByID looks a task up.
 func TaskByID(id string) (Task, bool) {
-	for _, t := range Tasks {
+	for _, t := range AllTasks() {
 		if t.ID == id {
 			return t, true
 		}
