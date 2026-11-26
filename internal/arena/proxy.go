@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Usage is what the proxy measured for one contestant run.
@@ -46,6 +47,7 @@ type Proxy struct {
 	session  string
 	maxCalls int
 	usage    map[string]*Usage
+	calls    map[string][]CallRecord
 	totalUSD float64
 
 	ln  net.Listener
@@ -63,7 +65,7 @@ func NewProxy(upstreamBase, apiKey string, price Price, spendCapUSD float64) (*P
 	if err != nil {
 		return nil, err
 	}
-	p := &Proxy{upstream: u, apiKey: apiKey, price: price, capUSD: spendCapUSD, ln: ln, usage: map[string]*Usage{}}
+	p := &Proxy{upstream: u, apiKey: apiKey, price: price, capUSD: spendCapUSD, ln: ln, usage: map[string]*Usage{}, calls: map[string][]CallRecord{}}
 	p.srv = &http.Server{Handler: p}
 	go func() { _ = p.srv.Serve(ln) }()
 	return p, nil
@@ -94,6 +96,13 @@ func (p *Proxy) End(session string) Usage {
 	return Usage{}
 }
 
+// Calls returns the per-call records of a session, in completion order.
+func (p *Proxy) Calls(session string) []CallRecord {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]CallRecord(nil), p.calls[session]...)
+}
+
 // SpentUSD is the total measured spend so far.
 func (p *Proxy) SpentUSD() float64 {
 	p.mu.Lock()
@@ -119,7 +128,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if refuse == "" && isModelCall(r) {
 		u.Calls++
 	}
-	sessionHeader := upstreamSessionID(p.session)
+	session := p.session
+	sessionHeader := upstreamSessionID(session)
 	p.mu.Unlock()
 	if refuse != "" {
 		// 400, not 429: agents must stop, not wait and retry.
@@ -128,6 +138,21 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]string{"message": refuse, "type": "arena_budget"}})
 		return
 	}
+
+	var rec *CallRecord
+	if isModelCall(r) && r.Body != nil {
+		// Buffer the request so it can be summarised for diagnosis; it is forwarded unchanged.
+		body, err := io.ReadAll(io.LimitReader(r.Body, 64<<20))
+		_ = r.Body.Close()
+		if err != nil {
+			http.Error(w, "arena: cannot read request body", http.StatusBadRequest)
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		r.ContentLength = int64(len(body))
+		rec = summarizeRequest(body)
+	}
+	started := time.Now()
 
 	rp := &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
@@ -151,7 +176,23 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// Only model calls are metered; metadata probes (model lists, capability lookups)
 			// pass through uncounted.
 			if isModelCall(r) {
-				resp.Body = &meteringBody{rc: resp.Body, onUsage: p.record, sse: strings.Contains(resp.Header.Get("Content-Type"), "event-stream")}
+				status := resp.StatusCode
+				resp.Body = &meteringBody{rc: resp.Body, sse: strings.Contains(resp.Header.Get("Content-Type"), "event-stream"),
+					onDone: func(body []byte, sse bool) {
+						in, cached, out := extractUsage(body, sse)
+						p.record(in, cached, out)
+						if rec == nil {
+							return
+						}
+						rec.Status = status
+						rec.LatencyMS = time.Since(started).Milliseconds()
+						rec.InputTokens, rec.CachedTokens, rec.OutputTokens = in, cached, out
+						summarizeResponse(rec, body, sse)
+						p.mu.Lock()
+						rec.Seq = len(p.calls[session]) + 1
+						p.calls[session] = append(p.calls[session], *rec)
+						p.mu.Unlock()
+					}}
 			}
 			return nil
 		},
@@ -188,11 +229,11 @@ func (p *Proxy) record(in, cached, out int) {
 // meteringBody passes the response through unchanged and extracts token usage from it (a JSON
 // body, or the usage chunk of an SSE stream) when it is closed.
 type meteringBody struct {
-	rc      io.ReadCloser
-	buf     bytes.Buffer
-	sse     bool
-	onUsage func(in, cached, out int)
-	done    bool
+	rc     io.ReadCloser
+	buf    bytes.Buffer
+	sse    bool
+	onDone func(body []byte, sse bool)
+	done   bool
 }
 
 func (m *meteringBody) Read(b []byte) (int, error) {
@@ -206,8 +247,7 @@ func (m *meteringBody) Read(b []byte) (int, error) {
 func (m *meteringBody) Close() error {
 	if !m.done {
 		m.done = true
-		in, cached, out := extractUsage(m.buf.Bytes(), m.sse)
-		m.onUsage(in, cached, out)
+		m.onDone(m.buf.Bytes(), m.sse)
 	}
 	return m.rc.Close()
 }
