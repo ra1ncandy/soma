@@ -35,7 +35,61 @@ func newMCPCmd() *cobra.Command {
 		newMCPTestCmd(),
 		newMCPAuthCmd(),
 		newMCPServeCmd(),
+		newMCPTrustCmd(),
 	)
+	return cmd
+}
+
+func newMCPTrustCmd() *cobra.Command {
+	var dir string
+	var all bool
+	cmd := &cobra.Command{
+		Use:   "trust [name...]",
+		Short: "Allow stdio MCP servers from this project's .soma/mcp.yaml to run (lists untrusted ones without arguments)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			abs, err := filepath.Abs(dir)
+			if err != nil {
+				return err
+			}
+			out := cmd.OutOrStdout()
+			pending := mcp.UntrustedWorkspaceServers(abs)
+			if len(args) == 0 && !all {
+				if len(pending) == 0 {
+					fmt.Fprintln(out, "All stdio MCP servers in this project are trusted.")
+					return nil
+				}
+				fmt.Fprintln(out, "Not launched until trusted (review each command first):")
+				for _, ep := range pending {
+					fmt.Fprintf(out, "  %s: %s %s\n", ep.Name, ep.Command, strings.Join(ep.Args, " "))
+				}
+				fmt.Fprintln(out, "Run: soma mcp trust <name> (or --all)")
+				return nil
+			}
+			want := map[string]bool{}
+			for _, a := range args {
+				want[a] = true
+			}
+			var picked []mcp.ServerEndpoint
+			for _, ep := range pending {
+				if all || want[ep.Name] {
+					picked = append(picked, ep)
+					delete(want, ep.Name)
+				}
+			}
+			for name := range want {
+				return fmt.Errorf("no untrusted stdio server named %q in %s", name, mcp.WorkspaceConfigPath(abs))
+			}
+			if err := mcp.TrustWorkspaceServers(abs, picked...); err != nil {
+				return err
+			}
+			for _, ep := range picked {
+				fmt.Fprintf(out, "trusted %s (%s %s)\n", ep.Name, ep.Command, strings.Join(ep.Args, " "))
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&dir, "dir", ".", "Project directory")
+	cmd.Flags().BoolVar(&all, "all", false, "Trust every untrusted stdio server in this project")
 	return cmd
 }
 

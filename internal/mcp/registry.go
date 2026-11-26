@@ -78,7 +78,20 @@ func WriteConfigFile(path string, cfg ConfigFile) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, raw, 0o600)
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		return err
+	}
+	// soma writing a workspace config is an operator action (soma mcp add, the dashboard), so
+	// the stdio entries it writes are trusted; a config that arrived with a repository is not.
+	if ws, ok := workspaceOfConfig(path); ok {
+		eps := make([]ServerEndpoint, 0, len(cfg.MCPServers))
+		for name, ep := range cfg.MCPServers {
+			ep.Name = name
+			eps = append(eps, ep)
+		}
+		_ = TrustWorkspaceServers(ws, eps...)
+	}
+	return nil
 }
 
 // LoadServerEndpoints loads global (~/.soma/mcp.yaml) and workspace (<wsDir>/.soma/mcp.yaml)
@@ -99,6 +112,10 @@ func LoadServerEndpoints(wsDir string) ([]ServerEndpoint, error) {
 		}
 		for k, ep := range wCfg.MCPServers {
 			ep.Name = k
+			if !IsWorkspaceServerTrusted(wsDir, ep) {
+				// Not launched until the operator runs `soma mcp trust` (see trust.go).
+				continue
+			}
 			merged[k] = ep
 		}
 	}

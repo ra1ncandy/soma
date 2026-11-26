@@ -139,9 +139,20 @@ func BuildBwrapArgs(spec ExecSpec) ([]string, error) {
 		args = append(args, "--ro-bind", hostPath, filepath.ToSlash(filepath.Join("/workspace", cleanRel)))
 	}
 
-	if !spec.AllowNetwork {
+	proxied := spec.AllowNetwork && spec.EgressSocket != "" && ForwarderBinary != ""
+	if !spec.AllowNetwork || proxied {
 		args = append(args, "--unshare-net")
-	} else {
+	}
+	if proxied {
+		args = append(args,
+			"--bind", filepath.Dir(spec.EgressSocket), egressSandboxDir,
+			"--ro-bind", ForwarderBinary, forwarderPath,
+			"--ro-bind-try", "/etc/ssl", "/etc/ssl",
+			"--ro-bind-try", "/etc/ca-certificates", "/etc/ca-certificates",
+			"--ro-bind-try", "/etc/pki", "/etc/pki",
+			"--ro-bind-try", "/etc/nsswitch.conf", "/etc/nsswitch.conf",
+		)
+	} else if spec.AllowNetwork {
 		args = append(args,
 			"--ro-bind-try", "/etc/resolv.conf", "/etc/resolv.conf",
 			"--ro-bind-try", "/etc/ssl", "/etc/ssl",
@@ -159,14 +170,30 @@ func BuildBwrapArgs(spec ExecSpec) ([]string, error) {
 		args = append(args, "--bind", hostDir, rpcSandboxDir)
 		rpcPath = rpcSandboxDir + "/" + filepath.Base(spec.RPCSocket)
 	}
-	for _, kv := range ScrubEnv(envWithRPC(spec, rpcPath)) {
+	env := envWithRPC(spec, rpcPath)
+	if proxied {
+		merged := make(map[string]string, len(env)+8)
+		for k, v := range env {
+			merged[k] = v
+		}
+		for k, v := range proxyEnv() {
+			merged[k] = v
+		}
+		env = merged
+	}
+	for _, kv := range ScrubEnv(env) {
 		k, v, ok := strings.Cut(kv, "=")
 		if ok {
 			args = append(args, "--setenv", k, v)
 		}
 	}
 
-	args = append(args, "--", spec.Command)
+	if proxied {
+		args = append(args, "--", forwarderPath, ForwarderCommand, sandboxProxyAddr,
+			egressSandboxDir+"/"+filepath.Base(spec.EgressSocket), "--", spec.Command)
+	} else {
+		args = append(args, "--", spec.Command)
+	}
 	args = append(args, spec.Args...)
 	return args, nil
 }

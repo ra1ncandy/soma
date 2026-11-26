@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
 	"sort"
 	"strings"
@@ -64,13 +63,9 @@ func (m *Manager) Connect(ctx context.Context, ep ServerEndpoint) error {
 			return fmt.Errorf("mcp manager: stdio server %q requires command", ep.Name)
 		}
 		cmd := exec.Command(ep.Command, ep.Args...)
-		if resolvedEnv := ResolveEnv(ep.Env); len(resolvedEnv) > 0 {
-			env := os.Environ()
-			for k, v := range resolvedEnv {
-				env = append(env, k+"="+v)
-			}
-			cmd.Env = env
-		}
+		// Never hand a server the host's full environment (provider keys, cloud tokens): only
+		// basic variables plus what the entry declares.
+		cmd.Env = minimalServerEnv(ResolveEnv(ep.Env))
 		client := sdkmcp.NewClient(&sdkmcp.Implementation{
 			Name:    "soma",
 			Version: "0.5.0",

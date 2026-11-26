@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -30,6 +31,9 @@ type ExecSpec struct {
 	// execute_code). Its in-sandbox path is passed as $SOMA_RPC_SOCKET. Nothing else on the
 	// host becomes reachable, even without network access.
 	RPCSocket string
+	// EgressSocket, when set with AllowNetwork, gives the sandbox internet access only through
+	// the host EgressProxy at this unix socket; the sandbox keeps its own network namespace.
+	EgressSocket string
 }
 
 // rpcSandboxDir is where bwrap mounts the directory holding RPCSocket.
@@ -70,6 +74,28 @@ type Backend interface {
 type Manager struct {
 	FailIfUnavailable bool
 	Backends          []Backend
+
+	egressMu sync.Mutex
+	egress   *EgressProxy
+}
+
+// withEgress routes a networked spec through the shared host egress proxy (see egress.go), so
+// the sandbox keeps its own network namespace and cannot reach host or LAN services.
+func (m *Manager) withEgress(spec ExecSpec) ExecSpec {
+	if !spec.AllowNetwork || spec.EgressSocket != "" || ForwarderBinary == "" {
+		return spec
+	}
+	m.egressMu.Lock()
+	defer m.egressMu.Unlock()
+	if m.egress == nil {
+		p, err := NewEgressProxy()
+		if err != nil {
+			return spec
+		}
+		m.egress = p
+	}
+	spec.EgressSocket = m.egress.SocketPath()
+	return spec
 }
 
 // NewManager builds a fail-closed sandbox Manager probing host backends in priority order.
@@ -118,6 +144,7 @@ func (m *Manager) Exec(ctx context.Context, spec ExecSpec) (ExecResult, error) {
 	if spec.Command == "" {
 		return ExecResult{}, errors.New("sandbox: command is required")
 	}
+	spec = m.withEgress(spec)
 	for _, b := range m.Backends {
 		if b == nil || !b.Available() {
 			continue
@@ -146,6 +173,7 @@ func (m *Manager) Command(ctx context.Context, spec ExecSpec) (*exec.Cmd, string
 	if spec.Command == "" {
 		return nil, "", errors.New("sandbox: command is required")
 	}
+	spec = m.withEgress(spec)
 	for _, b := range m.Backends {
 		if b == nil || !b.Available() {
 			continue
