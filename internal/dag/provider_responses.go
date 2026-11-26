@@ -210,7 +210,7 @@ func (p *ResponsesProvider) Generate(ctx context.Context, req GenerateRequest) (
 		}
 	}
 	if len(calls) == 0 && strings.TrimSpace(text.String()) == "" && parsed.IncompleteDetails != nil {
-		return nil, fmt.Errorf("responses: incomplete response (%s) before emitting content or tool calls", parsed.IncompleteDetails.Reason)
+		return nil, &OutputTruncatedError{MaxTokens: p.MaxOutputTokens, Reason: parsed.IncompleteDetails.Reason}
 	}
 	if onDelta := deltaSink(ctx, nil); onDelta != nil && text.Len() > 0 {
 		onDelta(text.String())

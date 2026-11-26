@@ -3,8 +3,35 @@ package dag
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 )
+
+// configuredTemperature reads SOMA_TEMPERATURE; unset means "use the provider's default".
+func configuredTemperature() (float64, bool) {
+	s := strings.TrimSpace(os.Getenv("SOMA_TEMPERATURE"))
+	if s == "" {
+		return 0, false
+	}
+	t, err := strconv.ParseFloat(s, 64)
+	if err != nil || t < 0 || t > 2 {
+		return 0, false
+	}
+	return t, true
+}
+
+// OutputTruncatedError means the model spent its whole output budget (often on hidden reasoning)
+// without emitting any text or tool call. The executor treats it as a wasted turn and tells the
+// model, instead of failing the run.
+type OutputTruncatedError struct {
+	MaxTokens int
+	Reason    string
+}
+
+func (e *OutputTruncatedError) Error() string {
+	return fmt.Sprintf("model output truncated at max_tokens=%d before emitting content or tool calls %s", e.MaxTokens, e.Reason)
+}
 
 // wireToolCall is a tool call as decoded from any provider protocol.
 type wireToolCall struct {

@@ -746,13 +746,17 @@ func (p *OpenAICompatProvider) Generate(ctx context.Context, req GenerateRequest
 		markCacheBreakpoints(msgs)
 	}
 	payload := map[string]any{
-		"model":       req.ModelID,
-		"messages":    msgs,
-		"temperature": 0.0,
-		"max_tokens":  maxToks,
+		"model":      req.ModelID,
+		"messages":   msgs,
+		"max_tokens": maxToks,
 	}
 	if effort := strings.TrimSpace(p.ReasoningEffort); effort != "" {
 		payload["reasoning_effort"] = effort
+	}
+	// Temperature is left to the provider unless configured: forcing 0 (greedy decoding) makes
+	// reasoning models fall into deterministic repetition loops that burn the whole output budget.
+	if t, ok := configuredTemperature(); ok {
+		payload["temperature"] = t
 	}
 	if p.EnableTools {
 		payload["tools"] = openAITools()
@@ -961,7 +965,7 @@ func (p *OpenAICompatProvider) Generate(ctx context.Context, req GenerateRequest
 	msg := parsed.Choices[0].Message
 	content := strings.TrimSpace(msg.Content)
 	if len(msg.ToolCalls) == 0 && content == "" && parsed.Choices[0].FinishReason == "length" {
-		return nil, fmt.Errorf("openai-compat provider: response truncated (finish_reason=length at max_tokens=%d) before emitting content or tool_calls", maxToks)
+		return nil, &OutputTruncatedError{MaxTokens: maxToks}
 	}
 	calls := make([]wireToolCall, 0, len(msg.ToolCalls))
 	for _, rawTC := range msg.ToolCalls {

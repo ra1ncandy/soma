@@ -169,13 +169,15 @@ func (p *AnthropicProvider) Generate(ctx context.Context, req GenerateRequest) (
 		maxToks = 16384
 	}
 	payload := map[string]any{
-		"model":       req.ModelID,
-		"max_tokens":  maxToks,
-		"system":      system,
-		"messages":    msgs,
-		"tools":       anthropicTools(),
-		"temperature": 0.0,
-		"stream":      true,
+		"model":      req.ModelID,
+		"max_tokens": maxToks,
+		"system":     system,
+		"messages":   msgs,
+		"tools":      anthropicTools(),
+		"stream":     true,
+	}
+	if t, ok := configuredTemperature(); ok {
+		payload["temperature"] = t
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -376,7 +378,7 @@ func (p *AnthropicProvider) readStream(ctx context.Context, r io.Reader, req Gen
 		}
 	}
 	if len(calls) == 0 && strings.TrimSpace(text.String()) == "" && stopReason == "max_tokens" {
-		return nil, fmt.Errorf("anthropic: response truncated at max_tokens before emitting content or tool calls")
+		return nil, &OutputTruncatedError{MaxTokens: p.MaxTokens}
 	}
 	return finishGenerateResponse(gen, req, text.String(), "", calls), nil
 }

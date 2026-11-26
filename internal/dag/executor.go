@@ -778,6 +778,7 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 	lastStateHash := ""
 	prevStateHash := ""
 	lastOracleError := ""
+	consecutiveTruncations := 0
 	var currentViewport *compiler.ViewportFrame
 	if branch.HeadStepID != "" {
 		if hs, err := e.Store.GetStep(ctx, branch.HeadStepID); err == nil {
@@ -912,6 +913,24 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 			TurnIndex: nextTurn,
 			Frame:     frame,
 		})
+		var truncated *OutputTruncatedError
+		if errors.As(genErr, &truncated) && consecutiveTruncations < 2 {
+			// The model used its entire output budget without producing anything. Count the turn,
+			// tell the model what happened (appended to Layer 2, cache-safe), and try again.
+			consecutiveTruncations++
+			_ = e.releaseLease(ctx, acc.ID, 0)
+			notice := compiler.LogEntry{
+				Kind:      "rule_notice",
+				TurnIndex: nextTurn,
+				Observation: fmt.Sprintf("[soma] Your previous response hit the %d-token output limit before producing any text or tool call, so it was discarded. "+
+					"Respond now with a single concrete tool call. Keep reasoning brief, and write large files in parts (fs_write a skeleton, then fs_patch or further writes) instead of one huge call.", truncated.MaxTokens),
+			}
+			l2 = append(l2, notice)
+			pendingDeltaAppends = append(pendingDeltaAppends, notice)
+			res.TurnsExecuted++
+			continue
+		}
+		consecutiveTruncations = 0
 		if genErr != nil {
 			var rlErr *RateLimitError
 			var outage *TransientError
