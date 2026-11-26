@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -22,6 +23,8 @@ type ResponsesProvider struct {
 	ReasoningEffort string
 	// ExtraHeaders are sent on every request (e.g. account routing headers of a subscription backend).
 	ExtraHeaders map[string]string
+
+	effortUnsupported atomic.Bool // the endpoint rejected reasoning.effort once; stop sending it
 }
 
 // NewResponsesProvider creates a Responses API client.
@@ -101,7 +104,7 @@ func (p *ResponsesProvider) Generate(ctx context.Context, req GenerateRequest) (
 	if p.MaxOutputTokens > 0 {
 		payload["max_output_tokens"] = p.MaxOutputTokens
 	}
-	if e := strings.TrimSpace(p.ReasoningEffort); e != "" {
+	if e := effectiveReasoningEffort(p.ReasoningEffort); e != "" && !p.effortUnsupported.Load() {
 		payload["reasoning"] = map[string]any{"effort": e}
 	}
 	body, err := json.Marshal(payload)
@@ -140,6 +143,16 @@ func (p *ResponsesProvider) Generate(ctx context.Context, req GenerateRequest) (
 		_ = resp.Body.Close()
 		if resp.StatusCode == http.StatusOK {
 			break
+		}
+		if _, sent := payload["reasoning"]; sent && rejectsReasoningEffort(resp.StatusCode, raw) {
+			// Models without a reasoning-effort setting get one retry without it.
+			p.effortUnsupported.Store(true)
+			delete(payload, "reasoning")
+			if body, err = json.Marshal(payload); err != nil {
+				return nil, err
+			}
+			attempt--
+			continue
 		}
 		switch {
 		case resp.StatusCode == http.StatusTooManyRequests:

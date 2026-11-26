@@ -113,6 +113,7 @@ type OpenAICompatProvider struct {
 	StreamIdleTimeout time.Duration
 
 	streamUnsupported atomic.Bool
+	effortUnsupported atomic.Bool // the endpoint rejected reasoning_effort once; stop sending it
 }
 
 // NewOpenAICompatProvider creates a client targeting baseURL (e.g. https://opencode.ai/zen/go/v1).
@@ -750,7 +751,7 @@ func (p *OpenAICompatProvider) Generate(ctx context.Context, req GenerateRequest
 		"messages":   msgs,
 		"max_tokens": maxToks,
 	}
-	if effort := strings.TrimSpace(p.ReasoningEffort); effort != "" {
+	if effort := effectiveReasoningEffort(p.ReasoningEffort); effort != "" && !p.effortUnsupported.Load() {
 		payload["reasoning_effort"] = effort
 	}
 	// Temperature is left to the provider unless configured: forcing 0 (greedy decoding) makes
@@ -884,6 +885,16 @@ func (p *OpenAICompatProvider) Generate(ctx context.Context, req GenerateRequest
 			p.streamUnsupported.Store(true)
 			streaming = false
 			if body, err = marshal(false); err != nil {
+				return nil, err
+			}
+			attempt--
+			continue
+		}
+		// Models or endpoints without a reasoning-effort setting get one retry without it.
+		if _, sent := payload["reasoning_effort"]; sent && rejectsReasoningEffort(statusCode, b) {
+			p.effortUnsupported.Store(true)
+			delete(payload, "reasoning_effort")
+			if body, err = marshal(streaming); err != nil {
 				return nil, err
 			}
 			attempt--
