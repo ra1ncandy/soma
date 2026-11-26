@@ -220,7 +220,16 @@ func grade(ctx context.Context, task Task, dir string) (bool, string) {
 	_ = f.Close()
 	gctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	out, err := exec.CommandContext(gctx, "python3", f.Name(), dir).CombinedOutput()
+	// A private bytecode cache: never trust __pycache__ left in the workspace (stale .pyc files
+	// can survive same-size edits made within the same second).
+	cache, err := os.MkdirTemp("", "arena-pycache-")
+	if err != nil {
+		return false, err.Error()
+	}
+	defer func() { _ = os.RemoveAll(cache) }()
+	cmd := exec.CommandContext(gctx, "python3", f.Name(), dir)
+	cmd.Env = append(os.Environ(), "PYTHONPYCACHEPREFIX="+cache)
+	out, err := cmd.CombinedOutput()
 	text := strings.TrimSpace(string(out))
 	if len(text) > 2000 {
 		text = text[len(text)-2000:]

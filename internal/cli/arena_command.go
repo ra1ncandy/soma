@@ -18,9 +18,9 @@ import (
 func newArenaCmd() *cobra.Command {
 	root := &cobra.Command{Use: "arena", Short: "Measured head-to-head runs of soma against other agent harnesses"}
 	var (
-		taskIDs, contestants, baseURL, model, keyEnv, somaBin, hermesBin, hermesHome, outDir string
-		repeats, wallMinutes                                                                 int
-		capUSD, priceIn, priceCached, priceOut                                               float64
+		taskIDs, tier, contestants, baseURL, model, keyEnv, somaBin, hermesBin, hermesHome, outDir string
+		repeats, wallMinutes                                                                       int
+		capUSD, priceIn, priceCached, priceOut                                                     float64
 	)
 	run := &cobra.Command{
 		Use:   "run",
@@ -38,7 +38,10 @@ func newArenaCmd() *cobra.Command {
 			}
 			var tasks []arena.Task
 			if taskIDs == "" {
-				tasks = arena.Tasks
+				tasks = arena.TasksForTier(tier)
+				if len(tasks) == 0 {
+					return fmt.Errorf("unknown tier %q (starter, hard, all)", tier)
+				}
 			} else {
 				for _, id := range strings.Split(taskIDs, ",") {
 					t, ok := arena.TaskByID(strings.TrimSpace(id))
@@ -124,7 +127,8 @@ func newArenaCmd() *cobra.Command {
 			return runErr
 		},
 	}
-	run.Flags().StringVar(&taskIDs, "tasks", "", "Comma-separated task ids (default: all)")
+	run.Flags().StringVar(&taskIDs, "tasks", "", "Comma-separated task ids (overrides --tier)")
+	run.Flags().StringVar(&tier, "tier", "starter", "Task tier: starter, hard or all")
 	run.Flags().StringVar(&contestants, "contestants", "soma,hermes", "Contestants to run")
 	run.Flags().StringVar(&baseURL, "base-url", "", "Upstream OpenAI-compatible base URL (e.g. https://openrouter.ai/api/v1)")
 	run.Flags().StringVar(&model, "model", "", "Model id both contestants use")
