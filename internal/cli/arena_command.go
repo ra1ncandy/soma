@@ -21,6 +21,7 @@ func newArenaCmd() *cobra.Command {
 		taskIDs, tier, contestants, baseURL, model, keyEnv, somaBin, hermesBin, hermesHome, outDir string
 		repeats, wallMinutes                                                                       int
 		capUSD, priceIn, priceCached, priceOut                                                     float64
+		keep                                                                                       bool
 	)
 	run := &cobra.Command{
 		Use:   "run",
@@ -85,6 +86,7 @@ func newArenaCmd() *cobra.Command {
 				Tasks:       tasks,
 				Repeats:     repeats,
 				Log:         func(s string) { fmt.Fprintln(out, s) },
+				KeepDir:     keepDir(keep, outDir),
 			}
 			results, runErr := runner.Run(cmd.Context())
 			versions := map[string]string{}
@@ -129,6 +131,7 @@ func newArenaCmd() *cobra.Command {
 	}
 	run.Flags().StringVar(&taskIDs, "tasks", "", "Comma-separated task ids (overrides --tier)")
 	run.Flags().StringVar(&tier, "tier", "starter", "Task tier: starter, hard or all")
+	run.Flags().BoolVar(&keep, "keep", false, "Keep every attempt's workspace, agent output and grader output under <out>/attempts")
 	run.Flags().StringVar(&contestants, "contestants", "soma,hermes", "Contestants to run")
 	run.Flags().StringVar(&baseURL, "base-url", "", "Upstream OpenAI-compatible base URL (e.g. https://openrouter.ai/api/v1)")
 	run.Flags().StringVar(&model, "model", "", "Model id both contestants use")
@@ -145,4 +148,11 @@ func newArenaCmd() *cobra.Command {
 	run.Flags().StringVar(&outDir, "out", "arena-results", "Output directory for arena-report.{json,md}")
 	root.AddCommand(run)
 	return root
+}
+
+func keepDir(keep bool, outDir string) string {
+	if !keep {
+		return ""
+	}
+	return filepath.Join(outDir, "attempts")
 }
