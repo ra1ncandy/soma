@@ -22,6 +22,7 @@ func newArenaCmd() *cobra.Command {
 		repeats, wallMinutes                                                                       int
 		capUSD, priceIn, priceCached, priceOut                                                     float64
 		keep                                                                                       bool
+		somaEnv                                                                                    []string
 	)
 	run := &cobra.Command{
 		Use:   "run",
@@ -63,7 +64,13 @@ func newArenaCmd() *cobra.Command {
 			for _, name := range strings.Split(contestants, ",") {
 				switch strings.TrimSpace(name) {
 				case "soma":
-					cs = append(cs, arena.SomaContestant{Bin: somaBin})
+					for _, kv := range somaEnv {
+						k, _, ok := strings.Cut(kv, "=")
+						if u := strings.ToUpper(k); !ok || !strings.HasPrefix(u, "SOMA_") || strings.Contains(u, "KEY") {
+							return fmt.Errorf("--soma-env %q: want SOMA_NAME=value, and never a credential", kv)
+						}
+					}
+					cs = append(cs, arena.SomaContestant{Bin: somaBin, Env: somaEnv})
 				case "hermes":
 					if hermesBin == "" {
 						return errors.New("--hermes-bin is required for the hermes contestant")
@@ -143,6 +150,7 @@ func newArenaCmd() *cobra.Command {
 	run.Flags().Float64Var(&priceCached, "price-cached", 0, "USD per 1M cached input tokens")
 	run.Flags().Float64Var(&priceOut, "price-out", 0, "USD per 1M output tokens")
 	run.Flags().StringVar(&somaBin, "soma-bin", "", "soma binary (default: this binary)")
+	run.Flags().StringArrayVar(&somaEnv, "soma-env", nil, "Extra SOMA_NAME=value setting for the soma contestant (repeatable), for comparing configurations")
 	run.Flags().StringVar(&hermesBin, "hermes-bin", "", "Installed hermes launcher")
 	run.Flags().StringVar(&hermesHome, "hermes-home", "", "Installed HERMES_HOME (for --version)")
 	run.Flags().StringVar(&outDir, "out", "arena-results", "Output directory for arena-report.{json,md}")
