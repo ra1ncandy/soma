@@ -141,6 +141,8 @@ type Runner struct {
 	Repeats     int
 	// Log receives progress lines.
 	Log func(string)
+	// KeepDir, when set, preserves every attempt's workspace and outputs under it.
+	KeepDir string
 }
 
 // Run executes all attempts sequentially (one metered session at a time) and stops early when
@@ -196,7 +198,7 @@ func (r *Runner) attempt(ctx context.Context, c Contestant, task Task, rep int) 
 	}
 	runCtx, cancel := context.WithTimeout(ctx, wall)
 	start := time.Now()
-	_, runErr := c.Run(runCtx, r.Config, task, dir)
+	agentOut, runErr := c.Run(runCtx, r.Config, task, dir)
 	cancel()
 	res := Result{Task: task.ID, Contestant: c.Name(), Repeat: rep, WallSec: time.Since(start).Seconds(), Usage: r.Proxy.End(session)}
 	if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
@@ -206,7 +208,21 @@ func (r *Runner) attempt(ctx context.Context, c Contestant, task Task, rep int) 
 		res.ExitError = runErr.Error()
 	}
 	res.Passed, res.GraderOut = grade(ctx, task, dir)
+	if r.KeepDir != "" {
+		keepAttempt(filepath.Join(r.KeepDir, task.ID, fmt.Sprintf("%s-%d", c.Name(), rep)), dir, agentOut, res.GraderOut)
+	}
 	return res, nil
+}
+
+// keepAttempt preserves an attempt's final workspace (including any agent state such as .soma)
+// plus the agent's output and the grader's verdict, for failure analysis.
+func keepAttempt(dest, dir, agentOut, graderOut string) {
+	if err := os.MkdirAll(dest, 0o755); err != nil {
+		return
+	}
+	_ = exec.Command("cp", "-a", dir+"/.", filepath.Join(dest, "workspace")).Run()
+	_ = os.WriteFile(filepath.Join(dest, "agent-output.txt"), []byte(agentOut), 0o644)
+	_ = os.WriteFile(filepath.Join(dest, "grader-output.txt"), []byte(graderOut), 0o644)
 }
 
 // grade runs the held-out grader from outside the workspace.
