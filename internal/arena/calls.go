@@ -13,6 +13,7 @@ import (
 type CallRecord struct {
 	Seq       int   `json:"seq"`
 	Status    int   `json:"status"`
+	StartMS   int64 `json:"start_ms"` // when the request arrived, since the attempt began
 	LatencyMS int64 `json:"latency_ms"`
 
 	// Request.

@@ -13,6 +13,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/ra1ncandy/soma/internal/arena"
+	"github.com/ra1ncandy/soma/internal/dag"
 )
 
 func newArenaCmd() *cobra.Command {
@@ -23,6 +24,7 @@ func newArenaCmd() *cobra.Command {
 		capUSD, priceIn, priceCached, priceOut                                                     float64
 		keep                                                                                       bool
 		somaEnv                                                                                    []string
+		hermesEffort                                                                               string
 	)
 	run := &cobra.Command{
 		Use:   "run",
@@ -75,7 +77,7 @@ func newArenaCmd() *cobra.Command {
 					if hermesBin == "" {
 						return errors.New("--hermes-bin is required for the hermes contestant")
 					}
-					cs = append(cs, arena.HermesContestant{Bin: hermesBin, BaseHome: hermesHome})
+					cs = append(cs, arena.HermesContestant{Bin: hermesBin, BaseHome: hermesHome, ReasoningEffort: hermesEffort})
 				default:
 					return fmt.Errorf("unknown contestant %q (soma, hermes)", name)
 				}
@@ -116,6 +118,8 @@ func newArenaCmd() *cobra.Command {
 					"Both receive the same goal text; graders are held out and run after the contestant exits.",
 					"soma runs `soma ask` (OS-sandboxed shell, isolated workspace applied to the project on completion). Hermes runs `hermes -z` one-shot with --yolo (its hardline blocklist still applies) on its default local terminal backend, which executes on the host.",
 					"Hermes' turn limit (agent.max_turns) and soma's --max-turns are both set to the task's call budget.",
+					"Each Hermes attempt gets a fresh HERMES_HOME (no memory or history from other attempts). Before the clock starts, Hermes answers one trivial prompt served locally by the proxy, so its first-run setup and gateway start-up are neither timed nor billed. soma has no such setup; its start-up is inside its timed run.",
+					hermesEffortNote(hermesEffort),
 					fmt.Sprintf("Prices used for the spend cap (USD per 1M tokens): input %.4g, cached input %.4g, output %.4g.", priceIn, priceCached, priceOut),
 				},
 			}
@@ -152,10 +156,18 @@ func newArenaCmd() *cobra.Command {
 	run.Flags().StringVar(&somaBin, "soma-bin", "", "soma binary (default: this binary)")
 	run.Flags().StringArrayVar(&somaEnv, "soma-env", nil, "Extra SOMA_NAME=value setting for the soma contestant (repeatable), for comparing configurations")
 	run.Flags().StringVar(&hermesBin, "hermes-bin", "", "Installed hermes launcher")
+	run.Flags().StringVar(&hermesEffort, "hermes-reasoning-effort", "", "Set Hermes' agent.reasoning_effort (default: leave Hermes' own default)")
 	run.Flags().StringVar(&hermesHome, "hermes-home", "", "Installed HERMES_HOME (for --version)")
 	run.Flags().StringVar(&outDir, "out", "arena-results", "Output directory for arena-report.{json,md}")
 	root.AddCommand(run)
 	return root
+}
+
+func hermesEffortNote(effort string) string {
+	if strings.TrimSpace(effort) == "" {
+		return "Reasoning effort: each contestant uses its own default (soma: " + dag.DefaultReasoningEffort + "; Hermes: its built-in default)."
+	}
+	return "Reasoning effort: soma uses its default (" + dag.DefaultReasoningEffort + "); Hermes was set to " + strings.TrimSpace(effort) + " with --hermes-reasoning-effort."
 }
 
 func keepDir(keep bool, outDir string) string {

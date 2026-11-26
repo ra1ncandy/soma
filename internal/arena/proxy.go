@@ -47,6 +47,8 @@ type Proxy struct {
 	session  string
 	maxCalls int
 	usage    map[string]*Usage
+	began    time.Time
+	warming  bool
 	calls    map[string][]CallRecord
 	totalUSD float64
 
@@ -83,7 +85,19 @@ func (p *Proxy) Begin(session string, maxCalls int) {
 	defer p.mu.Unlock()
 	p.session = session
 	p.maxCalls = maxCalls
+	p.warming = false
+	p.began = time.Now()
 	p.usage[session] = &Usage{}
+}
+
+// BeginWarmup puts the proxy in warm-up mode until the next Begin: model calls are answered
+// locally with a fixed one-word reply, never forwarded, and nothing is metered. It lets a
+// contestant finish its first-run setup before an attempt is timed.
+func (p *Proxy) BeginWarmup() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.session = ""
+	p.warming = true
 }
 
 // End returns the measured usage of a session.
@@ -112,6 +126,11 @@ func (p *Proxy) SpentUSD() float64 {
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.mu.Lock()
+	if p.warming {
+		p.mu.Unlock()
+		serveWarmup(w, r)
+		return
+	}
 	u := p.usage[p.session]
 	refuse := ""
 	switch {
@@ -129,6 +148,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		u.Calls++
 	}
 	session := p.session
+	began := p.began
 	sessionHeader := upstreamSessionID(session)
 	p.mu.Unlock()
 	if refuse != "" {
@@ -185,6 +205,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 							return
 						}
 						rec.Status = status
+						rec.StartMS = started.Sub(began).Milliseconds()
 						rec.LatencyMS = time.Since(started).Milliseconds()
 						rec.InputTokens, rec.CachedTokens, rec.OutputTokens = in, cached, out
 						summarizeResponse(rec, body, sse)
@@ -199,6 +220,45 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		FlushInterval: -1,
 	}
 	rp.ServeHTTP(w, r)
+}
+
+// serveWarmup answers a warm-up request without contacting the upstream: a canned completion for
+// model calls, an empty list for anything else.
+func serveWarmup(w http.ResponseWriter, r *http.Request) {
+	if !isModelCall(r) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"object":"list","data":[]}`)
+		return
+	}
+	var req struct {
+		Model  string `json:"model"`
+		Stream bool   `json:"stream"`
+	}
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 64<<20))
+	_ = json.Unmarshal(body, &req)
+	usage := map[string]int{"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+	if !req.Stream {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": "arena-warmup", "object": "chat.completion", "model": req.Model,
+			"choices": []map[string]any{{"index": 0, "message": map[string]any{"role": "assistant", "content": "ok"}, "finish_reason": "stop"}},
+			"usage":   usage,
+		})
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	chunk := func(choices []map[string]any, withUsage bool) {
+		c := map[string]any{"id": "arena-warmup", "object": "chat.completion.chunk", "model": req.Model, "choices": choices}
+		if withUsage {
+			c["usage"] = usage
+		}
+		b, _ := json.Marshal(c)
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", b)
+	}
+	chunk([]map[string]any{{"index": 0, "delta": map[string]any{"role": "assistant", "content": "ok"}, "finish_reason": nil}}, false)
+	chunk([]map[string]any{{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}}, false)
+	chunk([]map[string]any{}, true)
+	_, _ = io.WriteString(w, "data: [DONE]\n\n")
 }
 
 // upstreamSessionID is a stable, header-safe session id for one arena trial.

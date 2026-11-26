@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -19,6 +20,13 @@ type RunConfig struct {
 	ProxyBaseURL string
 	Model        string
 	WallClock    time.Duration
+}
+
+// preparer is implemented by contestants that need untimed setup before an attempt (for example
+// first-run initialisation that a normal installation has already done). Prepare runs while the
+// proxy is in warm-up mode; the returned run is what gets timed and metered.
+type preparer interface {
+	Prepare(ctx context.Context, cfg RunConfig, task Task) (run func(ctx context.Context, dir string) (string, error), cleanup func(), err error)
 }
 
 // Contestant runs one task in dir and returns when the agent stops.
@@ -65,6 +73,9 @@ type HermesContestant struct {
 	Bin string
 	// BaseHome is an installed HERMES_HOME; its code is reused, its state is not.
 	BaseHome string
+	// ReasoningEffort, when set, is written to Hermes' agent.reasoning_effort; empty keeps
+	// Hermes' own default.
+	ReasoningEffort string
 }
 
 func (c HermesContestant) Name() string { return "hermes" }
@@ -79,33 +90,101 @@ func (c HermesContestant) Version() string {
 	return strings.TrimSpace(strings.SplitN(string(out), "\n", 2)[0])
 }
 
-func (c HermesContestant) Run(ctx context.Context, cfg RunConfig, task Task, dir string) (string, error) {
-	home, err := os.MkdirTemp("", "arena-hermes-home-")
-	if err != nil {
-		return "", err
-	}
-	defer func() { _ = os.RemoveAll(home) }()
+func (c HermesContestant) config(cfg RunConfig, maxTurns int) string {
 	// Same budget as soma: Hermes' turn limit equals the task's call budget (the proxy also
-	// enforces it). --yolo because one-shot mode denies prompts that nobody can answer; Hermes'
-	// hardline blocklist still applies. Its default local terminal backend runs on the host.
-	config := fmt.Sprintf(`model:
+	// enforces it). Its default local terminal backend runs on the host.
+	effortLine := ""
+	if e := strings.TrimSpace(c.ReasoningEffort); e != "" {
+		effortLine = fmt.Sprintf("  reasoning_effort: %q\n", e)
+	}
+	return fmt.Sprintf(`model:
   default: %q
   provider: "custom"
   base_url: %q
   api_key: "arena"
 agent:
   max_turns: %d
-terminal:
+%sterminal:
   backend: "local"
-`, cfg.Model, cfg.ProxyBaseURL, task.MaxCalls)
-	if err := os.WriteFile(filepath.Join(home, "config.yaml"), []byte(config), 0o600); err != nil {
+`, cfg.Model, cfg.ProxyBaseURL, maxTurns, effortLine)
+}
+
+// Prepare gives the attempt its own fresh HERMES_HOME and lets Hermes finish its first-run setup
+// in it (installing bundled tools, starting its gateway daemon: about 13 seconds) by answering one
+// trivial prompt. The runner serves that prompt from the proxy's warm-up mode, so it costs nothing
+// and is not timed. A fresh home per attempt keeps Hermes' memory and session history from
+// carrying over between attempts; warming it keeps that isolation from being billed to Hermes as
+// wall time, which an installed Hermes never pays.
+func (c HermesContestant) Prepare(ctx context.Context, cfg RunConfig, task Task) (func(context.Context, string) (string, error), func(), error) {
+	home, err := os.MkdirTemp("", "arena-hermes-home-")
+	if err != nil {
+		return nil, nil, err
+	}
+	cleanup := func() {
+		stopHermesGateway(home)
+		_ = os.RemoveAll(home)
+	}
+	if err := os.WriteFile(filepath.Join(home, "config.yaml"), []byte(c.config(cfg, task.MaxCalls)), 0o600); err != nil {
+		cleanup()
+		return nil, nil, err
+	}
+	scratch, err := os.MkdirTemp("", "arena-hermes-warmup-")
+	if err != nil {
+		cleanup()
+		return nil, nil, err
+	}
+	warmCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	warm := exec.CommandContext(warmCtx, c.Bin, "-z", "Reply with the single word: ok", "--yolo")
+	warm.Dir = scratch
+	warm.Env = append(cleanEnv(), "HERMES_HOME="+home)
+	_ = warm.Run() // a failed warm-up only means the attempt starts cold
+	cancel()
+	_ = os.RemoveAll(scratch)
+
+	run := func(ctx context.Context, dir string) (string, error) {
+		// --yolo because one-shot mode denies prompts that nobody can answer; Hermes' hardline
+		// blocklist still applies.
+		cmd := exec.CommandContext(ctx, c.Bin, "-z", task.Goal, "--yolo")
+		cmd.Dir = dir
+		cmd.Env = append(cleanEnv(), "HERMES_HOME="+home)
+		out, err := cmd.CombinedOutput()
+		return string(out), err
+	}
+	return run, cleanup, nil
+}
+
+// Run runs one attempt without the untimed warm-up (used when the caller does not prepare).
+func (c HermesContestant) Run(ctx context.Context, cfg RunConfig, task Task, dir string) (string, error) {
+	run, cleanup, err := c.Prepare(ctx, cfg, task)
+	if err != nil {
 		return "", err
 	}
-	cmd := exec.CommandContext(ctx, c.Bin, "-z", task.Goal, "--yolo")
-	cmd.Dir = dir
-	cmd.Env = append(cleanEnv(), "HERMES_HOME="+home)
-	out, err := cmd.CombinedOutput()
-	return string(out), err
+	defer cleanup()
+	return run(ctx, dir)
+}
+
+// stopHermesGateway stops the gateway daemon Hermes started for this home, so attempts do not
+// leave daemons behind.
+func stopHermesGateway(home string) {
+	raw, err := os.ReadFile(filepath.Join(home, "gateway.pid"))
+	if err != nil {
+		return
+	}
+	var info struct {
+		PID  int    `json:"pid"`
+		Home string `json:"hermes_home"`
+	}
+	if json.Unmarshal(raw, &info) != nil || info.PID <= 1 || info.Home != home {
+		return
+	}
+	proc, err := os.FindProcess(info.PID)
+	if err != nil || proc.Signal(syscall.SIGTERM) != nil {
+		return
+	}
+	// Give it a moment to exit, so it does not write into the home while it is being removed.
+	for i := 0; i < 30 && proc.Signal(syscall.Signal(0)) == nil; i++ {
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 // cleanEnv passes the environment without any provider credentials, so a contestant can only
@@ -195,6 +274,16 @@ func (r *Runner) attempt(ctx context.Context, c Contestant, task Task, rep int) 
 	if err := task.Seed(dir); err != nil {
 		return Result{}, fmt.Errorf("seed %s: %w", task.ID, err)
 	}
+	run := func(ctx context.Context, dir string) (string, error) { return c.Run(ctx, r.Config, task, dir) }
+	if p, ok := c.(preparer); ok {
+		r.Proxy.BeginWarmup()
+		prepared, cleanup, err := p.Prepare(ctx, r.Config, task)
+		if err != nil {
+			return Result{}, fmt.Errorf("prepare %s: %w", c.Name(), err)
+		}
+		defer cleanup()
+		run = prepared
+	}
 	session := fmt.Sprintf("%s/%s/%d", c.Name(), task.ID, rep)
 	r.Proxy.Begin(session, task.MaxCalls)
 	wall := r.Config.WallClock
@@ -203,7 +292,7 @@ func (r *Runner) attempt(ctx context.Context, c Contestant, task Task, rep int) 
 	}
 	runCtx, cancel := context.WithTimeout(ctx, wall)
 	start := time.Now()
-	agentOut, runErr := c.Run(runCtx, r.Config, task, dir)
+	agentOut, runErr := run(runCtx, dir)
 	cancel()
 	res := Result{Task: task.ID, Contestant: c.Name(), Repeat: rep, WallSec: time.Since(start).Seconds(), Usage: r.Proxy.End(session)}
 	calls := r.Proxy.Calls(session)
