@@ -129,6 +129,21 @@ SOMA_API_BASE="https://api.openai.com/v1" SOMA_API_KEY="$OPENAI_API_KEY" SOMA_MO
 
 ---
 
+## Measured Comparison (`soma arena`)
+
+`soma arena run` runs soma and an installed Hermes Agent on the same tasks with the same model. Both reach the model only through a local metering proxy that injects the API key, counts calls, tokens and cost, and enforces each task's call budget and a hard spend cap. Graders are held out and run after each agent exits; the report contains only measured numbers (pass rate with 95% Wilson intervals, model calls, tokens, cost, wall time) plus the exact conditions.
+
+```bash
+export SOMA_ARENA_API_KEY=...            # injected by the proxy; agents never see it
+./bin/soma arena run --base-url https://openrouter.ai/api/v1 --model <model> \
+  --spend-cap-usd 5 --price-in <usd/Mtok> --price-out <usd/Mtok> --repeats 3 \
+  --hermes-bin ~/.local/bin/hermes --out arena-results
+```
+
+No arena results are published in this repository yet.
+
+---
+
 ## CLI Reference
 
 | Category | Commands |
