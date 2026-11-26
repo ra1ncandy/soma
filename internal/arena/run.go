@@ -1,7 +1,9 @@
 package arena
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -30,6 +32,9 @@ type Contestant interface {
 type SomaContestant struct {
 	Bin      string
 	MaxTurns int
+	// Env is extra KEY=VALUE settings for soma (e.g. SOMA_REASONING_EFFORT=low), for comparing
+	// configurations. It cannot carry credentials: the proxy address and model always win.
+	Env []string
 }
 
 func (c SomaContestant) Name() string { return "soma" }
@@ -49,7 +54,7 @@ func (c SomaContestant) Run(ctx context.Context, cfg RunConfig, task Task, dir s
 	}
 	cmd := exec.CommandContext(ctx, c.Bin, "ask", "--dir", dir, "--max-turns", fmt.Sprint(turns), task.Goal)
 	cmd.Dir = dir
-	cmd.Env = append(cleanEnv(), "SOMA_API_BASE="+cfg.ProxyBaseURL, "SOMA_MODEL="+cfg.Model, "SOMA_API_KEY=arena")
+	cmd.Env = append(append(cleanEnv(), c.Env...), "SOMA_API_BASE="+cfg.ProxyBaseURL, "SOMA_MODEL="+cfg.Model, "SOMA_API_KEY=arena")
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
@@ -201,6 +206,7 @@ func (r *Runner) attempt(ctx context.Context, c Contestant, task Task, rep int) 
 	agentOut, runErr := c.Run(runCtx, r.Config, task, dir)
 	cancel()
 	res := Result{Task: task.ID, Contestant: c.Name(), Repeat: rep, WallSec: time.Since(start).Seconds(), Usage: r.Proxy.End(session)}
+	calls := r.Proxy.Calls(session)
 	if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
 		res.TimedOut = true
 	}
@@ -209,20 +215,26 @@ func (r *Runner) attempt(ctx context.Context, c Contestant, task Task, rep int) 
 	}
 	res.Passed, res.GraderOut = grade(ctx, task, dir)
 	if r.KeepDir != "" {
-		keepAttempt(filepath.Join(r.KeepDir, task.ID, fmt.Sprintf("%s-%d", c.Name(), rep)), dir, agentOut, res.GraderOut)
+		keepAttempt(filepath.Join(r.KeepDir, task.ID, fmt.Sprintf("%s-%d", c.Name(), rep)), dir, agentOut, res.GraderOut, calls)
 	}
 	return res, nil
 }
 
 // keepAttempt preserves an attempt's final workspace (including any agent state such as .soma)
-// plus the agent's output and the grader's verdict, for failure analysis.
-func keepAttempt(dest, dir, agentOut, graderOut string) {
+// plus the agent's output, the grader's verdict and a per-call summary, for failure analysis.
+func keepAttempt(dest, dir, agentOut, graderOut string, calls []CallRecord) {
 	if err := os.MkdirAll(dest, 0o755); err != nil {
 		return
 	}
 	_ = exec.Command("cp", "-a", dir+"/.", filepath.Join(dest, "workspace")).Run()
 	_ = os.WriteFile(filepath.Join(dest, "agent-output.txt"), []byte(agentOut), 0o644)
 	_ = os.WriteFile(filepath.Join(dest, "grader-output.txt"), []byte(graderOut), 0o644)
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	for _, c := range calls {
+		_ = enc.Encode(c)
+	}
+	_ = os.WriteFile(filepath.Join(dest, "calls.jsonl"), buf.Bytes(), 0o644)
 }
 
 // grade runs the held-out grader from outside the workspace.
