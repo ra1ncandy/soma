@@ -113,7 +113,7 @@ type OpenAICompatProvider struct {
 	StreamIdleTimeout time.Duration
 
 	streamUnsupported atomic.Bool
-	effortUnsupported atomic.Bool // the endpoint rejected reasoning_effort once; stop sending it
+	effortLevel       atomic.Int32 // fallback level after the endpoint rejected reasoning_effort
 }
 
 // NewOpenAICompatProvider creates a client targeting baseURL (e.g. https://opencode.ai/zen/go/v1).
@@ -751,7 +751,7 @@ func (p *OpenAICompatProvider) Generate(ctx context.Context, req GenerateRequest
 		"messages":   msgs,
 		"max_tokens": maxToks,
 	}
-	if effort := effectiveReasoningEffort(p.ReasoningEffort); effort != "" && !p.effortUnsupported.Load() {
+	if effort := effortAtLevel(effectiveReasoningEffort(p.ReasoningEffort), p.effortLevel.Load()); effort != "" {
 		payload["reasoning_effort"] = effort
 	}
 	// Temperature is left to the provider unless configured: forcing 0 (greedy decoding) makes
@@ -890,10 +890,16 @@ func (p *OpenAICompatProvider) Generate(ctx context.Context, req GenerateRequest
 			attempt--
 			continue
 		}
-		// Models or endpoints without a reasoning-effort setting get one retry without it.
-		if _, sent := payload["reasoning_effort"]; sent && rejectsReasoningEffort(statusCode, b) {
-			p.effortUnsupported.Store(true)
-			delete(payload, "reasoning_effort")
+		// An endpoint that rejects the effort setting is retried with a more widely accepted
+		// value, then without one; the outcome is remembered.
+		if sent, ok := payload["reasoning_effort"].(string); ok && rejectsReasoningEffort(statusCode, b) {
+			level := nextEffortLevel(sent)
+			p.effortLevel.Store(level)
+			if next := effortAtLevel(sent, level); next != "" {
+				payload["reasoning_effort"] = next
+			} else {
+				delete(payload, "reasoning_effort")
+			}
 			if body, err = marshal(streaming); err != nil {
 				return nil, err
 			}

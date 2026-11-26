@@ -24,7 +24,7 @@ type ResponsesProvider struct {
 	// ExtraHeaders are sent on every request (e.g. account routing headers of a subscription backend).
 	ExtraHeaders map[string]string
 
-	effortUnsupported atomic.Bool // the endpoint rejected reasoning.effort once; stop sending it
+	effortLevel atomic.Int32 // fallback level after the endpoint rejected reasoning.effort
 }
 
 // NewResponsesProvider creates a Responses API client.
@@ -104,8 +104,9 @@ func (p *ResponsesProvider) Generate(ctx context.Context, req GenerateRequest) (
 	if p.MaxOutputTokens > 0 {
 		payload["max_output_tokens"] = p.MaxOutputTokens
 	}
-	if e := effectiveReasoningEffort(p.ReasoningEffort); e != "" && !p.effortUnsupported.Load() {
-		payload["reasoning"] = map[string]any{"effort": e}
+	effortSent := effortAtLevel(effectiveReasoningEffort(p.ReasoningEffort), p.effortLevel.Load())
+	if effortSent != "" {
+		payload["reasoning"] = map[string]any{"effort": effortSent}
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -144,10 +145,15 @@ func (p *ResponsesProvider) Generate(ctx context.Context, req GenerateRequest) (
 		if resp.StatusCode == http.StatusOK {
 			break
 		}
-		if _, sent := payload["reasoning"]; sent && rejectsReasoningEffort(resp.StatusCode, raw) {
-			// Models without a reasoning-effort setting get one retry without it.
-			p.effortUnsupported.Store(true)
-			delete(payload, "reasoning")
+		if effortSent != "" && rejectsReasoningEffort(resp.StatusCode, raw) {
+			// Retried with a more widely accepted value, then without one; remembered.
+			level := nextEffortLevel(effortSent)
+			p.effortLevel.Store(level)
+			if effortSent = effortAtLevel(effortSent, level); effortSent != "" {
+				payload["reasoning"] = map[string]any{"effort": effortSent}
+			} else {
+				delete(payload, "reasoning")
+			}
 			if body, err = json.Marshal(payload); err != nil {
 				return nil, err
 			}

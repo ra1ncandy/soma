@@ -211,17 +211,19 @@ type EmittedPayload struct {
 
 // Executor drives the Merkle DAG execution loop with durable 2-phase journaling and @page context VM.
 type Executor struct {
-	Store               *store.Store
-	VM                  *vmem.Manager
-	Memory              *memory.Service
-	Blackboard          *Blackboard
-	Workspace           *workspace.Manager
-	Scheduler           *QuotaScheduler
-	Provider            ModelProvider
-	Tools               ToolRunner
-	Reconciler          ActionReconciler
-	Verifier            ContractVerifier
-	Profile             compiler.ModelProfile
+	Store      *store.Store
+	VM         *vmem.Manager
+	Memory     *memory.Service
+	Blackboard *Blackboard
+	Workspace  *workspace.Manager
+	Scheduler  *QuotaScheduler
+	Provider   ModelProvider
+	Tools      ToolRunner
+	Reconciler ActionReconciler
+	Verifier   ContractVerifier
+	Profile    compiler.ModelProfile
+	// NoWorkspaceOverview stops a fresh run from starting with the workspace's file list.
+	NoWorkspaceOverview bool
 	SystemPrompt        string
 	MaxLayer1Memories   int
 	AccountIDs          []string
@@ -773,6 +775,16 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 	if len(recoveredAppends) > 0 {
 		l2 = append(l2, recoveredAppends...)
 		pendingDeltaAppends = recoveredAppends
+	}
+
+	// A fresh run starts with the workspace's file list already in Layer 2 (append-only, so the
+	// frozen prefix is untouched): the model can read what matters on its first call.
+	if branch.HeadStepID == "" && len(l2) == 0 && !e.NoWorkspaceOverview {
+		if overview := workspaceOverview(branch.WorkspaceDir); overview != "" {
+			notice := compiler.LogEntry{Kind: "rule_notice", Name: "workspace_files", TurnIndex: nextTurn, Observation: overview}
+			l2 = append(l2, notice)
+			pendingDeltaAppends = append(pendingDeltaAppends, notice)
+		}
 	}
 
 	lastStateHash := ""
@@ -2099,7 +2111,7 @@ func strconvUnquote(s string) (string, error) {
 }
 
 func defaultKernelSystemPrompt() string {
-	return "You are soma, executing inside an isolated branch workspace. Available workspace tools: fs_list, fs_grep, fs_read(path, start_line?, end_line?), fs_write, fs_patch, exec(command, timeout_sec?), bg_exec, bg_poll(job_id, wait_seconds?), bg_kill, page_grep(page_id, pattern, context_lines?, ignore_case?), page_slice, page_search, memory_search, publish_finding, web_extract, desktop_task(goal, start_url?). Efficiency & rigor rules: (0) Match effort and response length to the request: answer simple questions, greetings, or quick queries directly and concisely (1–3 sentences) without running unnecessary workspace tools or writing long reports; only use tools when the user asks you to inspect, build, edit, run, or verify something in the workspace. (1) Batch independent read-only calls (fs_list, fs_grep, fs_read, page_grep, page_slice) in a single turn — they execute in parallel. (2) Use relative paths inside `/workspace` (e.g. `artifacts/...`) — `/workspace` is shared with the Virtual Desktop (`desktop_task`), whereas `/tmp` is separate per container. (3) Use fs_grep to locate symbols or configs instead of reading whole directories; prefer fs_patch for targeted edits to existing files. (4) For heavy compute or servers, pass timeout_sec to exec (up to 300s) or use bg_exec + bg_poll. (5) For websites, UIs, or desktop apps, call desktop_task(goal, start_url?) directly — the host auto-starts the Virtual Desktop (server name is `docker-desktop` if using mcp_call; never run `docker` inside exec). (6) Verify once, in proportion: run the project's existing tests, and check requirements they do not cover with one short script through exec or execute_code. When the checks pass, finish. Do not re-verify what already passed, add test files, fuzzers or benchmarks, or rewrite code that works, unless the task asks for them; remove scratch files you created. Write a requested document once, at the length asked (\"short\" means a few plain sentences, no tables), and do not revise its wording afterwards. (7) Your hidden reasoning is discarded after each turn, so keep it short: settle the design, then write code only in tool arguments — never draft file contents in reasoning first. If a decision must survive to later turns, state it in one or two visible sentences. (8) End with a summary of a few sentences: what was wrong, what you changed, how you verified it."
+	return "You are soma, executing inside an isolated branch workspace. Available workspace tools: fs_list, fs_grep, fs_read(path, start_line?, end_line?), fs_write, fs_patch, exec(command, timeout_sec?), bg_exec, bg_poll(job_id, wait_seconds?), bg_kill, page_grep(page_id, pattern, context_lines?, ignore_case?), page_slice, page_search, memory_search, publish_finding, web_extract, desktop_task(goal, start_url?). Efficiency & rigor rules: (0) Match effort and response length to the request: answer simple questions, greetings, or quick queries directly and concisely (1–3 sentences) without running unnecessary workspace tools or writing long reports; only use tools when the user asks you to inspect, build, edit, run, or verify something in the workspace. (1) Batch independent read-only calls (fs_list, fs_grep, fs_read, page_grep, page_slice) in a single turn — they execute in parallel. (2) Use relative paths inside `/workspace` (e.g. `artifacts/...`) — `/workspace` is shared with the Virtual Desktop (`desktop_task`), whereas `/tmp` is separate per container. (3) Use fs_grep to locate symbols or configs instead of reading whole directories; prefer fs_patch for targeted edits to existing files. (4) For heavy compute or servers, pass timeout_sec to exec (up to 300s) or use bg_exec + bg_poll. (5) For websites, UIs, or desktop apps, call desktop_task(goal, start_url?) directly — the host auto-starts the Virtual Desktop (server name is `docker-desktop` if using mcp_call; never run `docker` inside exec). (6) Verify once, in proportion: run the project's existing tests, and check requirements they do not cover with one short script through exec or execute_code. When the checks pass, finish. Do not re-verify what already passed, add test files, fuzzers or benchmarks, or rewrite code that works, unless the task asks for them; remove scratch files you created. Write a requested document once, at the length asked (\"short\" means a few plain sentences, no tables), and do not revise its wording afterwards. (7) Your hidden reasoning is discarded after each turn, so keep it short: settle the design, then write code only in tool arguments — never draft file contents in reasoning first. If a decision must survive to later turns, state it in one or two visible sentences. (8) End with a summary of at most three sentences: what was wrong, what you changed, how you verified it. Do not repeat a document you just wrote."
 }
 
 func (e *Executor) buildEpochInput(run store.Run, activeMem []compiler.MemoryEntry, grave []compiler.GraveyardEntry) compiler.EpochInput {

@@ -18,14 +18,14 @@ func TestReasoningEffortDefaultOverrideAndFallback(t *testing.T) {
 		effort any
 		has    bool
 	}
-	serve := func(t *testing.T, reject bool) (*httptest.Server, *[]seen) {
+	serve := func(t *testing.T, reject string) (*httptest.Server, *[]seen) {
 		var got []seen
 		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			var body map[string]any
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			e, has := body["reasoning_effort"]
 			got = append(got, seen{e, has})
-			if has && reject {
+			if has && (reject == "all" || reject == e) {
 				w.WriteHeader(http.StatusBadRequest)
 				_, _ = w.Write([]byte(`{"error":{"message":"Unrecognized request argument supplied: reasoning_effort"}}`))
 				return
@@ -46,17 +46,17 @@ func TestReasoningEffortDefaultOverrideAndFallback(t *testing.T) {
 		}
 	}
 
-	t.Run("default is low", func(t *testing.T) {
+	t.Run("default is minimal", func(t *testing.T) {
 		t.Setenv("SOMA_REASONING_EFFORT", "")
-		ts, got := serve(t, false)
+		ts, got := serve(t, "")
 		gen(t, dag.NewOpenAICompatProvider(ts.URL, ""))
-		if len(*got) != 1 || (*got)[0].effort != dag.DefaultReasoningEffort || dag.DefaultReasoningEffort != "low" {
+		if len(*got) != 1 || (*got)[0].effort != dag.DefaultReasoningEffort || dag.DefaultReasoningEffort != "minimal" {
 			t.Fatalf("got %+v", *got)
 		}
 	})
 	t.Run("environment overrides the default", func(t *testing.T) {
 		t.Setenv("SOMA_REASONING_EFFORT", "High")
-		ts, got := serve(t, false)
+		ts, got := serve(t, "")
 		gen(t, dag.NewOpenAICompatProvider(ts.URL, ""))
 		if (*got)[0].effort != "high" {
 			t.Fatalf("got %+v", *got)
@@ -64,7 +64,7 @@ func TestReasoningEffortDefaultOverrideAndFallback(t *testing.T) {
 	})
 	t.Run("explicit setting beats the environment", func(t *testing.T) {
 		t.Setenv("SOMA_REASONING_EFFORT", "high")
-		ts, got := serve(t, false)
+		ts, got := serve(t, "")
 		p := dag.NewOpenAICompatProvider(ts.URL, "")
 		p.ReasoningEffort = "medium"
 		gen(t, p)
@@ -74,20 +74,30 @@ func TestReasoningEffortDefaultOverrideAndFallback(t *testing.T) {
 	})
 	t.Run("provider leaves the choice to the endpoint", func(t *testing.T) {
 		t.Setenv("SOMA_REASONING_EFFORT", "provider")
-		ts, got := serve(t, false)
+		ts, got := serve(t, "")
 		gen(t, dag.NewOpenAICompatProvider(ts.URL, ""))
 		if (*got)[0].has {
 			t.Fatalf("reasoning_effort must be omitted, got %+v", *got)
 		}
 	})
-	t.Run("an endpoint that rejects it is retried without and remembered", func(t *testing.T) {
+	t.Run("an endpoint without minimal gets low, and that is remembered", func(t *testing.T) {
 		t.Setenv("SOMA_REASONING_EFFORT", "")
-		ts, got := serve(t, true)
+		ts, got := serve(t, "minimal")
 		p := dag.NewOpenAICompatProvider(ts.URL, "")
 		gen(t, p)
 		gen(t, p)
-		if len(*got) != 3 || !(*got)[0].has || (*got)[1].has || (*got)[2].has {
-			t.Fatalf("want [with, without, without], got %+v", *got)
+		if len(*got) != 3 || (*got)[0].effort != "minimal" || (*got)[1].effort != "low" || (*got)[2].effort != "low" {
+			t.Fatalf("want [minimal, low, low], got %+v", *got)
+		}
+	})
+	t.Run("an endpoint that takes no effort setting stops receiving one", func(t *testing.T) {
+		t.Setenv("SOMA_REASONING_EFFORT", "")
+		ts, got := serve(t, "all")
+		p := dag.NewOpenAICompatProvider(ts.URL, "")
+		gen(t, p)
+		gen(t, p)
+		if len(*got) != 4 || !(*got)[0].has || !(*got)[1].has || (*got)[2].has || (*got)[3].has {
+			t.Fatalf("want [minimal, low, none, none], got %+v", *got)
 		}
 	})
 }

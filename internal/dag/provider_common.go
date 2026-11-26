@@ -24,8 +24,9 @@ func configuredTemperature() (float64, bool) {
 // DefaultReasoningEffort is what soma asks of reasoning models unless configured otherwise. An
 // agent loop makes many small decisions and can check them against tool results, so long hidden
 // deliberation on every turn mostly buys output tokens and latency: in the arena's hard tier,
-// "low" cut output tokens and wall time by more than half with no loss in pass rate.
-const DefaultReasoningEffort = "low"
+// low effort cut output tokens and wall time by more than half with no loss in pass rate, and
+// "minimal" cut them further; no reasoning at all ("none") started failing the hardest tasks.
+const DefaultReasoningEffort = "minimal"
 
 // effectiveReasoningEffort resolves the effort to request: the explicit setting, then
 // SOMA_REASONING_EFFORT, then DefaultReasoningEffort. "provider" (or "default") means "send
@@ -42,6 +43,33 @@ func effectiveReasoningEffort(explicit string) string {
 		return ""
 	}
 	return e
+}
+
+// Effort fallback levels, remembered per provider after an endpoint rejects the setting.
+const (
+	effortAsConfigured int32 = iota
+	effortDowngraded         // "minimal" is not accepted everywhere: send "low" instead
+	effortOmitted            // the endpoint takes no effort setting at all
+)
+
+// effortAtLevel is the effort to send once an endpoint has rejected earlier attempts.
+func effortAtLevel(effort string, level int32) string {
+	switch {
+	case level >= effortOmitted:
+		return ""
+	case level == effortDowngraded:
+		return "low"
+	}
+	return effort
+}
+
+// nextEffortLevel picks the fallback after effort was rejected: "minimal" steps down to "low"
+// first, anything else is dropped.
+func nextEffortLevel(rejected string) int32 {
+	if rejected == "minimal" {
+		return effortDowngraded
+	}
+	return effortOmitted
 }
 
 // rejectsReasoningEffort reports whether a 4xx body says the endpoint or model does not accept a
