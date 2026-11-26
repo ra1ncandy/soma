@@ -7,6 +7,8 @@ package arena
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -117,6 +119,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if refuse == "" && isModelCall(r) {
 		u.Calls++
 	}
+	sessionHeader := upstreamSessionID(p.session)
 	p.mu.Unlock()
 	if refuse != "" {
 		// 400, not 429: agents must stop, not wait and retry.
@@ -138,6 +141,11 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				pr.Out.Header.Set("Authorization", "Bearer "+p.apiKey)
 			}
 			pr.Out.Header.Del("Accept-Encoding") // keep bodies readable for metering
+			// Some gateways (OpenCode Go) reject requests without a session id. Give every trial a
+			// stable one unless the contestant sent its own.
+			if pr.Out.Header.Get("x-opencode-session") == "" {
+				pr.Out.Header.Set("x-opencode-session", sessionHeader)
+			}
 		},
 		ModifyResponse: func(resp *http.Response) error {
 			// Only model calls are metered; metadata probes (model lists, capability lookups)
@@ -150,6 +158,12 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		FlushInterval: -1,
 	}
 	rp.ServeHTTP(w, r)
+}
+
+// upstreamSessionID is a stable, header-safe session id for one arena trial.
+func upstreamSessionID(session string) string {
+	sum := sha256.Sum256([]byte(session))
+	return "ses_" + hex.EncodeToString(sum[:12])
 }
 
 func isModelCall(r *http.Request) bool {

@@ -14,8 +14,10 @@ import (
 
 func TestProxyMetersUsageAndEnforcesBudgets(t *testing.T) {
 	var sawAuth string
+	var sawSession string
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sawAuth = r.Header.Get("Authorization")
+		sawSession = r.Header.Get("x-opencode-session")
 		if r.URL.Query().Get("stream") == "1" {
 			w.Header().Set("Content-Type", "text/event-stream")
 			_, _ = io.WriteString(w, "data: {\"choices\":[]}\n\ndata: {\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":7,\"prompt_tokens_details\":{\"cached_tokens\":60}}}\n\ndata: [DONE]\n\n")
@@ -47,6 +49,9 @@ func TestProxyMetersUsageAndEnforcesBudgets(t *testing.T) {
 	p.Begin("a", 2)
 	if c1, c2 := post(""), post("?stream=1"); c1 != 200 || c2 != 200 {
 		t.Fatalf("proxied calls failed: %d %d", c1, c2)
+	}
+	if sawSession != upstreamSessionID("a") || !strings.HasPrefix(sawSession, "ses_") {
+		t.Fatalf("x-opencode-session = %q, want stable ses_ id", sawSession)
 	}
 	if sawAuth != "Bearer real-key" {
 		t.Fatalf("upstream auth = %q, contestant key must be replaced", sawAuth)
