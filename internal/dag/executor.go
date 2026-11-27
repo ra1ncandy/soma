@@ -871,6 +871,15 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 			Viewport:            currentViewport,
 		}
 
+		// What the kernel has to say about the run goes into Layer 2, append-only, where it stays
+		// for later turns (see LiveTailState.NoticesInLog).
+		if notice := tail.Notices(); notice != "" {
+			entry := compiler.LogEntry{Kind: "rule_notice", Name: "live_tail", TurnIndex: nextTurn, Observation: strings.TrimSpace(notice)}
+			l2 = append(l2, entry)
+			pendingDeltaAppends = append(pendingDeltaAppends, entry)
+			tail.NoticesInLog = true
+		}
+
 		// Drain any pending cross-agent Blackboard findings/graveyard notices into Layer 2 (keeping Layer 0+1 frozen).
 		if e.Blackboard != nil {
 			if lt, ok := e.Tools.(*LocalToolRunner); ok && lt.Blackboard == nil {
@@ -1424,9 +1433,11 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 			entryReasoning := genResp.Reasoning
 			asstContent := ""
 			asstReasoningContent := ""
+			providerContent := ""
 			if idx == 0 {
 				asstContent = genResp.AssistantContent
 				asstReasoningContent = genResp.ReasoningContent
+				providerContent = genResp.ProviderContent
 			} else {
 				entryReasoning = fmt.Sprintf("batched tool call (%d/%d)", idx+1, len(planned))
 			}
@@ -1442,6 +1453,7 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 				ArgsJSON:         tc.ArgsJSON,
 				AssistantContent: asstContent,
 				ReasoningContent: asstReasoningContent,
+				ProviderContent:  providerContent,
 				Reasoning:        entryReasoning,
 				Action:           fmt.Sprintf("%s(%s)", tc.Name, tc.ArgsJSON),
 				Observation:      obsText,

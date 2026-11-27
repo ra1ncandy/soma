@@ -36,7 +36,7 @@ func TestObservationFailed(t *testing.T) {
 }
 
 // After an edit, two turns in a row that only run commands without a failure put a notice in the
-// live tail telling the model to finish. Exploration before any edit, failing commands and new
+// log telling the model to finish. Exploration before any edit, failing commands and new
 // edits do not count.
 func TestRepeatingChecksNotice(t *testing.T) {
 	ctx := context.Background()
@@ -60,7 +60,15 @@ func TestRepeatingChecksNotice(t *testing.T) {
 		var sawNotice []bool
 		calls := 0
 		ex := NewExecutor(st, &scriptedProvider{fn: func(_ int, req GenerateRequest) (*GenerateResponse, error) {
-			sawNotice = append(sawNotice, strings.Contains(req.Frame.Layer3, notice))
+			// The notice for this turn is the newest log entry; earlier ones stay in the log.
+			newest := ""
+			if n := len(req.Frame.Layer2Entries); n > 0 {
+				newest = req.Frame.Layer2Entries[n-1].Observation
+			}
+			if strings.Contains(req.Frame.Layer3, notice) {
+				t.Errorf("the notice must live in the log, not the live tail: %q", req.Frame.Layer3)
+			}
+			sawNotice = append(sawNotice, strings.Contains(newest, notice))
 			if calls >= len(script) {
 				return &GenerateResponse{Done: true, FinalSummary: "ok", StateHash: "done"}, nil
 			}

@@ -30,8 +30,21 @@ type AnthropicProvider struct {
 	// ReasoningEffort overrides SOMA_REASONING_EFFORT and the default (see anthropicEffort).
 	ReasoningEffort string
 
-	effortOmitted atomic.Bool // the model rejected output_config.effort once; stop sending it
+	// NoThinkingReplay stops the adapter from sending the model's thinking blocks back on later
+	// turns (see thinkingBindingBeta). The model then re-plans every turn.
+	NoThinkingReplay bool
+
+	effortOmitted     atomic.Bool // the model rejected output_config.effort once; stop sending it
+	bindingControlsNo atomic.Bool // the model rejected thinking.block_binding once; stop sending it
 }
+
+// thinkingBindingBeta lets a request ask the API to drop, instead of rejecting, thinking blocks
+// whose earlier conversation has changed. Current models sign each thinking block against the
+// system prompt, tool set and messages before it; soma replays the blocks verbatim so the model
+// keeps its reasoning across tool calls, and anything soma rewrites in an earlier turn (the live
+// tail, for one) invalidates the blocks after it. With "drop_block" that costs the affected
+// reasoning, not the request.
+const thinkingBindingBeta = "thinking-binding-controls-2026-08-01"
 
 // anthropicEffort maps soma's effort setting to the levels the Messages API accepts
 // (low, medium, high, xhigh, max). Thinking cannot be turned off on current models, so soma's
@@ -91,17 +104,26 @@ func anthropicTools() []map[string]any {
 }
 
 // toAnthropicMessages converts the canonical OpenAI-shaped message list into Anthropic blocks,
-// merging consecutive same-role messages (the API requires alternation).
-func toAnthropicMessages(msgs []map[string]any) (system []map[string]any, out []map[string]any) {
-	appendBlocks := func(role string, blocks []map[string]any) {
+// merging consecutive same-role messages (the API requires alternation). An assistant turn that
+// carries verbatim provider content (thinking blocks and what followed them) is sent back exactly
+// as it was received; replayed reports whether any turn was.
+func toAnthropicMessages(msgs []map[string]any) (system []map[string]any, out []map[string]any, replayed bool) {
+	appendBlocks := func(role string, blocks []any) {
 		if len(blocks) == 0 {
 			return
 		}
 		if n := len(out); n > 0 && out[n-1]["role"] == role {
-			out[n-1]["content"] = append(out[n-1]["content"].([]map[string]any), blocks...)
+			out[n-1]["content"] = append(out[n-1]["content"].([]any), blocks...)
 			return
 		}
 		out = append(out, map[string]any{"role": role, "content": blocks})
+	}
+	anyBlocks := func(in []map[string]any) []any {
+		res := make([]any, 0, len(in))
+		for _, b := range in {
+			res = append(res, b)
+		}
+		return res
 	}
 	for _, m := range msgs {
 		role, _ := m["role"].(string)
@@ -111,9 +133,21 @@ func toAnthropicMessages(msgs []map[string]any) (system []map[string]any, out []
 				system = append(system, map[string]any{"type": "text", "text": s, "cache_control": ephemeral()})
 			}
 		case "user":
-			appendBlocks("user", contentBlocks(m["content"]))
+			appendBlocks("user", anyBlocks(contentBlocks(m["content"])))
 		case "assistant":
-			var blocks []map[string]any
+			if verbatim, _ := m[providerContentKey].(string); verbatim != "" {
+				var raw []json.RawMessage
+				if json.Unmarshal([]byte(verbatim), &raw) == nil && len(raw) > 0 {
+					blocks := make([]any, 0, len(raw))
+					for _, r := range raw {
+						blocks = append(blocks, r)
+					}
+					appendBlocks("assistant", blocks)
+					replayed = true
+					continue
+				}
+			}
+			var blocks []any
 			if s, _ := m["content"].(string); strings.TrimSpace(s) != "" {
 				blocks = append(blocks, map[string]any{"type": "text", "text": s})
 			}
@@ -130,17 +164,20 @@ func toAnthropicMessages(msgs []map[string]any) (system []map[string]any, out []
 			appendBlocks("assistant", blocks)
 		case "tool":
 			text, _ := m["content"].(string)
-			appendBlocks("user", []map[string]any{{"type": "tool_result", "tool_use_id": m["tool_call_id"], "content": text}})
+			appendBlocks("user", []any{map[string]any{"type": "tool_result", "tool_use_id": m["tool_call_id"], "content": text}})
 		}
 	}
-	// Rolling cache breakpoint on the newest block: the whole conversation prefix is reused next turn.
+	// Rolling cache breakpoint on the newest block: the whole conversation prefix is reused next
+	// turn. (Markers may move freely; they are not part of what thinking blocks are signed against.)
 	if n := len(out); n > 0 {
-		blocks := out[n-1]["content"].([]map[string]any)
+		blocks := out[n-1]["content"].([]any)
 		if len(blocks) > 0 {
-			blocks[len(blocks)-1]["cache_control"] = ephemeral()
+			if last, ok := blocks[len(blocks)-1].(map[string]any); ok {
+				last["cache_control"] = ephemeral()
+			}
 		}
 	}
-	return system, out
+	return system, out, replayed
 }
 
 func contentBlocks(c any) []map[string]any {
@@ -181,31 +218,42 @@ func parseDataURI(u string) (mime, data string, ok bool) {
 
 // Generate implements ModelProvider.
 func (p *AnthropicProvider) Generate(ctx context.Context, req GenerateRequest) (*GenerateResponse, error) {
-	system, msgs := toAnthropicMessages(buildOpenAIMessages(req.Frame, false))
-	if len(msgs) == 0 {
-		msgs = []map[string]any{{"role": "user", "content": []map[string]any{{"type": "text", "text": "Continue."}}}}
-	}
 	maxToks := p.MaxTokens
 	if maxToks <= 0 {
 		maxToks = 16384
 	}
-	payload := map[string]any{
-		"model":      req.ModelID,
-		"max_tokens": maxToks,
-		"system":     system,
-		"messages":   msgs,
-		"tools":      anthropicTools(),
-		"stream":     true,
+	// build assembles the request. replay sends earlier thinking blocks back verbatim; controls
+	// asks the API to drop blocks it can no longer accept instead of failing the request.
+	var controlsSent bool
+	build := func(replay, controls bool) ([]byte, error) {
+		system, msgs, replayed := toAnthropicMessages(buildMessages(req.Frame, false, replay))
+		if len(msgs) == 0 {
+			msgs = []map[string]any{{"role": "user", "content": []map[string]any{{"type": "text", "text": "Continue."}}}}
+		}
+		payload := map[string]any{
+			"model":      req.ModelID,
+			"max_tokens": maxToks,
+			"system":     system,
+			"messages":   msgs,
+			"tools":      anthropicTools(),
+			"stream":     true,
+		}
+		if t, ok := configuredTemperature(); ok {
+			payload["temperature"] = t
+		}
+		// Thinking is adaptive (and on by default) on current models; effort is the control for
+		// how much the model thinks and writes. Models without the setting get one retry without it.
+		if effort := anthropicEffort(p.ReasoningEffort); effort != "" && !p.effortOmitted.Load() {
+			payload["output_config"] = map[string]any{"effort": effort}
+		}
+		controlsSent = replayed && controls
+		if controlsSent {
+			payload["thinking"] = map[string]any{"type": "adaptive", "block_binding": map[string]any{"prefix_mismatch_behavior": "drop_block"}}
+		}
+		return json.Marshal(payload)
 	}
-	if t, ok := configuredTemperature(); ok {
-		payload["temperature"] = t
-	}
-	// Thinking is adaptive (and on by default) on current models; effort is the control for how
-	// much the model thinks and writes. Models without the setting get one retry without it.
-	if effort := anthropicEffort(p.ReasoningEffort); effort != "" && !p.effortOmitted.Load() {
-		payload["output_config"] = map[string]any{"effort": effort}
-	}
-	body, err := json.Marshal(payload)
+	replay := !p.NoThinkingReplay
+	body, err := build(replay, !p.bindingControlsNo.Load())
 	if err != nil {
 		return nil, err
 	}
@@ -223,6 +271,9 @@ func (p *AnthropicProvider) Generate(ctx context.Context, req GenerateRequest) (
 		hreq.Header.Set("content-type", "application/json")
 		hreq.Header.Set("anthropic-version", anthropicVersion)
 		hreq.Header.Set("x-api-key", p.APIKey)
+		if controlsSent {
+			hreq.Header.Set("anthropic-beta", thinkingBindingBeta)
+		}
 		resp, err := client.Do(hreq)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -247,15 +298,29 @@ func (p *AnthropicProvider) Generate(ctx context.Context, req GenerateRequest) (
 		}
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 		_ = resp.Body.Close()
-		if _, sent := payload["output_config"]; sent && resp.StatusCode == http.StatusBadRequest &&
-			(bytes.Contains(errBody, []byte("effort")) || bytes.Contains(errBody, []byte("output_config"))) {
-			p.effortOmitted.Store(true)
-			delete(payload, "output_config")
-			if body, err = json.Marshal(payload); err != nil {
-				return nil, err
+		if resp.StatusCode == http.StatusBadRequest {
+			lower := bytes.ToLower(errBody)
+			retry := false
+			switch {
+			case replay && bytes.Contains(lower, []byte("signature")) && bytes.Contains(lower, []byte("thinking")):
+				// A replayed thinking block was refused outright. Answer this turn without the
+				// earlier reasoning; later turns replay only what the model produces from here.
+				replay, retry = false, true
+			case controlsSent && (bytes.Contains(lower, []byte("block_binding")) || bytes.Contains(lower, []byte("prefix_mismatch_behavior")) ||
+				bytes.Contains(lower, []byte(thinkingBindingBeta)) || bytes.Contains(lower, []byte("anthropic-beta"))):
+				p.bindingControlsNo.Store(true)
+				retry = true
+			case !p.effortOmitted.Load() && (bytes.Contains(lower, []byte("effort")) || bytes.Contains(lower, []byte("output_config"))):
+				p.effortOmitted.Store(true)
+				retry = true
 			}
-			attempt--
-			continue
+			if retry {
+				if body, err = build(replay, !p.bindingControlsNo.Load()); err != nil {
+					return nil, err
+				}
+				attempt--
+				continue
+			}
 		}
 		switch {
 		case resp.StatusCode == http.StatusTooManyRequests:
@@ -288,8 +353,10 @@ func (p *AnthropicProvider) readStream(ctx context.Context, r io.Reader, req Gen
 		kind string
 		id   string
 		name string
-		text strings.Builder
-		json strings.Builder
+		data string          // redacted_thinking payload
+		text strings.Builder // text, or thinking text
+		json strings.Builder // tool_use input
+		sig  strings.Builder // thinking signature
 	}
 	var blocks []*block
 	gen := &GenerateResponse{}
@@ -338,17 +405,24 @@ func (p *AnthropicProvider) readStream(ctx context.Context, r io.Reader, req Gen
 			Type    string `json:"type"`
 			Index   int    `json:"index"`
 			Message struct {
-				Usage anthropicUsage `json:"usage"`
+				Usage                anthropicUsage        `json:"usage"`
+				InputTransformations []inputTransformation `json:"input_transformations"`
 			} `json:"message"`
-			ContentBlock struct {
-				Type string `json:"type"`
-				ID   string `json:"id"`
-				Name string `json:"name"`
-				Text string `json:"text"`
+			InputTransformations []inputTransformation `json:"input_transformations"`
+			ContentBlock         struct {
+				Type      string `json:"type"`
+				ID        string `json:"id"`
+				Name      string `json:"name"`
+				Text      string `json:"text"`
+				Thinking  string `json:"thinking"`
+				Signature string `json:"signature"`
+				Data      string `json:"data"`
 			} `json:"content_block"`
 			Delta struct {
 				Type        string `json:"type"`
 				Text        string `json:"text"`
+				Thinking    string `json:"thinking"`
+				Signature   string `json:"signature"`
 				PartialJSON string `json:"partial_json"`
 				StopReason  string `json:"stop_reason"`
 			} `json:"delta"`
@@ -361,6 +435,11 @@ func (p *AnthropicProvider) readStream(ctx context.Context, r io.Reader, req Gen
 		if json.Unmarshal([]byte(data), &ev) != nil {
 			continue
 		}
+		for _, tr := range append(ev.Message.InputTransformations, ev.InputTransformations...) {
+			if tr.Type == "thinking_dropped" {
+				gen.ThinkingDropped++
+			}
+		}
 		switch ev.Type {
 		case "message_start":
 			ev.Message.Usage.apply(gen)
@@ -369,8 +448,10 @@ func (p *AnthropicProvider) readStream(ctx context.Context, r io.Reader, req Gen
 				blocks = append(blocks, &block{})
 			}
 			b := blocks[ev.Index]
-			b.kind, b.id, b.name = ev.ContentBlock.Type, ev.ContentBlock.ID, ev.ContentBlock.Name
+			b.kind, b.id, b.name, b.data = ev.ContentBlock.Type, ev.ContentBlock.ID, ev.ContentBlock.Name, ev.ContentBlock.Data
 			b.text.WriteString(ev.ContentBlock.Text)
+			b.text.WriteString(ev.ContentBlock.Thinking)
+			b.sig.WriteString(ev.ContentBlock.Signature)
 		case "content_block_delta":
 			if ev.Index >= len(blocks) {
 				continue
@@ -384,6 +465,10 @@ func (p *AnthropicProvider) readStream(ctx context.Context, r io.Reader, req Gen
 				}
 			case "input_json_delta":
 				b.json.WriteString(ev.Delta.PartialJSON)
+			case "thinking_delta":
+				b.text.WriteString(ev.Delta.Thinking)
+			case "signature_delta":
+				b.sig.WriteString(ev.Delta.Signature)
 			}
 		case "message_delta":
 			if ev.Delta.StopReason != "" {
@@ -401,16 +486,39 @@ func (p *AnthropicProvider) readStream(ctx context.Context, r io.Reader, req Gen
 	}
 	var text strings.Builder
 	var calls []wireToolCall
+	// verbatim is the content array to send back unchanged on later turns. It is only worth
+	// keeping when the turn has thinking, and only safe when every block is one we can reproduce.
+	var verbatim []any
+	hasThinking, reproducible := false, true
 	for _, b := range blocks {
 		switch b.kind {
 		case "text":
 			text.WriteString(b.text.String())
+			verbatim = append(verbatim, map[string]any{"type": "text", "text": b.text.String()})
 		case "tool_use":
 			args := strings.TrimSpace(b.json.String())
 			if args == "" {
 				args = "{}"
 			}
 			calls = append(calls, wireToolCall{ID: b.id, Name: b.name, Arguments: args})
+			if !json.Valid([]byte(args)) {
+				reproducible = false
+			}
+			verbatim = append(verbatim, map[string]any{"type": "tool_use", "id": b.id, "name": b.name, "input": json.RawMessage(args)})
+		case "thinking":
+			// Kept even when the text is empty (the default): the signature is what counts.
+			hasThinking = true
+			verbatim = append(verbatim, map[string]any{"type": "thinking", "thinking": b.text.String(), "signature": b.sig.String()})
+		case "redacted_thinking":
+			hasThinking = true
+			verbatim = append(verbatim, map[string]any{"type": "redacted_thinking", "data": b.data})
+		default:
+			reproducible = false
+		}
+	}
+	if hasThinking && reproducible && len(calls) > 0 {
+		if raw, err := json.Marshal(verbatim); err == nil {
+			gen.ProviderContent = string(raw)
 		}
 	}
 	if stopReason == "refusal" {
@@ -422,6 +530,11 @@ func (p *AnthropicProvider) readStream(ctx context.Context, r io.Reader, req Gen
 		return nil, &OutputTruncatedError{MaxTokens: p.MaxTokens}
 	}
 	return finishGenerateResponse(gen, req, text.String(), "", calls), nil
+}
+
+type inputTransformation struct {
+	Type   string `json:"type"`
+	Reason string `json:"reason"`
 }
 
 type anthropicUsage struct {

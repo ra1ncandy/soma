@@ -105,11 +105,17 @@ type LogEntry struct {
 	// interleaved-thinking models (DeepSeek, GLM, Kimi) keep their reasoning across tool round-trips.
 	// It is append-only within an epoch (cache-stable) and dropped at rollover.
 	ReasoningContent string `json:"reasoning_content,omitempty"`
-	Action           string `json:"action,omitempty"`
-	Reasoning        string `json:"reasoning,omitempty"`
-	Observation      string `json:"observation,omitempty"`
-	PageID           string `json:"page_id,omitempty"`
-	Masked           bool   `json:"masked,omitempty"`
+	// ProviderContent is the assistant turn's content blocks exactly as the provider returned
+	// them (a JSON array), kept on the first entry of a turn when it contains blocks that must be
+	// sent back unmodified, such as Anthropic thinking blocks with their signatures. Like
+	// ReasoningContent it is append-only within an epoch and dropped at rollover: those blocks
+	// are only valid after the exact conversation that produced them.
+	ProviderContent string `json:"provider_content,omitempty"`
+	Action          string `json:"action,omitempty"`
+	Reasoning       string `json:"reasoning,omitempty"`
+	Observation     string `json:"observation,omitempty"`
+	PageID          string `json:"page_id,omitempty"`
+	Masked          bool   `json:"masked,omitempty"`
 }
 
 // ViewportFrame describes the single ephemeral visual frame attached to Layer 3 (LiveTailState).
@@ -132,6 +138,23 @@ const ChecksRepeatingAfter = 2
 // editing anything in between: the point where more verification mostly costs tokens and time.
 func (t LiveTailState) ChecksRepeating() bool {
 	return t.PassingCheckStreak >= ChecksRepeatingAfter
+}
+
+// Notices is what the kernel has to tell the model this turn about its own run: that the turn
+// budget is nearly spent, or that it keeps re-running checks that pass. Empty when there is
+// nothing to say.
+func (t LiveTailState) Notices() string {
+	var b strings.Builder
+	if t.BudgetLow() {
+		fmt.Fprintf(&b, "TURN BUDGET LOW: %d of %d turns left. Stop exploring, adding tests or polishing. "+
+			"Make sure the requested change is complete and saved, verify it once, then finish with your summary.\n",
+			t.StepBudgetRemaining, t.StepBudgetTotal)
+	}
+	if t.ChecksRepeating() {
+		fmt.Fprintf(&b, "CHECKS REPEATING: your last %d turns only ran commands, none failed, and you have not edited anything since. "+
+			"If their output shows no problem, finish now with your summary instead of running more checks.\n", t.PassingCheckStreak)
+	}
+	return b.String()
 }
 
 // BudgetLow reports that the run is in its last quarter of turns (at least the last 3), when the
@@ -159,7 +182,12 @@ type LiveTailState struct {
 	StepBudgetTotal int `json:"step_budget_total,omitempty"`
 	// PassingCheckStreak counts consecutive turns that only ran commands, with no failure and no
 	// edit since the last one. See ChecksRepeating.
-	PassingCheckStreak  int            `json:"passing_check_streak,omitempty"`
+	PassingCheckStreak int `json:"passing_check_streak,omitempty"`
+	// NoticesInLog means this turn's Notices were appended to Layer 2 as a log entry, so Layer 3
+	// must not repeat them. Kept in the log they stay where they were said; shown only in the
+	// live tail they would vanish from the next request, and providers that sign the model's
+	// reasoning against the conversation so far (Anthropic) would then discard that reasoning.
+	NoticesInLog        bool           `json:"notices_in_log,omitempty"`
 	AccountQuotaSummary string         `json:"account_quota_summary,omitempty"`
 	StallCount          int            `json:"stall_count"`
 	MaxStalls           int            `json:"max_stalls"`
@@ -413,15 +441,8 @@ func Compile(snap EpochSnapshot, l2 []LogEntry, tail LiveTailState, profile Mode
 	}
 	fmt.Fprintf(&l3Buf, "budget_remaining: %d | stalls: %d/%d | quota: %s\n",
 		tail.StepBudgetRemaining, tail.StallCount, tail.MaxStalls, tail.AccountQuotaSummary)
-	if tail.BudgetLow() {
-		fmt.Fprintf(&l3Buf, "TURN BUDGET LOW: %d of %d turns left. Stop exploring, adding tests or polishing. "+
-			"Make sure the requested change is complete and saved, verify it once, then finish with your summary.\n",
-			tail.StepBudgetRemaining, tail.StepBudgetTotal)
-	}
-
-	if tail.ChecksRepeating() {
-		fmt.Fprintf(&l3Buf, "CHECKS REPEATING: your last %d turns only ran commands, none failed, and you have not edited anything since. "+
-			"If their output shows no problem, finish now with your summary instead of running more checks.\n", tail.PassingCheckStreak)
+	if !tail.NoticesInLog {
+		l3Buf.WriteString(tail.Notices())
 	}
 
 	l0 := snap.Layer0Text
@@ -567,6 +588,7 @@ func Rollover(
 			if keepRecentTurnMin >= 0 && e.TurnIndex >= keepRecentTurnMin && !e.Masked {
 				recent := e
 				recent.ReasoningContent = ""
+				recent.ProviderContent = ""
 				if len(recent.Observation) > 2048 {
 					recent.Observation = recent.Observation[:2045] + "..."
 				}

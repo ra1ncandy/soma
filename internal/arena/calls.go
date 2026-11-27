@@ -36,6 +36,8 @@ type CallRecord struct {
 	ToolArgChars    int      `json:"tool_arg_chars"`
 	ToolNames       []string `json:"tool_names,omitempty"`
 	FinishReason    string   `json:"finish_reason,omitempty"`
+	// ThinkingDropped counts replayed thinking blocks the API reported discarding on this call.
+	ThinkingDropped int `json:"thinking_dropped,omitempty"`
 }
 
 func summarizeRequest(body []byte) *CallRecord {
@@ -140,6 +142,7 @@ type callChunk struct {
 
 // summarizeResponse fills the response half of rec from a chat-completions body (JSON or SSE).
 func summarizeResponse(rec *CallRecord, body []byte, sse bool) {
+	rec.ThinkingDropped = bytes.Count(body, []byte(`"thinking_dropped"`))
 	names := map[int]string{}
 	apply := func(c callChunk) {
 		if c.Usage != nil && c.Usage.CompletionTokensDetails.ReasoningTokens > 0 {
