@@ -26,7 +26,15 @@ spec = importlib.util.spec_from_file_location("osw_grade", GRADE)
 g = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(g)
 
-DOMAINS = ["libreoffice_calc", "libreoffice_writer", "libreoffice_impress", "gimp"]
+# The LibreOffice domains are left out on purpose: the benchmark must not depend on LibreOffice,
+# neither as subject matter nor as a tool. Tasks elsewhere that involve it are skipped too.
+DOMAINS = ["gimp", "vs_code", "multi_apps"]
+# Tasks that need the internet: soma's sandbox is offline, so they cannot be compared fairly.
+NEEDS_NETWORK = {"acb0f96b": "clones a GitHub repository"}
+OFFICE_EXTENSIONS = (".xlsx", ".xls", ".ods", ".docx", ".doc", ".odt", ".pptx", ".ppt", ".odp", ".csv")
+
+sys.path.insert(0, HERE)
+from references import REFERENCES  # noqa: E402
 VM_ONLY_SETUP = {"execute", "command", "googledrive", "login", "chrome_open_tabs", "execute_with_verification"}
 
 
@@ -39,12 +47,26 @@ def run_grader(src, task_file, workspace, cache):
         return {"score": 0.0, "detail": "grader crashed: " + r.stderr[-200:]}
 
 
+def make_parent(path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    return path
+
+
 def consider(root, src, domain, task_file):
     t = json.load(open(task_file))
     cache = os.path.join(root, "cache", domain, t["id"])
     ev = t["evaluator"]
     if ev["func"] == "infeasible":
         raise g.Unsupported("infeasible-task check")
+    if t["id"][:8] in NEEDS_NETWORK:
+        raise g.Unsupported("needs the network: " + NEEDS_NETWORK[t["id"][:8]])
+    if any("libreoffice" in a.lower() for a in t.get("related_apps", [])):
+        raise g.Unsupported("involves LibreOffice")
+    results_cfg = ev["result"] if isinstance(ev.get("result"), list) else [ev.get("result")]
+    for r in results_cfg:
+        for p in (g.multi(r)[0] if r and r.get("type") == "vm_file" else []):
+            if p.lower().endswith(OFFICE_EXTENSIONS):
+                raise g.Unsupported("office-document result")
     inputs = []
     for c in t.get("config", []):
         if c["type"] == "download":
@@ -64,25 +86,40 @@ def consider(root, src, domain, task_file):
         seed = run_grader(src, task_file, ws, cache)
         if seed["detail"].startswith("unsupported"):
             raise g.Unsupported(seed["detail"][len("unsupported: "):])
-        if seed["score"] >= 1.0:
+        if seed["score"] >= g.PASS_SCORE:
             return "seed-passes", None
+        # Show the checker can be passed: with OSWorld's gold file when there is one, with the
+        # values a settings rule asks for, or with a held-out reference solution.
         res, exp = ev.get("result"), ev.get("expected")
         if isinstance(res, list):
             res, exp = res[0], (exp or [None])[0]
-        if not (exp and exp.get("type") == "cloud_file" and not exp.get("multi") and not res.get("multi")):
-            return "unverified", None  # no single gold file to check the pass side with
-        gold = g.fetch(exp["path"], os.path.join(cache, g.cache_name(exp["path"])))
-        result_path = g.vm_to_workspace(res["path"], ws)
-        os.makedirs(os.path.dirname(result_path), exist_ok=True)
-        shutil.copy(gold, result_path)
-        if run_grader(src, task_file, ws, cache)["score"] < 1.0:
-            return "gold-fails", None
+        verified_by = None
+        candidates = []
+        if exp and exp.get("type") == "cloud_file" and not exp.get("multi") and not res.get("multi"):
+            candidates.append(("gold", lambda: shutil.copy(
+                g.fetch(exp["path"], os.path.join(cache, g.cache_name(exp["path"]))), make_parent(g.vm_to_workspace(res["path"], ws)))))
+        if ev["func"] in ("check_json_settings", "check_json_keybindings") and exp and exp.get("type") == "rule":
+            want = exp["rules"]["expected"]
+            body = want if ev["func"] == "check_json_settings" else [want]
+            candidates.append(("rule", lambda: open(make_parent(g.vm_to_workspace(res["path"], ws)), "w").write(json.dumps(body))))
+        if t["id"][:8] in REFERENCES:
+            candidates.append(("reference", lambda: REFERENCES[t["id"][:8]](ws)))
+        for name, apply in candidates:
+            try:
+                apply()
+            except Exception as e:
+                return "reference-error", None
+            if run_grader(src, task_file, ws, cache)["score"] >= g.PASS_SCORE:
+                verified_by = name
+                break
+        if verified_by is None:
+            return ("unverified" if not candidates else "solution-fails"), None
         results = ev["result"] if isinstance(ev["result"], list) else [ev["result"]]
         result_files = sorted({os.path.relpath(g.vm_to_workspace(p, ws), ws) for r in results if r for p in g.multi(r)[0]})
         return "ok", {
             "id": t["id"], "domain": domain, "instruction": t["instruction"],
             "task_file": os.path.relpath(task_file, root), "cache": os.path.relpath(cache, root),
-            "inputs": entries, "results": result_files,
+            "inputs": entries, "results": result_files, "verified_by": verified_by,
         }
     finally:
         shutil.rmtree(ws, ignore_errors=True)

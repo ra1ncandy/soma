@@ -75,6 +75,18 @@ func (c SomaContestant) Run(ctx context.Context, cfg RunConfig, task Task, dir s
 		}
 		cmd.Env = append(cmd.Env, "SOMA_SANDBOX_RO_BINDS="+strings.Join(binds, ","))
 	}
+	if task.HomeIsWorkspace {
+		// Inside soma's sandbox the workspace is always mounted at /workspace.
+		sandboxEnv := "HOME=/workspace"
+		for i, kv := range cmd.Env {
+			if rest, ok := strings.CutPrefix(kv, "SOMA_SANDBOX_ENV="); ok {
+				sandboxEnv = rest + ";" + sandboxEnv
+				cmd.Env = append(cmd.Env[:i], cmd.Env[i+1:]...)
+				break
+			}
+		}
+		cmd.Env = append(cmd.Env, "SOMA_SANDBOX_ENV="+sandboxEnv)
+	}
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
@@ -162,6 +174,9 @@ func (c HermesContestant) Prepare(ctx context.Context, cfg RunConfig, task Task)
 		if t := task.Tools; t != nil && t.PythonPath != "" {
 			// Hermes runs commands on the host, so the libraries only need to be importable.
 			cmd.Env = append(cmd.Env, "PYTHONPATH="+t.PythonPath)
+		}
+		if task.HomeIsWorkspace {
+			cmd.Env = append(cmd.Env, "HOME="+dir)
 		}
 		out, err := cmd.CombinedOutput()
 		return string(out), err

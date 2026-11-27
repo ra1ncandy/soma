@@ -116,7 +116,7 @@ func newArenaCmd() *cobra.Command {
 			}
 			for _, t := range tasks {
 				if t.Tier == "osworld" {
-					rep.Notes = append(rep.Notes, "Tasks named osw-* are OSWorld tasks replicated on plain files: OSWorld's instruction (plus a note that no GUI is available), its starting files and its own checker functions, but no desktop VM. Only tasks whose checker reads files are included, and only those where the checker rejects the starting files and accepts OSWorld's gold file. A spreadsheet that fails as written is checked again after a LibreOffice re-save, mirroring OSWorld's save step. Both contestants get the same Python libraries (openpyxl, python-docx, python-pptx) and headless LibreOffice; soma reads them through read-only sandbox mounts. These scores are not comparable with the OSWorld leaderboard.")
+					rep.Notes = append(rep.Notes, "Tasks named osw-* are OSWorld tasks replicated on plain files: OSWorld's instruction (plus a note that there is no GUI and that the working directory is the home directory), its starting files and its own checker functions, but no desktop VM. Only tasks whose checker reads files are included, and only those where the checker rejects the starting files and was shown to be passable (OSWorld's gold file, the values a settings rule asks for, or a held-out reference solution). LibreOffice is not involved: its task domains are left out and nothing runs it. Tasks that need the network are left out. An attempt passes when the checker's score is at least 0.9 (most checkers answer 0 or 1; a few return a similarity); the raw score is in the per-attempt grader output. These scores are not comparable with the OSWorld leaderboard.")
 					break
 				}
 			}
@@ -138,7 +138,7 @@ func newArenaCmd() *cobra.Command {
 		},
 	}
 	run.Flags().StringVar(&taskIDs, "tasks", "", "Comma-separated task ids (overrides --tier)")
-	run.Flags().StringVar(&tier, "tier", "starter", "Task tier: starter, hard, all, or osworld (OSWorld tasks replicated on plain files)")
+	run.Flags().StringVar(&tier, "tier", "starter", "Task tier: starter, hard, all, or osworld (OSWorld tasks replicated on plain files, no VM)")
 	run.Flags().StringVar(&osworldDir, "osworld-dir", "", "Prepared OSWorld directory for --tier osworld (default ~/.local/share/soma-arena/osworld)")
 	run.Flags().IntVar(&limit, "limit", 0, "Run at most this many tasks, spread evenly over the selected ones (0 = all)")
 	run.Flags().BoolVar(&keep, "keep", false, "Keep every attempt's workspace, agent output and grader output under <out>/attempts")

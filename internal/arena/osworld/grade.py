@@ -6,7 +6,12 @@ directory, and calls the same metric functions OSWorld uses. Paths under /home/u
 map to the workspace root.
 
 Usage: grade.py --src <OSWorld checkout> --task <task.json> --workspace <dir> --cache <dir>
-Prints one JSON object {"score": float, "detail": str} and exits 0 only when score >= 1.
+Prints one JSON object {"score": float, "detail": str} and exits 0 only when the task passes.
+
+Most checkers answer 0 or 1. A few return a similarity between 0 and 1 (for example comparing an
+animated GIF with a reference frame by frame), where a correct result made with different
+encoder settings lands just under 1. OSWorld itself averages these scores; the arena needs a
+yes/no, so an attempt passes at PASS_SCORE or above. The raw score is always printed.
 """
 import argparse
 import hashlib
@@ -17,7 +22,8 @@ import sys
 import types
 import urllib.request
 
-METRIC_MODULES = ["table", "docs", "slides", "gimp", "general", "vscode", "pdf", "others"]
+PASS_SCORE = 0.9
+METRIC_MODULES = ["gimp", "vscode", "general", "animation", "table", "docs", "slides", "pdf", "others"]
 HOME_PREFIXES = ("/home/user/", "~/")
 
 
@@ -174,7 +180,7 @@ def main():
     except Exception as e:  # a checker crashing on the agent's file is a failed check
         out["detail"] = "%s: %s" % (type(e).__name__, e)
     print(json.dumps(out))
-    sys.exit(0 if out["score"] >= 1.0 else 1)
+    sys.exit(0 if out["score"] >= PASS_SCORE else 1)
 
 
 if __name__ == "__main__":

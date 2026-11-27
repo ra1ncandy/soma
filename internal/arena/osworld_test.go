@@ -17,7 +17,10 @@ func TestOSWorldGoalSaysItIsFileOnly(t *testing.T) {
 	}{Src: "cache/x/in.xlsx", Dest: "Book.xlsx"})
 	e.Results = []string{"Book.xlsx"}
 	goal := osworldGoal(e)
-	for _, want := range []string{"Make the header bold.", "no desktop or GUI", "Book.xlsx", "soffice --headless"} {
+	if strings.Contains(strings.ToLower(goal), "libreoffice") || strings.Contains(goal, "soffice") {
+		t.Errorf("the tier must not point contestants at LibreOffice:\n%s", goal)
+	}
+	for _, want := range []string{"Make the header bold.", "no desktop, GUI or application", "Book.xlsx", "home directory"} {
 		if !strings.Contains(goal, want) {
 			t.Errorf("goal lacks %q:\n%s", want, goal)
 		}
@@ -53,7 +56,7 @@ func TestOSWorldSeedFailsLive(t *testing.T) {
 		if err := task.Seed(dir); err != nil {
 			t.Fatalf("%s: seed: %v", task.ID, err)
 		}
-		if task.Tier != "osworld" || task.Tools == nil || !strings.HasPrefix(task.ID, "osw-") {
+		if task.Tier != "osworld" || !task.HomeIsWorkspace || !strings.HasPrefix(task.ID, "osw-") {
 			t.Fatalf("%s: unexpected task shape %+v", task.ID, task)
 		}
 		if ok, out := grade(context.Background(), task, dir); ok {
