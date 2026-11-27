@@ -60,7 +60,13 @@ type GenerateResponse struct {
 	OutputTokens     int                  `json:"output_tokens"`
 	CostUSD          float64              `json:"cost_usd"`
 	LatencyMS        int64                `json:"latency_ms"`
-	RawEmitted       []byte               `json:"-"`
+	// ProviderContent is the assistant content exactly as returned, when it must be replayed
+	// verbatim on later turns (see compiler.LogEntry.ProviderContent).
+	ProviderContent string `json:"provider_content,omitempty"`
+	// ThinkingDropped counts earlier thinking blocks the provider discarded on this request
+	// because the conversation before them had changed.
+	ThinkingDropped int    `json:"thinking_dropped,omitempty"`
+	RawEmitted      []byte `json:"-"`
 }
 
 // RateLimitError signals an HTTP 429 or subscription quota limit so the kernel can suspend cleanly.
@@ -113,6 +119,7 @@ type OpenAICompatProvider struct {
 	StreamIdleTimeout time.Duration
 
 	streamUnsupported atomic.Bool
+	effortLevel       atomic.Int32 // fallback level after the endpoint rejected reasoning_effort
 }
 
 // NewOpenAICompatProvider creates a client targeting baseURL (e.g. https://opencode.ai/zen/go/v1).
@@ -603,7 +610,18 @@ func appendUserMessage(msgs []map[string]any, text string) []map[string]any {
 	})
 }
 
+// providerContentKey carries a turn's verbatim provider content through the canonical message
+// list. It is only set by buildMessages when the caller asks for it, and must never be sent on
+// the wire as-is.
+const providerContentKey = "_provider_content"
+
 func buildOpenAIMessages(frame compiler.CompiledFrame, passReasoning bool) []map[string]any {
+	return buildMessages(frame, passReasoning, false)
+}
+
+// buildMessages is buildOpenAIMessages with the option to attach each tool turn's verbatim
+// provider content (for adapters that replay it, such as Anthropic's).
+func buildMessages(frame compiler.CompiledFrame, passReasoning, withProviderContent bool) []map[string]any {
 	if !frame.Structured {
 		return []map[string]any{
 			{"role": "system", "content": frame.Layer0 + "\n" + frame.Layer1},
@@ -630,6 +648,7 @@ func buildOpenAIMessages(frame compiler.CompiledFrame, passReasoning bool) []map
 			}
 			var asstContent string
 			var asstReasoning string
+			providerContent := entries[i].ProviderContent
 			toolCalls := make([]map[string]any, 0, j-i)
 			toolResps := make([]toolResp, 0, j-i)
 			for k := i; k < j; k++ {
@@ -670,6 +689,9 @@ func buildOpenAIMessages(frame compiler.CompiledFrame, passReasoning bool) []map
 			if passReasoning && asstReasoning != "" {
 				asstMsg["reasoning_content"] = asstReasoning
 			}
+			if withProviderContent && providerContent != "" {
+				asstMsg[providerContentKey] = providerContent
+			}
 			msgs = append(msgs, asstMsg)
 			for _, tr := range toolResps {
 				msgs = append(msgs, map[string]any{
@@ -704,7 +726,11 @@ func buildOpenAIMessages(frame compiler.CompiledFrame, passReasoning bool) []map
 
 	lastRole, _ := msgs[len(msgs)-1]["role"].(string)
 	hasViewport := frame.Tail.Viewport != nil && frame.Tail.Viewport.DataURI != ""
-	needsTail := hasViewport || frame.Tail.StallCount > 0 || (frame.Tail.StepBudgetRemaining > 0 && frame.Tail.StepBudgetRemaining <= 2) || frame.Tail.GitDiffStat != ""
+	// The live tail is rebuilt on every request. Notices the kernel already put in the log
+	// (NoticesInLog) need no tail of their own.
+	noticesInTail := !frame.Tail.NoticesInLog &&
+		((frame.Tail.StepBudgetRemaining > 0 && frame.Tail.StepBudgetRemaining <= 2) || frame.Tail.Notices() != "")
+	needsTail := hasViewport || frame.Tail.StallCount > 0 || noticesInTail || frame.Tail.GitDiffStat != ""
 	if needsTail {
 		if hasViewport {
 			parts := []map[string]any{
@@ -746,13 +772,17 @@ func (p *OpenAICompatProvider) Generate(ctx context.Context, req GenerateRequest
 		markCacheBreakpoints(msgs)
 	}
 	payload := map[string]any{
-		"model":       req.ModelID,
-		"messages":    msgs,
-		"temperature": 0.0,
-		"max_tokens":  maxToks,
+		"model":      req.ModelID,
+		"messages":   msgs,
+		"max_tokens": maxToks,
 	}
-	if effort := strings.TrimSpace(p.ReasoningEffort); effort != "" {
+	if effort := effortAtLevel(effectiveReasoningEffort(p.ReasoningEffort), p.effortLevel.Load()); effort != "" {
 		payload["reasoning_effort"] = effort
+	}
+	// Temperature is left to the provider unless configured: forcing 0 (greedy decoding) makes
+	// reasoning models fall into deterministic repetition loops that burn the whole output budget.
+	if t, ok := configuredTemperature(); ok {
+		payload["temperature"] = t
 	}
 	if p.EnableTools {
 		payload["tools"] = openAITools()
@@ -885,6 +915,22 @@ func (p *OpenAICompatProvider) Generate(ctx context.Context, req GenerateRequest
 			attempt--
 			continue
 		}
+		// An endpoint that rejects the effort setting is retried with a more widely accepted
+		// value, then without one; the outcome is remembered.
+		if sent, ok := payload["reasoning_effort"].(string); ok && rejectsReasoningEffort(statusCode, b) {
+			level := nextEffortLevel(sent)
+			p.effortLevel.Store(level)
+			if next := effortAtLevel(sent, level); next != "" {
+				payload["reasoning_effort"] = next
+			} else {
+				delete(payload, "reasoning_effort")
+			}
+			if body, err = marshal(streaming); err != nil {
+				return nil, err
+			}
+			attempt--
+			continue
+		}
 		if statusCode == http.StatusTooManyRequests && attempt < maxAttempts && ctx.Err() == nil {
 			if wait := parseRetryAfter(retryAfterHeader); retryAfterHeader != "" && wait <= maxInlineRateLimitWait && !waitedOnRateLimit {
 				waitedOnRateLimit = true
@@ -961,7 +1007,7 @@ func (p *OpenAICompatProvider) Generate(ctx context.Context, req GenerateRequest
 	msg := parsed.Choices[0].Message
 	content := strings.TrimSpace(msg.Content)
 	if len(msg.ToolCalls) == 0 && content == "" && parsed.Choices[0].FinishReason == "length" {
-		return nil, fmt.Errorf("openai-compat provider: response truncated (finish_reason=length at max_tokens=%d) before emitting content or tool_calls", maxToks)
+		return nil, &OutputTruncatedError{MaxTokens: maxToks}
 	}
 	calls := make([]wireToolCall, 0, len(msg.ToolCalls))
 	for _, rawTC := range msg.ToolCalls {

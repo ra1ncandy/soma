@@ -105,11 +105,17 @@ type LogEntry struct {
 	// interleaved-thinking models (DeepSeek, GLM, Kimi) keep their reasoning across tool round-trips.
 	// It is append-only within an epoch (cache-stable) and dropped at rollover.
 	ReasoningContent string `json:"reasoning_content,omitempty"`
-	Action           string `json:"action,omitempty"`
-	Reasoning        string `json:"reasoning,omitempty"`
-	Observation      string `json:"observation,omitempty"`
-	PageID           string `json:"page_id,omitempty"`
-	Masked           bool   `json:"masked,omitempty"`
+	// ProviderContent is the assistant turn's content blocks exactly as the provider returned
+	// them (a JSON array), kept on the first entry of a turn when it contains blocks that must be
+	// sent back unmodified, such as Anthropic thinking blocks with their signatures. Like
+	// ReasoningContent it is append-only within an epoch and dropped at rollover: those blocks
+	// are only valid after the exact conversation that produced them.
+	ProviderContent string `json:"provider_content,omitempty"`
+	Action          string `json:"action,omitempty"`
+	Reasoning       string `json:"reasoning,omitempty"`
+	Observation     string `json:"observation,omitempty"`
+	PageID          string `json:"page_id,omitempty"`
+	Masked          bool   `json:"masked,omitempty"`
 }
 
 // ViewportFrame describes the single ephemeral visual frame attached to Layer 3 (LiveTailState).
@@ -125,13 +131,63 @@ type ViewportFrame struct {
 	DataURI  string `json:"-"`
 }
 
+// ChecksRepeatingAfter is how many check-only turns in a row trigger the repeating-checks notice.
+const ChecksRepeatingAfter = 2
+
+// ChecksRepeating reports that the model keeps running commands that do not fail, without
+// editing anything in between: the point where more verification mostly costs tokens and time.
+func (t LiveTailState) ChecksRepeating() bool {
+	return t.PassingCheckStreak >= ChecksRepeatingAfter
+}
+
+// Notices is what the kernel has to tell the model this turn about its own run: that the turn
+// budget is nearly spent, or that it keeps re-running checks that pass. Empty when there is
+// nothing to say.
+func (t LiveTailState) Notices() string {
+	var b strings.Builder
+	if t.BudgetLow() {
+		fmt.Fprintf(&b, "TURN BUDGET LOW: %d of %d turns left. Stop exploring, adding tests or polishing. "+
+			"Make sure the requested change is complete and saved, verify it once, then finish with your summary.\n",
+			t.StepBudgetRemaining, t.StepBudgetTotal)
+	}
+	if t.ChecksRepeating() {
+		fmt.Fprintf(&b, "CHECKS REPEATING: your last %d turns only ran commands, none failed, and you have not edited anything since. "+
+			"If their output shows no problem, finish now with your summary instead of running more checks.\n", t.PassingCheckStreak)
+	}
+	return b.String()
+}
+
+// BudgetLow reports that the run is in its last quarter of turns (at least the last 3), when the
+// model must stop exploring and polishing and make sure the deliverable is complete. It is only
+// known for steps that recorded the total budget.
+func (t LiveTailState) BudgetLow() bool {
+	if t.StepBudgetTotal <= 0 || t.StepBudgetRemaining <= 0 {
+		return false
+	}
+	threshold := t.StepBudgetTotal / 4
+	if threshold < 3 {
+		threshold = 3
+	}
+	return t.StepBudgetRemaining <= threshold
+}
+
 // LiveTailState represents uncached Layer 3 telemetry rebuilt every turn.
 type LiveTailState struct {
-	WorkspaceKind       string         `json:"workspace_kind"`
-	GitDiffStat         string         `json:"git_diff_stat,omitempty"`
-	ResearchStatus      string         `json:"research_status,omitempty"`
-	LastOracleError     string         `json:"last_oracle_error,omitempty"`
-	StepBudgetRemaining int            `json:"step_budget_remaining"`
+	WorkspaceKind       string `json:"workspace_kind"`
+	GitDiffStat         string `json:"git_diff_stat,omitempty"`
+	ResearchStatus      string `json:"research_status,omitempty"`
+	LastOracleError     string `json:"last_oracle_error,omitempty"`
+	StepBudgetRemaining int    `json:"step_budget_remaining"`
+	// StepBudgetTotal is the turn budget of this run of the branch (0 = unknown, older steps).
+	StepBudgetTotal int `json:"step_budget_total,omitempty"`
+	// PassingCheckStreak counts consecutive turns that only ran commands, with no failure and no
+	// edit since the last one. See ChecksRepeating.
+	PassingCheckStreak int `json:"passing_check_streak,omitempty"`
+	// NoticesInLog means this turn's Notices were appended to Layer 2 as a log entry, so Layer 3
+	// must not repeat them. Kept in the log they stay where they were said; shown only in the
+	// live tail they would vanish from the next request, and providers that sign the model's
+	// reasoning against the conversation so far (Anthropic) would then discard that reasoning.
+	NoticesInLog        bool           `json:"notices_in_log,omitempty"`
 	AccountQuotaSummary string         `json:"account_quota_summary,omitempty"`
 	StallCount          int            `json:"stall_count"`
 	MaxStalls           int            `json:"max_stalls"`
@@ -385,6 +441,9 @@ func Compile(snap EpochSnapshot, l2 []LogEntry, tail LiveTailState, profile Mode
 	}
 	fmt.Fprintf(&l3Buf, "budget_remaining: %d | stalls: %d/%d | quota: %s\n",
 		tail.StepBudgetRemaining, tail.StallCount, tail.MaxStalls, tail.AccountQuotaSummary)
+	if !tail.NoticesInLog {
+		l3Buf.WriteString(tail.Notices())
+	}
 
 	l0 := snap.Layer0Text
 	l1 := snap.Layer1Text
@@ -529,6 +588,7 @@ func Rollover(
 			if keepRecentTurnMin >= 0 && e.TurnIndex >= keepRecentTurnMin && !e.Masked {
 				recent := e
 				recent.ReasoningContent = ""
+				recent.ProviderContent = ""
 				if len(recent.Observation) > 2048 {
 					recent.Observation = recent.Observation[:2045] + "..."
 				}

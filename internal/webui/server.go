@@ -453,6 +453,11 @@ func (s *Server) Handler() http.Handler {
 			http.NotFound(w, r)
 			return
 		}
+		if strings.HasPrefix(path, "/v1/") {
+			// OpenAI-compatible API (openai_api.go): bearer-key auth instead of browser CSRF.
+			s.serveOpenAIAPI(w, r, path)
+			return
+		}
 		if path == "/desktop-vnc" || strings.HasPrefix(path, "/desktop-vnc/") {
 			if s.activeAuthToken() != "" && !s.validAuth(r) {
 				http.Error(w, "unauthorized", http.StatusUnauthorized)

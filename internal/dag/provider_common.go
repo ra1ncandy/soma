@@ -3,8 +3,98 @@ package dag
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 )
+
+// configuredTemperature reads SOMA_TEMPERATURE; unset means "use the provider's default".
+func configuredTemperature() (float64, bool) {
+	s := strings.TrimSpace(os.Getenv("SOMA_TEMPERATURE"))
+	if s == "" {
+		return 0, false
+	}
+	t, err := strconv.ParseFloat(s, 64)
+	if err != nil || t < 0 || t > 2 {
+		return 0, false
+	}
+	return t, true
+}
+
+// DefaultReasoningEffort is what soma asks of reasoning models unless configured otherwise. An
+// agent loop makes many small decisions and can check them against tool results, so long hidden
+// deliberation on every turn mostly buys output tokens and latency: in the arena's hard tier,
+// low effort cut output tokens and wall time by more than half with no loss in pass rate, and
+// "minimal" cut them further; no reasoning at all ("none") started failing the hardest tasks.
+const DefaultReasoningEffort = "minimal"
+
+// effectiveReasoningEffort resolves the effort to request: the explicit setting, then
+// SOMA_REASONING_EFFORT, then DefaultReasoningEffort. "provider" (or "default") means "send
+// nothing and let the provider decide".
+func effectiveReasoningEffort(explicit string) string {
+	e := strings.ToLower(strings.TrimSpace(explicit))
+	if e == "" {
+		e = strings.ToLower(strings.TrimSpace(os.Getenv("SOMA_REASONING_EFFORT")))
+	}
+	switch e {
+	case "":
+		return DefaultReasoningEffort
+	case "provider", "default":
+		return ""
+	}
+	return e
+}
+
+// Effort fallback levels, remembered per provider after an endpoint rejects the setting.
+const (
+	effortAsConfigured int32 = iota
+	effortDowngraded         // "minimal" is not accepted everywhere: send "low" instead
+	effortOmitted            // the endpoint takes no effort setting at all
+)
+
+// effortAtLevel is the effort to send once an endpoint has rejected earlier attempts.
+func effortAtLevel(effort string, level int32) string {
+	switch {
+	case level >= effortOmitted:
+		return ""
+	case level == effortDowngraded:
+		return "low"
+	}
+	return effort
+}
+
+// nextEffortLevel picks the fallback after effort was rejected: "minimal" steps down to "low"
+// first, anything else is dropped.
+func nextEffortLevel(rejected string) int32 {
+	if rejected == "minimal" {
+		return effortDowngraded
+	}
+	return effortOmitted
+}
+
+// rejectsReasoningEffort reports whether a 4xx body says the endpoint or model does not accept a
+// reasoning-effort setting, so the caller can retry without it.
+func rejectsReasoningEffort(status int, body []byte) bool {
+	if status != 400 && status != 404 && status != 422 {
+		return false
+	}
+	b := strings.ToLower(string(body))
+	return strings.Contains(b, "reasoning_effort") || strings.Contains(b, "reasoning.effort") ||
+		(strings.Contains(b, "reasoning") && (strings.Contains(b, "unsupported") || strings.Contains(b, "not supported") ||
+			strings.Contains(b, "unrecognized") || strings.Contains(b, "unknown") || strings.Contains(b, "extra inputs")))
+}
+
+// OutputTruncatedError means the model spent its whole output budget (often on hidden reasoning)
+// without emitting any text or tool call. The executor treats it as a wasted turn and tells the
+// model, instead of failing the run.
+type OutputTruncatedError struct {
+	MaxTokens int
+	Reason    string
+}
+
+func (e *OutputTruncatedError) Error() string {
+	return fmt.Sprintf("model output truncated at max_tokens=%d before emitting content or tool calls %s", e.MaxTokens, e.Reason)
+}
 
 // wireToolCall is a tool call as decoded from any provider protocol.
 type wireToolCall struct {

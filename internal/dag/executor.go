@@ -211,17 +211,19 @@ type EmittedPayload struct {
 
 // Executor drives the Merkle DAG execution loop with durable 2-phase journaling and @page context VM.
 type Executor struct {
-	Store               *store.Store
-	VM                  *vmem.Manager
-	Memory              *memory.Service
-	Blackboard          *Blackboard
-	Workspace           *workspace.Manager
-	Scheduler           *QuotaScheduler
-	Provider            ModelProvider
-	Tools               ToolRunner
-	Reconciler          ActionReconciler
-	Verifier            ContractVerifier
-	Profile             compiler.ModelProfile
+	Store      *store.Store
+	VM         *vmem.Manager
+	Memory     *memory.Service
+	Blackboard *Blackboard
+	Workspace  *workspace.Manager
+	Scheduler  *QuotaScheduler
+	Provider   ModelProvider
+	Tools      ToolRunner
+	Reconciler ActionReconciler
+	Verifier   ContractVerifier
+	Profile    compiler.ModelProfile
+	// NoWorkspaceOverview stops a fresh run from starting with the workspace's file list.
+	NoWorkspaceOverview bool
 	SystemPrompt        string
 	MaxLayer1Memories   int
 	AccountIDs          []string
@@ -775,9 +777,23 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 		pendingDeltaAppends = recoveredAppends
 	}
 
+	// A fresh run starts with the workspace's file list already in Layer 2 (append-only, so the
+	// frozen prefix is untouched): the model can read what matters on its first call.
+	if branch.HeadStepID == "" && len(l2) == 0 && !e.NoWorkspaceOverview {
+		if overview := workspaceOverview(branch.WorkspaceDir); overview != "" {
+			notice := compiler.LogEntry{Kind: "rule_notice", Name: "workspace_files", TurnIndex: nextTurn, Observation: overview}
+			l2 = append(l2, notice)
+			pendingDeltaAppends = append(pendingDeltaAppends, notice)
+		}
+	}
+
 	lastStateHash := ""
 	prevStateHash := ""
 	lastOracleError := ""
+	consecutiveTruncations := 0
+	// Verification that keeps passing without any edit in between is tracked so the live tail can
+	// tell the model to stop (see compiler.LiveTailState.ChecksRepeating).
+	editedThisRun, passingCheckStreak := false, 0
 	var currentViewport *compiler.ViewportFrame
 	if branch.HeadStepID != "" {
 		if hs, err := e.Store.GetStep(ctx, branch.HeadStepID); err == nil {
@@ -847,10 +863,21 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 			ResearchStatus:      fmt.Sprintf("workspace=%s (%s)", filepath.Base(branch.WorkspaceDir), branch.WorkspaceStrategy),
 			LastOracleError:     lastOracleError,
 			StepBudgetRemaining: maxTurns - turn,
+			StepBudgetTotal:     maxTurns,
+			PassingCheckStreak:  passingCheckStreak,
 			AccountQuotaSummary: fmt.Sprintf("%s:%s", acc.ID, acc.ModelID),
 			StallCount:          branch.StallCount,
 			MaxStalls:           e.Profile.MaxStalls,
 			Viewport:            currentViewport,
+		}
+
+		// What the kernel has to say about the run goes into Layer 2, append-only, where it stays
+		// for later turns (see LiveTailState.NoticesInLog).
+		if notice := tail.Notices(); notice != "" {
+			entry := compiler.LogEntry{Kind: "rule_notice", Name: "live_tail", TurnIndex: nextTurn, Observation: strings.TrimSpace(notice)}
+			l2 = append(l2, entry)
+			pendingDeltaAppends = append(pendingDeltaAppends, entry)
+			tail.NoticesInLog = true
 		}
 
 		// Drain any pending cross-agent Blackboard findings/graveyard notices into Layer 2 (keeping Layer 0+1 frozen).
@@ -911,6 +938,24 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 			TurnIndex: nextTurn,
 			Frame:     frame,
 		})
+		var truncated *OutputTruncatedError
+		if errors.As(genErr, &truncated) && consecutiveTruncations < 2 {
+			// The model used its entire output budget without producing anything. Count the turn,
+			// tell the model what happened (appended to Layer 2, cache-safe), and try again.
+			consecutiveTruncations++
+			_ = e.releaseLease(ctx, acc.ID, 0)
+			notice := compiler.LogEntry{
+				Kind:      "rule_notice",
+				TurnIndex: nextTurn,
+				Observation: fmt.Sprintf("[soma] Your previous response hit the %d-token output limit before producing any text or tool call, so it was discarded. "+
+					"Respond now with a single concrete tool call. Keep reasoning brief, and write large files in parts (fs_write a skeleton, then fs_patch or further writes) instead of one huge call.", truncated.MaxTokens),
+			}
+			l2 = append(l2, notice)
+			pendingDeltaAppends = append(pendingDeltaAppends, notice)
+			res.TurnsExecuted++
+			continue
+		}
+		consecutiveTruncations = 0
 		if genErr != nil {
 			var rlErr *RateLimitError
 			var outage *TransientError
@@ -1284,6 +1329,7 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 			wg.Wait()
 		}
 
+		turnEdited, turnChecked, turnFailed := false, false, false
 		for idx, pc := range planned {
 			tc := pc.spec
 			var obsText, obsPageID string
@@ -1374,12 +1420,24 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 				hasCommittedAction = true
 			}
 
+			switch tc.Name {
+			case "fs_write", "fs_patch":
+				turnEdited = true
+			case "exec", "execute_code", "bg_exec", "bg_poll":
+				turnChecked = true
+			}
+			if observationFailed(obsText) {
+				turnFailed = true
+			}
+
 			entryReasoning := genResp.Reasoning
 			asstContent := ""
 			asstReasoningContent := ""
+			providerContent := ""
 			if idx == 0 {
 				asstContent = genResp.AssistantContent
 				asstReasoningContent = genResp.ReasoningContent
+				providerContent = genResp.ProviderContent
 			} else {
 				entryReasoning = fmt.Sprintf("batched tool call (%d/%d)", idx+1, len(planned))
 			}
@@ -1395,11 +1453,21 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 				ArgsJSON:         tc.ArgsJSON,
 				AssistantContent: asstContent,
 				ReasoningContent: asstReasoningContent,
+				ProviderContent:  providerContent,
 				Reasoning:        entryReasoning,
 				Action:           fmt.Sprintf("%s(%s)", tc.Name, tc.ArgsJSON),
 				Observation:      obsText,
 				PageID:           obsPageID,
 			})
+		}
+
+		switch {
+		case turnEdited:
+			editedThisRun, passingCheckStreak = true, 0
+		case turnFailed:
+			passingCheckStreak = 0
+		case turnChecked && editedThisRun:
+			passingCheckStreak++
 		}
 
 		nextPending := appendDynamicEntries(nextTurn, genResp, turnEntries...)
@@ -2078,14 +2146,22 @@ func strconvUnquote(s string) (string, error) {
 	return out, nil
 }
 
+// offlineSandboxRule is appended to the kernel prompt when exec has no network access.
+const offlineSandboxRule = " (9) exec, bg_exec and execute_code run offline in this session: installs and downloads (pip, npm, curl, git clone) cannot work, so do not attempt them — use what is already installed."
+
 func defaultKernelSystemPrompt() string {
-	return "You are soma, executing inside an isolated branch workspace. Available workspace tools: fs_list, fs_grep, fs_read(path, start_line?, end_line?), fs_write, fs_patch, exec(command, timeout_sec?), bg_exec, bg_poll(job_id, wait_seconds?), bg_kill, page_grep(page_id, pattern, context_lines?, ignore_case?), page_slice, page_search, memory_search, publish_finding, web_extract, desktop_task(goal, start_url?). Efficiency & rigor rules: (0) Match effort and response length to the request: answer simple questions, greetings, or quick queries directly and concisely (1–3 sentences) without running unnecessary workspace tools or writing long reports; only use tools when the user asks you to inspect, build, edit, run, or verify something in the workspace. (1) Batch independent read-only calls (fs_list, fs_grep, fs_read, page_grep, page_slice) in a single turn — they execute in parallel. (2) Use relative paths inside `/workspace` (e.g. `artifacts/...`) — `/workspace` is shared with the Virtual Desktop (`desktop_task`), whereas `/tmp` is separate per container. (3) Use fs_grep to locate symbols or configs instead of reading whole directories; prefer fs_patch for targeted edits to existing files. (4) For heavy compute or servers, pass timeout_sec to exec (up to 300s) or use bg_exec + bg_poll. (5) For websites, UIs, or desktop apps, call desktop_task(goal, start_url?) directly — the host auto-starts the Virtual Desktop (server name is `docker-desktop` if using mcp_call; never run `docker` inside exec). (6) For complex engineering tasks, verify edge cases with tests before finishing, then summarize concisely."
+	return "You are soma, executing inside an isolated branch workspace. Available workspace tools: fs_list, fs_grep, fs_read(path, start_line?, end_line?), fs_write, fs_patch, exec(command, timeout_sec?), bg_exec, bg_poll(job_id, wait_seconds?), bg_kill, page_grep(page_id, pattern, context_lines?, ignore_case?), page_slice, page_search, memory_search, publish_finding, web_extract, desktop_task(goal, start_url?). Efficiency & rigor rules: (0) Match effort and response length to the request: answer simple questions, greetings, or quick queries directly and concisely (1–3 sentences) without running unnecessary workspace tools or writing long reports; only use tools when the user asks you to inspect, build, edit, run, or verify something in the workspace. (1) Every turn is a round trip, so make each one count: a turn can carry several tool calls. Read-only calls (fs_list, fs_grep, fs_read, page_grep, page_slice) run in parallel — read everything you expect to need at once. A turn that also writes or executes runs its calls in the order given, so put an edit, any further edits, and the command that checks them in the same turn instead of one call per turn. (2) Use relative paths inside `/workspace` (e.g. `artifacts/...`) — `/workspace` is shared with the Virtual Desktop (`desktop_task`), whereas `/tmp` is separate per container. (3) Use fs_grep to locate symbols or configs instead of reading whole directories; prefer fs_patch for targeted edits to existing files. (4) For heavy compute or servers, pass timeout_sec to exec (up to 300s) or use bg_exec + bg_poll. (5) For websites, UIs, or desktop apps, call desktop_task(goal, start_url?) directly — the host auto-starts the Virtual Desktop (server name is `docker-desktop` if using mcp_call; never run `docker` inside exec). (6) Verify once, in proportion: run the project's existing tests, and check requirements they do not cover with one short script through exec or execute_code. When the checks pass, finish. Do not re-verify what already passed, add test files, fuzzers or benchmarks, or rewrite code that works, unless the task asks for them; remove scratch files you created. Write a requested document once, at the length asked (\"short\" means a few plain sentences, no tables), and do not revise its wording afterwards. (7) Your hidden reasoning is discarded after each turn, so keep it short: settle the design, then write code only in tool arguments — never draft file contents in reasoning first. If a decision must survive to later turns, state it in one or two visible sentences. (8) End with a summary of at most three sentences: what was wrong, what you changed, how you verified it. Do not repeat a document you just wrote."
 }
 
 func (e *Executor) buildEpochInput(run store.Run, activeMem []compiler.MemoryEntry, grave []compiler.GraveyardEntry) compiler.EpochInput {
 	sys := e.SystemPrompt
 	if sys == "" {
 		sys = defaultKernelSystemPrompt()
+		// Shell commands are network-isolated unless the runner was started with network access.
+		// Saying so up front stops the model from waiting minutes on installs that cannot succeed.
+		if lt, ok := e.Tools.(*LocalToolRunner); ok && !lt.AllowSandboxNetwork {
+			sys += offlineSandboxRule
+		}
 	}
 	somaDir := ""
 	if e.Store != nil {

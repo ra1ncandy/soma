@@ -39,6 +39,8 @@ func NewRootCmd() *cobra.Command {
 	root := &cobra.Command{
 		Use:   "soma",
 		Short: "soma — A Durable, Replayable, Capability-Scoped Agent Kernel",
+		// Runtime errors are not usage errors: print the error, not the help text.
+		SilenceUsage: true,
 	}
 
 	root.AddCommand(

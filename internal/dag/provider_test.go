@@ -833,7 +833,8 @@ func TestOpenAICompatProvider_ReasoningEffortAndTruncatedLengthError(t *testing.
 			Layer3: "tail",
 		},
 	})
-	if err == nil || !strings.Contains(err.Error(), "finish_reason=length") {
+	var trErr *dag.OutputTruncatedError
+	if !errors.As(err, &trErr) || trErr.MaxTokens != 16384 {
 		t.Fatalf("expected finish_reason=length error on truncated empty response, got err=%v", err)
 	}
 	if gotBody["reasoning_effort"] != "high" {

@@ -34,6 +34,8 @@ type ExecSpec struct {
 	// EgressSocket, when set with AllowNetwork, gives the sandbox internet access only through
 	// the host EgressProxy at this unix socket; the sandbox keeps its own network namespace.
 	EgressSocket string
+	// ToolMounts are extra read-only host paths (operator-configured toolchains). See toolpaths.go.
+	ToolMounts []ToolMount
 }
 
 // rpcSandboxDir is where bwrap mounts the directory holding RPCSocket.
@@ -144,6 +146,10 @@ func (m *Manager) Exec(ctx context.Context, spec ExecSpec) (ExecResult, error) {
 	if spec.Command == "" {
 		return ExecResult{}, errors.New("sandbox: command is required")
 	}
+	spec, err := withOperatorTools(spec)
+	if err != nil {
+		return ExecResult{}, err
+	}
 	spec = m.withEgress(spec)
 	for _, b := range m.Backends {
 		if b == nil || !b.Available() {
@@ -172,6 +178,10 @@ type CommandBackend interface {
 func (m *Manager) Command(ctx context.Context, spec ExecSpec) (*exec.Cmd, string, error) {
 	if spec.Command == "" {
 		return nil, "", errors.New("sandbox: command is required")
+	}
+	spec, err := withOperatorTools(spec)
+	if err != nil {
+		return nil, "", err
 	}
 	spec = m.withEgress(spec)
 	for _, b := range m.Backends {

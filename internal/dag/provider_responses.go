@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -22,6 +23,8 @@ type ResponsesProvider struct {
 	ReasoningEffort string
 	// ExtraHeaders are sent on every request (e.g. account routing headers of a subscription backend).
 	ExtraHeaders map[string]string
+
+	effortLevel atomic.Int32 // fallback level after the endpoint rejected reasoning.effort
 }
 
 // NewResponsesProvider creates a Responses API client.
@@ -101,8 +104,9 @@ func (p *ResponsesProvider) Generate(ctx context.Context, req GenerateRequest) (
 	if p.MaxOutputTokens > 0 {
 		payload["max_output_tokens"] = p.MaxOutputTokens
 	}
-	if e := strings.TrimSpace(p.ReasoningEffort); e != "" {
-		payload["reasoning"] = map[string]any{"effort": e}
+	effortSent := effortAtLevel(effectiveReasoningEffort(p.ReasoningEffort), p.effortLevel.Load())
+	if effortSent != "" {
+		payload["reasoning"] = map[string]any{"effort": effortSent}
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -140,6 +144,21 @@ func (p *ResponsesProvider) Generate(ctx context.Context, req GenerateRequest) (
 		_ = resp.Body.Close()
 		if resp.StatusCode == http.StatusOK {
 			break
+		}
+		if effortSent != "" && rejectsReasoningEffort(resp.StatusCode, raw) {
+			// Retried with a more widely accepted value, then without one; remembered.
+			level := nextEffortLevel(effortSent)
+			p.effortLevel.Store(level)
+			if effortSent = effortAtLevel(effortSent, level); effortSent != "" {
+				payload["reasoning"] = map[string]any{"effort": effortSent}
+			} else {
+				delete(payload, "reasoning")
+			}
+			if body, err = json.Marshal(payload); err != nil {
+				return nil, err
+			}
+			attempt--
+			continue
 		}
 		switch {
 		case resp.StatusCode == http.StatusTooManyRequests:
@@ -210,7 +229,7 @@ func (p *ResponsesProvider) Generate(ctx context.Context, req GenerateRequest) (
 		}
 	}
 	if len(calls) == 0 && strings.TrimSpace(text.String()) == "" && parsed.IncompleteDetails != nil {
-		return nil, fmt.Errorf("responses: incomplete response (%s) before emitting content or tool calls", parsed.IncompleteDetails.Reason)
+		return nil, &OutputTruncatedError{MaxTokens: p.MaxOutputTokens, Reason: parsed.IncompleteDetails.Reason}
 	}
 	if onDelta := deltaSink(ctx, nil); onDelta != nil && text.Len() > 0 {
 		onDelta(text.String())

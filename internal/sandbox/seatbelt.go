@@ -48,6 +48,10 @@ func GenerateSBPL(spec ExecSpec) string {
 	b.WriteString("(deny file-read* (regex #\"^.*/\\.ssh(/.*)?$\"))\n")
 	b.WriteString("(deny file-read* (regex #\"^.*/\\.aws(/.*)?$\"))\n")
 	b.WriteString("(deny file-read* (regex #\"^.*/\\.gnupg(/.*)?$\"))\n")
+	// Operator-configured toolchains stay readable even under /Users (no remapping on macOS).
+	for _, m := range spec.ToolMounts {
+		fmt.Fprintf(&b, "(allow file-read* (subpath %q))\n", m.Host)
+	}
 	b.WriteString("(deny file-write*)\n")
 	b.WriteString("(allow file-write* (subpath \"/tmp\"))\n")
 	b.WriteString("(allow file-write* (subpath \"/private/tmp\"))\n")

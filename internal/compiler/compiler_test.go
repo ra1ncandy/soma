@@ -262,3 +262,13 @@ func TestHybridRolloverAndExactFrameReconstruction(t *testing.T) {
 		t.Fatalf("expected skeleton reasoning + masked observation, got: %s", formatLogEntry(nextL2[0]))
 	}
 }
+
+func TestLiveTailRepeatingChecksNotice(t *testing.T) {
+	snap := NewEpochSnapshot(1, EpochInput{TaskGoal: "x"})
+	for streak, want := range map[int]bool{0: false, 1: false, ChecksRepeatingAfter: true, 5: true} {
+		frame := Compile(snap, nil, LiveTailState{PassingCheckStreak: streak}, WorkerProfile())
+		if got := strings.Contains(frame.Layer3, "CHECKS REPEATING"); got != want {
+			t.Errorf("streak %d: notice=%v, want %v", streak, got, want)
+		}
+	}
+}
