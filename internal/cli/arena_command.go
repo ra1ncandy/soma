@@ -27,6 +27,7 @@ func newArenaCmd() *cobra.Command {
 		hermesEffort                                                                               string
 		osworldDir                                                                                 string
 		hermesUncontained                                                                          bool
+		memoryMax                                                                                  string
 		limit                                                                                      int
 	)
 	run := &cobra.Command{
@@ -42,6 +43,14 @@ func newArenaCmd() *cobra.Command {
 			key := os.Getenv(keyEnv)
 			if key == "" {
 				return fmt.Errorf("set the API key in $%s (it is injected by the proxy; contestants never see it)", keyEnv)
+			}
+			memoryNote := "Each contestant's process tree is limited to " + memoryMax + " of memory (no swap)."
+			if strings.TrimSpace(memoryMax) == "" {
+				memoryNote = "No memory cap was applied to contestants."
+			} else if !arena.MemoryCapAvailable() {
+				memoryMax = ""
+				memoryNote = "No memory cap was applied to contestants: this machine has no systemd user session that accepts transient scopes."
+				fmt.Fprintln(cmd.ErrOrStderr(), "warning: --contestant-memory-max cannot be enforced here (no usable systemd user session); contestants run without a memory cap")
 			}
 			tasks, err := selectArenaTasks(tier, taskIDs, osworldDir, limit)
 			if err != nil {
@@ -82,7 +91,7 @@ func newArenaCmd() *cobra.Command {
 			out := cmd.OutOrStdout()
 			runner := &arena.Runner{
 				Proxy:       proxy,
-				Config:      arena.RunConfig{ProxyBaseURL: proxy.BaseURL(), Model: model, WallClock: time.Duration(wallMinutes) * time.Minute},
+				Config:      arena.RunConfig{ProxyBaseURL: proxy.BaseURL(), Model: model, WallClock: time.Duration(wallMinutes) * time.Minute, MemoryMax: memoryMax},
 				Contestants: cs,
 				Tasks:       tasks,
 				Repeats:     repeats,
@@ -112,6 +121,7 @@ func newArenaCmd() *cobra.Command {
 					"Hermes' turn limit (agent.max_turns) and soma's --max-turns are both set to the task's call budget.",
 					"Each Hermes attempt gets a fresh HERMES_HOME (no memory or history from other attempts). Before the clock starts, Hermes answers one trivial prompt served locally by the proxy, so its first-run setup and gateway start-up are neither timed nor billed. soma has no such setup; its start-up is inside its timed run.",
 					hermesEffortNote(hermesEffort),
+					memoryNote,
 					fmt.Sprintf("Prices used for the spend cap (USD per 1M tokens): input %.4g, cached input %.4g, output %.4g.", priceIn, priceCached, priceOut),
 				},
 			}
@@ -156,6 +166,7 @@ func newArenaCmd() *cobra.Command {
 	run.Flags().StringVar(&somaBin, "soma-bin", "", "soma binary (default: this binary)")
 	run.Flags().StringArrayVar(&somaEnv, "soma-env", nil, "Extra SOMA_NAME=value setting for the soma contestant (repeatable), for comparing configurations")
 	run.Flags().StringVar(&hermesBin, "hermes-bin", "", "Installed hermes launcher")
+	run.Flags().StringVar(&memoryMax, "contestant-memory-max", "8G", "Memory cap for each contestant's process tree (systemd scope); empty disables it")
 	run.Flags().BoolVar(&hermesUncontained, "hermes-uncontained", false, "Run Hermes directly on this machine instead of in a mount namespace that hides your home directory (it runs with --yolo: it can then write anywhere you can)")
 	run.Flags().StringVar(&hermesEffort, "hermes-reasoning-effort", "", "Set Hermes' agent.reasoning_effort (default: leave Hermes' own default)")
 	run.Flags().StringVar(&hermesHome, "hermes-home", "", "Installed HERMES_HOME (for --version)")

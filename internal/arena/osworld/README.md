@@ -18,7 +18,10 @@ What is included:
 - No tasks whose checker expects exactly what the GUI would have written when the instruction
   does not say it (`NOT_FAITHFUL` in `prepare.py` lists them with the reason).
 
-Today that is 15 tasks: 9 image edits (GIMP domain), 5 VS Code settings or text edits and 1
+- No tasks that are too heavy for a workstation (`TOO_HEAVY`): background removal made
+  contestants download gigabytes of models and use over 13 GB of memory.
+
+Today that is 14 tasks: 8 image edits (GIMP domain), 5 VS Code settings or text edits and 1
 multi-app task (animated GIF from a video).
 
 The workspace is mounted as the contestant's home directory. Hermes, which otherwise runs on the

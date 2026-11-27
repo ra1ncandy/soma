@@ -178,3 +178,30 @@ func TestHermesContainmentLive(t *testing.T) {
 		}
 	}
 }
+
+// A capped contestant that touches more memory than its limit is killed; one that stays under
+// it runs normally.
+func TestCapMemoryLive(t *testing.T) {
+	if !MemoryCapAvailable() {
+		t.Skip("no systemd user session for transient scopes")
+	}
+	py, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 not available")
+	}
+	small := exec.Command(py, "-c", "print('fine')")
+	capMemory(small, "256M")
+	if out, err := small.CombinedOutput(); err != nil || !strings.Contains(string(out), "fine") {
+		t.Fatalf("a small job must run under the cap: %v %s", err, out)
+	}
+	big := exec.Command(py, "-c", "b = b'x' * (700 * 1024 * 1024); print('SURVIVED')")
+	capMemory(big, "256M")
+	if out, err := big.CombinedOutput(); err == nil || strings.Contains(string(out), "SURVIVED") {
+		t.Fatalf("a job over the cap must be killed, got err=%v out=%s", err, out)
+	}
+	uncapped := exec.Command(py, "-c", "print('x')")
+	capMemory(uncapped, "")
+	if filepath.Base(uncapped.Path) != filepath.Base(py) {
+		t.Fatalf("an empty cap must leave the command alone, got %s", uncapped.Path)
+	}
+}

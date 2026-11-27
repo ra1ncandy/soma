@@ -37,6 +37,11 @@ NOT_FAITHFUL = {
     "ec71221e": "says 'indent by one tab' but the gold file has four spaces, as VS Code inserts",
     "ea98c5d7": "expects the exact 'when' clause VS Code writes when a default shortcut is removed",
 }
+# Tasks that are unsafe or pointless to run on the operator's machine.
+TOO_HEAVY = {
+    "2a729ded": "background removal needs a segmentation model: contestants downloaded 1.3 GB of "
+                "models and one script used 13.6 GB of memory; no contestant passed it",
+}
 OFFICE_EXTENSIONS = (".xlsx", ".xls", ".ods", ".docx", ".doc", ".odt", ".pptx", ".ppt", ".odp", ".csv")
 
 sys.path.insert(0, HERE)
@@ -66,6 +71,8 @@ def consider(root, src, domain, task_file):
         raise g.Unsupported("infeasible-task check")
     if t["id"][:8] in NEEDS_NETWORK:
         raise g.Unsupported("needs the network: " + NEEDS_NETWORK[t["id"][:8]])
+    if t["id"][:8] in TOO_HEAVY:
+        raise g.Unsupported("too heavy: " + TOO_HEAVY[t["id"][:8]])
     if t["id"][:8] in NOT_FAITHFUL:
         raise g.Unsupported("not faithful without the GUI: " + NOT_FAITHFUL[t["id"][:8]])
     if any("libreoffice" in a.lower() for a in t.get("related_apps", [])):

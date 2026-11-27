@@ -22,6 +22,36 @@ type RunConfig struct {
 	ProxyBaseURL string
 	Model        string
 	WallClock    time.Duration
+	// MemoryMax caps the memory of each contestant's whole process tree (for example "8G");
+	// empty means no cap. See capMemory.
+	MemoryMax string
+}
+
+// MemoryCapAvailable reports whether contestants can be given a memory cap on this machine: a
+// systemd user session that accepts transient scopes.
+func MemoryCapAvailable() bool {
+	bin, err := exec.LookPath("systemd-run")
+	if err != nil {
+		return false
+	}
+	return exec.Command(bin, "--user", "--scope", "--quiet", "--collect", "--", "true").Run() == nil
+}
+
+// capMemory makes cmd run in a transient systemd scope limited to max memory, with no swap, so a
+// contestant that loads a huge model or leaks is killed instead of exhausting the operator's
+// machine (one image task's script reached 13.6 GB). The scope covers every process the
+// contestant starts. It is a no-op when max is empty or systemd-run is missing.
+func capMemory(cmd *exec.Cmd, max string) {
+	if strings.TrimSpace(max) == "" {
+		return
+	}
+	bin, err := exec.LookPath("systemd-run")
+	if err != nil {
+		return
+	}
+	cmd.Args = append([]string{bin, "--user", "--scope", "--quiet", "--collect",
+		"-p", "MemoryMax=" + max, "-p", "MemorySwapMax=0", "--", cmd.Path}, cmd.Args[1:]...)
+	cmd.Path = bin
 }
 
 // preparer is implemented by contestants that need untimed setup before an attempt (for example
@@ -89,6 +119,7 @@ func (c SomaContestant) Run(ctx context.Context, cfg RunConfig, task Task, dir s
 		}
 		cmd.Env = append(cmd.Env, "SOMA_SANDBOX_ENV="+sandboxEnv)
 	}
+	capMemory(cmd, cfg.MemoryMax)
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
@@ -182,6 +213,7 @@ func (c HermesContestant) Prepare(ctx context.Context, cfg RunConfig, task Task,
 		// Hermes sees the host's files (read-only), so the libraries only need to be importable.
 		cmd.Env = append(cmd.Env, "PYTHONPATH="+t.PythonPath)
 	}
+	capMemory(cmd, cfg.MemoryMax)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		cleanup()
@@ -343,19 +375,16 @@ func (c HermesContestant) command(hermesHome, dir string, homeIsWorkspace bool, 
 		"--bind", hermesHome, hermesHome,
 		"--chdir", workdir,
 		"--unshare-pid", "--unshare-ipc", "--new-session", "--die-with-parent",
-		"--", "/bin/sh",
+		"--setenv", "HOME", realHome,
 	)
-	cmd := exec.Command(bwrap, append(args, script...)...)
-	// Session variables would point at sockets that no longer exist inside the namespace.
-	for _, kv := range env {
-		k, _, _ := strings.Cut(kv, "=")
-		switch k {
-		case "DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR", "SSH_AUTH_SOCK", "HOME":
-			continue
-		}
-		cmd.Env = append(cmd.Env, kv)
+	// Session variables point at sockets that do not exist inside the namespace. They are removed
+	// there, not from the command's own environment, which systemd-run may still need.
+	for _, k := range []string{"DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR", "SSH_AUTH_SOCK"} {
+		args = append(args, "--unsetenv", k)
 	}
-	cmd.Env = append(cmd.Env, "HOME="+realHome)
+	args = append(args, "--", "/bin/sh")
+	cmd := exec.Command(bwrap, append(args, script...)...)
+	cmd.Env = env
 	return cmd, nil
 }
 
