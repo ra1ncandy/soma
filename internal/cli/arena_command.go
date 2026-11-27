@@ -26,6 +26,7 @@ func newArenaCmd() *cobra.Command {
 		somaEnv                                                                                    []string
 		hermesEffort                                                                               string
 		osworldDir                                                                                 string
+		hermesUncontained                                                                          bool
 		limit                                                                                      int
 	)
 	run := &cobra.Command{
@@ -68,7 +69,7 @@ func newArenaCmd() *cobra.Command {
 					if hermesBin == "" {
 						return errors.New("--hermes-bin is required for the hermes contestant")
 					}
-					cs = append(cs, arena.HermesContestant{Bin: hermesBin, BaseHome: hermesHome, ReasoningEffort: hermesEffort})
+					cs = append(cs, arena.HermesContestant{Bin: hermesBin, BaseHome: hermesHome, ReasoningEffort: hermesEffort, Uncontained: hermesUncontained})
 				default:
 					return fmt.Errorf("unknown contestant %q (soma, hermes)", name)
 				}
@@ -107,7 +108,7 @@ func newArenaCmd() *cobra.Command {
 				Notes: []string{
 					"Both contestants reach the model only through the arena proxy, which counts calls, tokens and cost and enforces each task's call budget and the run's spend cap. Provider credentials are stripped from their environments.",
 					"Both receive the same goal text; graders are held out and run after the contestant exits.",
-					"soma runs `soma ask` (OS-sandboxed shell, isolated workspace applied to the project on completion). Hermes runs `hermes -z` one-shot with --yolo (its hardline blocklist still applies) on its default local terminal backend, which executes on the host.",
+					"soma runs `soma ask` (OS-sandboxed shell without network, isolated workspace applied to the project on completion). Hermes runs `hermes -z` one-shot with --yolo (its hardline blocklist still applies) on its default local terminal backend. " + hermesContainmentNote(hermesUncontained),
 					"Hermes' turn limit (agent.max_turns) and soma's --max-turns are both set to the task's call budget.",
 					"Each Hermes attempt gets a fresh HERMES_HOME (no memory or history from other attempts). Before the clock starts, Hermes answers one trivial prompt served locally by the proxy, so its first-run setup and gateway start-up are neither timed nor billed. soma has no such setup; its start-up is inside its timed run.",
 					hermesEffortNote(hermesEffort),
@@ -155,6 +156,7 @@ func newArenaCmd() *cobra.Command {
 	run.Flags().StringVar(&somaBin, "soma-bin", "", "soma binary (default: this binary)")
 	run.Flags().StringArrayVar(&somaEnv, "soma-env", nil, "Extra SOMA_NAME=value setting for the soma contestant (repeatable), for comparing configurations")
 	run.Flags().StringVar(&hermesBin, "hermes-bin", "", "Installed hermes launcher")
+	run.Flags().BoolVar(&hermesUncontained, "hermes-uncontained", false, "Run Hermes directly on this machine instead of in a mount namespace that hides your home directory (it runs with --yolo: it can then write anywhere you can)")
 	run.Flags().StringVar(&hermesEffort, "hermes-reasoning-effort", "", "Set Hermes' agent.reasoning_effort (default: leave Hermes' own default)")
 	run.Flags().StringVar(&hermesHome, "hermes-home", "", "Installed HERMES_HOME (for --version)")
 	run.Flags().StringVar(&outDir, "out", "arena-results", "Output directory for arena-report.{json,md}")
@@ -226,6 +228,13 @@ func selectArenaTasks(tier, taskIDs, osworldDir string, limit int) ([]arena.Task
 		tasks = picked
 	}
 	return tasks, nil
+}
+
+func hermesContainmentNote(uncontained bool) string {
+	if uncontained {
+		return "Hermes ran directly on the host, with the operator's files and network."
+	}
+	return "Hermes ran in a mount namespace: it sees the host's programs read-only and has network access, but the operator's home directory is hidden and it can write only to the task workspace, its own state directory and a private /tmp."
 }
 
 func hermesEffortNote(effort string) string {

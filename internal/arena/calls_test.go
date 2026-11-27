@@ -4,6 +4,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -112,5 +115,66 @@ func TestProxyWarmupIsLocalAndUnmetered(t *testing.T) {
 	}
 	if upstreamHits != 1 || u.Calls != 1 || u.OutputTokens != 5 {
 		t.Fatalf("metering after warm-up: hits=%d usage=%+v", upstreamHits, u)
+	}
+}
+
+// Contained (the default), Hermes may write to the task workspace and its own state directory,
+// and nowhere in the operator's home; with homeIsWorkspace the workspace is mounted at the home
+// path. The test runs a shell in place of Hermes.
+func TestHermesContainmentLive(t *testing.T) {
+	if _, err := exec.LookPath("bwrap"); err != nil {
+		t.Skip("bwrap not available")
+	}
+	realHome, err := os.UserHomeDir()
+	if err != nil {
+		t.Skip("no home directory")
+	}
+	// A stand-in "hermes" that runs its -z argument as a shell script.
+	binDir := t.TempDir()
+	fake := filepath.Join(binDir, "hermes")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\nexec sh -c \"$2\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c := HermesContestant{Bin: fake}
+	marker := filepath.Join(realHome, ".arena-containment-test-marker")
+	_ = os.Remove(marker)
+	defer func() { _ = os.Remove(marker) }()
+
+	for _, homeIsWorkspace := range []bool{false, true} {
+		ws, state := t.TempDir(), t.TempDir()
+		script := `echo in-cwd > made-in-cwd; echo in-home > "$HOME/.arena-containment-test-marker" 2>/dev/null; ` +
+			`echo state > "$HERMES_HOME/s"; ls "$HOME" | wc -l; touch /usr/arena-x 2>/dev/null && echo USR-WRITABLE; true`
+		// The supervisor runs the warm-up prompt, waits for a line, then runs the task prompt.
+		cmd, err := c.command(state, ws, homeIsWorkspace, "true", script)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cmd.Stdin = strings.NewReader("go\n")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("homeIsWorkspace=%v: %v\n%s", homeIsWorkspace, err, out)
+		}
+		if !strings.Contains(string(out), hermesReady) {
+			t.Fatalf("homeIsWorkspace=%v: supervisor never announced readiness:\n%s", homeIsWorkspace, out)
+		}
+		if strings.Contains(string(out), "USR-WRITABLE") {
+			t.Errorf("homeIsWorkspace=%v: host files must be read-only", homeIsWorkspace)
+		}
+		if _, err := os.Stat(marker); err == nil {
+			t.Fatalf("homeIsWorkspace=%v: the contestant wrote into the real home directory", homeIsWorkspace)
+		}
+		if _, err := os.Stat(filepath.Join(ws, "made-in-cwd")); err != nil {
+			t.Errorf("homeIsWorkspace=%v: workspace writes must persist: %v", homeIsWorkspace, err)
+		}
+		if _, err := os.Stat(filepath.Join(state, "s")); err != nil {
+			t.Errorf("homeIsWorkspace=%v: state directory writes must persist: %v", homeIsWorkspace, err)
+		}
+		_, inWorkspace := os.Stat(filepath.Join(ws, ".arena-containment-test-marker"))
+		if homeIsWorkspace && inWorkspace != nil {
+			t.Errorf("with homeIsWorkspace, a write to $HOME must land in the workspace")
+		}
+		if !homeIsWorkspace && inWorkspace == nil {
+			t.Errorf("without homeIsWorkspace, $HOME must not be the workspace")
+		}
 	}
 }

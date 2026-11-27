@@ -15,9 +15,16 @@ What is included:
 - No LibreOffice: its three task domains are left out, tasks elsewhere that involve it or
   produce office documents are skipped, and nothing here runs LibreOffice.
 - No tasks that need the network (soma's sandbox is offline).
+- No tasks whose checker expects exactly what the GUI would have written when the instruction
+  does not say it (`NOT_FAITHFUL` in `prepare.py` lists them with the reason).
 
-Today that is 17 tasks: 9 image edits (GIMP domain), 7 VS Code settings or text edits and 1
+Today that is 15 tasks: 9 image edits (GIMP domain), 5 VS Code settings or text edits and 1
 multi-app task (animated GIF from a video).
+
+The workspace is mounted as the contestant's home directory. Hermes, which otherwise runs on the
+host, is confined to a mount namespace for this (and every) tier: an earlier uncontained run
+wrote task output, VS Code settings, pip packages and 1.3 GB of model downloads into the
+operator's real home.
 
 ## Prepare (once)
 

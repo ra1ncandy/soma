@@ -31,6 +31,12 @@ spec.loader.exec_module(g)
 DOMAINS = ["gimp", "vs_code", "multi_apps"]
 # Tasks that need the internet: soma's sandbox is offline, so they cannot be compared fairly.
 NEEDS_NETWORK = {"acb0f96b": "clones a GitHub repository"}
+# Tasks whose checker expects exactly what the GUI application would have written, which the
+# instruction does not say and a file-only contestant cannot know. Every contestant failed them.
+NOT_FAITHFUL = {
+    "ec71221e": "says 'indent by one tab' but the gold file has four spaces, as VS Code inserts",
+    "ea98c5d7": "expects the exact 'when' clause VS Code writes when a default shortcut is removed",
+}
 OFFICE_EXTENSIONS = (".xlsx", ".xls", ".ods", ".docx", ".doc", ".odt", ".pptx", ".ppt", ".odp", ".csv")
 
 sys.path.insert(0, HERE)
@@ -60,6 +66,8 @@ def consider(root, src, domain, task_file):
         raise g.Unsupported("infeasible-task check")
     if t["id"][:8] in NEEDS_NETWORK:
         raise g.Unsupported("needs the network: " + NEEDS_NETWORK[t["id"][:8]])
+    if t["id"][:8] in NOT_FAITHFUL:
+        raise g.Unsupported("not faithful without the GUI: " + NOT_FAITHFUL[t["id"][:8]])
     if any("libreoffice" in a.lower() for a in t.get("related_apps", [])):
         raise g.Unsupported("involves LibreOffice")
     results_cfg = ev["result"] if isinstance(ev.get("result"), list) else [ev.get("result")]
