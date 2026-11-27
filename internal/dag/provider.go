@@ -705,7 +705,7 @@ func buildOpenAIMessages(frame compiler.CompiledFrame, passReasoning bool) []map
 
 	lastRole, _ := msgs[len(msgs)-1]["role"].(string)
 	hasViewport := frame.Tail.Viewport != nil && frame.Tail.Viewport.DataURI != ""
-	needsTail := hasViewport || frame.Tail.StallCount > 0 || (frame.Tail.StepBudgetRemaining > 0 && frame.Tail.StepBudgetRemaining <= 2) || frame.Tail.BudgetLow() || frame.Tail.GitDiffStat != ""
+	needsTail := hasViewport || frame.Tail.StallCount > 0 || (frame.Tail.StepBudgetRemaining > 0 && frame.Tail.StepBudgetRemaining <= 2) || frame.Tail.BudgetLow() || frame.Tail.ChecksRepeating() || frame.Tail.GitDiffStat != ""
 	if needsTail {
 		if hasViewport {
 			parts := []map[string]any{

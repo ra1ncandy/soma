@@ -125,6 +125,15 @@ type ViewportFrame struct {
 	DataURI  string `json:"-"`
 }
 
+// ChecksRepeatingAfter is how many check-only turns in a row trigger the repeating-checks notice.
+const ChecksRepeatingAfter = 2
+
+// ChecksRepeating reports that the model keeps running commands that do not fail, without
+// editing anything in between: the point where more verification mostly costs tokens and time.
+func (t LiveTailState) ChecksRepeating() bool {
+	return t.PassingCheckStreak >= ChecksRepeatingAfter
+}
+
 // BudgetLow reports that the run is in its last quarter of turns (at least the last 3), when the
 // model must stop exploring and polishing and make sure the deliverable is complete. It is only
 // known for steps that recorded the total budget.
@@ -147,7 +156,10 @@ type LiveTailState struct {
 	LastOracleError     string `json:"last_oracle_error,omitempty"`
 	StepBudgetRemaining int    `json:"step_budget_remaining"`
 	// StepBudgetTotal is the turn budget of this run of the branch (0 = unknown, older steps).
-	StepBudgetTotal     int            `json:"step_budget_total,omitempty"`
+	StepBudgetTotal int `json:"step_budget_total,omitempty"`
+	// PassingCheckStreak counts consecutive turns that only ran commands, with no failure and no
+	// edit since the last one. See ChecksRepeating.
+	PassingCheckStreak  int            `json:"passing_check_streak,omitempty"`
 	AccountQuotaSummary string         `json:"account_quota_summary,omitempty"`
 	StallCount          int            `json:"stall_count"`
 	MaxStalls           int            `json:"max_stalls"`
@@ -405,6 +417,11 @@ func Compile(snap EpochSnapshot, l2 []LogEntry, tail LiveTailState, profile Mode
 		fmt.Fprintf(&l3Buf, "TURN BUDGET LOW: %d of %d turns left. Stop exploring, adding tests or polishing. "+
 			"Make sure the requested change is complete and saved, verify it once, then finish with your summary.\n",
 			tail.StepBudgetRemaining, tail.StepBudgetTotal)
+	}
+
+	if tail.ChecksRepeating() {
+		fmt.Fprintf(&l3Buf, "CHECKS REPEATING: your last %d turns only ran commands, none failed, and you have not edited anything since. "+
+			"If their output shows no problem, finish now with your summary instead of running more checks.\n", tail.PassingCheckStreak)
 	}
 
 	l0 := snap.Layer0Text

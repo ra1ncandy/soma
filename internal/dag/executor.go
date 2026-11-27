@@ -791,6 +791,9 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 	prevStateHash := ""
 	lastOracleError := ""
 	consecutiveTruncations := 0
+	// Verification that keeps passing without any edit in between is tracked so the live tail can
+	// tell the model to stop (see compiler.LiveTailState.ChecksRepeating).
+	editedThisRun, passingCheckStreak := false, 0
 	var currentViewport *compiler.ViewportFrame
 	if branch.HeadStepID != "" {
 		if hs, err := e.Store.GetStep(ctx, branch.HeadStepID); err == nil {
@@ -861,6 +864,7 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 			LastOracleError:     lastOracleError,
 			StepBudgetRemaining: maxTurns - turn,
 			StepBudgetTotal:     maxTurns,
+			PassingCheckStreak:  passingCheckStreak,
 			AccountQuotaSummary: fmt.Sprintf("%s:%s", acc.ID, acc.ModelID),
 			StallCount:          branch.StallCount,
 			MaxStalls:           e.Profile.MaxStalls,
@@ -1316,6 +1320,7 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 			wg.Wait()
 		}
 
+		turnEdited, turnChecked, turnFailed := false, false, false
 		for idx, pc := range planned {
 			tc := pc.spec
 			var obsText, obsPageID string
@@ -1406,6 +1411,16 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 				hasCommittedAction = true
 			}
 
+			switch tc.Name {
+			case "fs_write", "fs_patch":
+				turnEdited = true
+			case "exec", "execute_code", "bg_exec", "bg_poll":
+				turnChecked = true
+			}
+			if observationFailed(obsText) {
+				turnFailed = true
+			}
+
 			entryReasoning := genResp.Reasoning
 			asstContent := ""
 			asstReasoningContent := ""
@@ -1432,6 +1447,15 @@ func (e *Executor) ExecuteBranch(ctx context.Context, branchID string, maxTurns 
 				Observation:      obsText,
 				PageID:           obsPageID,
 			})
+		}
+
+		switch {
+		case turnEdited:
+			editedThisRun, passingCheckStreak = true, 0
+		case turnFailed:
+			passingCheckStreak = 0
+		case turnChecked && editedThisRun:
+			passingCheckStreak++
 		}
 
 		nextPending := appendDynamicEntries(nextTurn, genResp, turnEntries...)
