@@ -93,6 +93,16 @@ func BuildBwrapArgs(spec ExecSpec) ([]string, error) {
 		}
 	}
 
+	// Font configuration lets anything that renders text (office tools, plotting, PDF) start;
+	// it holds no secrets. A synthetic passwd/group gives the current uid a name without
+	// revealing the host's accounts.
+	args = append(args, "--ro-bind-try", "/etc/fonts", "/etc/fonts")
+	if passwd, group := identityFiles(); passwd != "" {
+		args = append(args, "--ro-bind", passwd, "/etc/passwd", "--ro-bind", group, "/etc/group")
+	}
+	for _, m := range spec.ToolMounts {
+		args = append(args, "--ro-bind", m.Host, m.Dest)
+	}
 	args = append(args,
 		"--ro-bind-try", "/etc/ld.so.cache", "/etc/ld.so.cache",
 		"--proc", "/proc",
