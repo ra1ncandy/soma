@@ -1,6 +1,7 @@
 package arena
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -20,6 +21,10 @@ type Task struct {
 	Files    map[string]string
 	Generate func(dir string) error
 	Grader   string
+	// GradeFunc, when set, grades the workspace instead of the Python Grader script.
+	GradeFunc func(ctx context.Context, dir string) (bool, string)
+	// Tools is extra tooling each contestant is given for this task.
+	Tools *TaskTools
 }
 
 // Seed writes the task's starting files into dir.

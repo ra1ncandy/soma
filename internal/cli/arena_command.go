@@ -25,6 +25,8 @@ func newArenaCmd() *cobra.Command {
 		keep                                                                                       bool
 		somaEnv                                                                                    []string
 		hermesEffort                                                                               string
+		osworldDir                                                                                 string
+		limit                                                                                      int
 	)
 	run := &cobra.Command{
 		Use:   "run",
@@ -40,20 +42,9 @@ func newArenaCmd() *cobra.Command {
 			if key == "" {
 				return fmt.Errorf("set the API key in $%s (it is injected by the proxy; contestants never see it)", keyEnv)
 			}
-			var tasks []arena.Task
-			if taskIDs == "" {
-				tasks = arena.TasksForTier(tier)
-				if len(tasks) == 0 {
-					return fmt.Errorf("unknown tier %q (starter, hard, all)", tier)
-				}
-			} else {
-				for _, id := range strings.Split(taskIDs, ",") {
-					t, ok := arena.TaskByID(strings.TrimSpace(id))
-					if !ok {
-						return fmt.Errorf("unknown task %q", id)
-					}
-					tasks = append(tasks, t)
-				}
+			tasks, err := selectArenaTasks(tier, taskIDs, osworldDir, limit)
+			if err != nil {
+				return err
 			}
 			if somaBin == "" {
 				exe, err := os.Executable()
@@ -123,6 +114,12 @@ func newArenaCmd() *cobra.Command {
 					fmt.Sprintf("Prices used for the spend cap (USD per 1M tokens): input %.4g, cached input %.4g, output %.4g.", priceIn, priceCached, priceOut),
 				},
 			}
+			for _, t := range tasks {
+				if t.Tier == "osworld" {
+					rep.Notes = append(rep.Notes, "Tasks named osw-* are OSWorld tasks replicated on plain files: OSWorld's instruction (plus a note that no GUI is available), its starting files and its own checker functions, but no desktop VM. Only tasks whose checker reads files are included, and only those where the checker rejects the starting files and accepts OSWorld's gold file. A spreadsheet that fails as written is checked again after a LibreOffice re-save, mirroring OSWorld's save step. Both contestants get the same Python libraries (openpyxl, python-docx, python-pptx) and headless LibreOffice; soma reads them through read-only sandbox mounts. These scores are not comparable with the OSWorld leaderboard.")
+					break
+				}
+			}
 			if runErr != nil {
 				rep.Notes = append(rep.Notes, "Run stopped early: "+runErr.Error())
 			}
@@ -141,7 +138,9 @@ func newArenaCmd() *cobra.Command {
 		},
 	}
 	run.Flags().StringVar(&taskIDs, "tasks", "", "Comma-separated task ids (overrides --tier)")
-	run.Flags().StringVar(&tier, "tier", "starter", "Task tier: starter, hard or all")
+	run.Flags().StringVar(&tier, "tier", "starter", "Task tier: starter, hard, all, or osworld (OSWorld tasks replicated on plain files)")
+	run.Flags().StringVar(&osworldDir, "osworld-dir", "", "Prepared OSWorld directory for --tier osworld (default ~/.local/share/soma-arena/osworld)")
+	run.Flags().IntVar(&limit, "limit", 0, "Run at most this many tasks, spread evenly over the selected ones (0 = all)")
 	run.Flags().BoolVar(&keep, "keep", false, "Keep every attempt's workspace, agent output and grader output under <out>/attempts")
 	run.Flags().StringVar(&contestants, "contestants", "soma,hermes", "Contestants to run")
 	run.Flags().StringVar(&baseURL, "base-url", "", "Upstream OpenAI-compatible base URL (e.g. https://openrouter.ai/api/v1)")
@@ -161,6 +160,72 @@ func newArenaCmd() *cobra.Command {
 	run.Flags().StringVar(&outDir, "out", "arena-results", "Output directory for arena-report.{json,md}")
 	root.AddCommand(run)
 	return root
+}
+
+// selectArenaTasks resolves --tier / --tasks (and --limit) to a task list. Tasks whose id starts
+// with "osw-" and the osworld tier come from the prepared OSWorld directory.
+func selectArenaTasks(tier, taskIDs, osworldDir string, limit int) ([]arena.Task, error) {
+	var osworld []arena.Task
+	loadOSWorld := func() error {
+		if osworld != nil {
+			return nil
+		}
+		dir := osworldDir
+		if dir == "" {
+			home, err := os.UserHomeDir()
+			if err != nil {
+				return err
+			}
+			dir = filepath.Join(home, ".local", "share", "soma-arena", "osworld")
+		}
+		var err error
+		osworld, err = arena.OSWorldTasks(dir)
+		return err
+	}
+	var tasks []arena.Task
+	switch {
+	case taskIDs != "":
+		for _, id := range strings.Split(taskIDs, ",") {
+			id = strings.TrimSpace(id)
+			if t, ok := arena.TaskByID(id); ok {
+				tasks = append(tasks, t)
+				continue
+			}
+			found := false
+			if strings.HasPrefix(id, "osw-") {
+				if err := loadOSWorld(); err != nil {
+					return nil, err
+				}
+				for _, t := range osworld {
+					if t.ID == id {
+						tasks, found = append(tasks, t), true
+					}
+				}
+			}
+			if !found {
+				return nil, fmt.Errorf("unknown task %q", id)
+			}
+		}
+	case tier == "osworld":
+		if err := loadOSWorld(); err != nil {
+			return nil, err
+		}
+		tasks = osworld
+	default:
+		tasks = arena.TasksForTier(tier)
+	}
+	if len(tasks) == 0 {
+		return nil, fmt.Errorf("no tasks for tier %q (starter, hard, all, osworld)", tier)
+	}
+	if limit > 0 && limit < len(tasks) {
+		// Evenly spaced, so a limited run still covers every part of the list.
+		picked := make([]arena.Task, 0, limit)
+		for i := 0; i < limit; i++ {
+			picked = append(picked, tasks[i*len(tasks)/limit])
+		}
+		tasks = picked
+	}
+	return tasks, nil
 }
 
 func hermesEffortNote(effort string) string {

@@ -45,6 +45,9 @@ type SomaContestant struct {
 	Env []string
 }
 
+// somaToolsPythonPath is where a task's Python libraries appear inside soma's sandbox.
+const somaToolsPythonPath = "/opt/arena-pylib"
+
 func (c SomaContestant) Name() string { return "soma" }
 
 func (c SomaContestant) Version() string {
@@ -63,6 +66,15 @@ func (c SomaContestant) Run(ctx context.Context, cfg RunConfig, task Task, dir s
 	cmd := exec.CommandContext(ctx, c.Bin, "ask", "--dir", dir, "--max-turns", fmt.Sprint(turns), task.Goal)
 	cmd.Dir = dir
 	cmd.Env = append(append(cleanEnv(), c.Env...), "SOMA_API_BASE="+cfg.ProxyBaseURL, "SOMA_MODEL="+cfg.Model, "SOMA_API_KEY=arena")
+	if t := task.Tools; t != nil {
+		// soma's sandbox sees only /usr by default; the task's tooling is mounted read-only.
+		binds := append([]string(nil), t.ROPaths...)
+		if t.PythonPath != "" {
+			binds = append(binds, t.PythonPath+":"+somaToolsPythonPath)
+			cmd.Env = append(cmd.Env, "SOMA_SANDBOX_ENV=PYTHONPATH="+somaToolsPythonPath)
+		}
+		cmd.Env = append(cmd.Env, "SOMA_SANDBOX_RO_BINDS="+strings.Join(binds, ","))
+	}
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
@@ -147,6 +159,10 @@ func (c HermesContestant) Prepare(ctx context.Context, cfg RunConfig, task Task)
 		cmd := exec.CommandContext(ctx, c.Bin, "-z", task.Goal, "--yolo")
 		cmd.Dir = dir
 		cmd.Env = append(cleanEnv(), "HERMES_HOME="+home)
+		if t := task.Tools; t != nil && t.PythonPath != "" {
+			// Hermes runs commands on the host, so the libraries only need to be importable.
+			cmd.Env = append(cmd.Env, "PYTHONPATH="+t.PythonPath)
+		}
 		out, err := cmd.CombinedOutput()
 		return string(out), err
 	}
@@ -328,6 +344,9 @@ func keepAttempt(dest, dir, agentOut, graderOut string, calls []CallRecord) {
 
 // grade runs the held-out grader from outside the workspace.
 func grade(ctx context.Context, task Task, dir string) (bool, string) {
+	if task.GradeFunc != nil {
+		return task.GradeFunc(ctx, dir)
+	}
 	f, err := os.CreateTemp("", "arena-grader-*.py")
 	if err != nil {
 		return false, err.Error()
