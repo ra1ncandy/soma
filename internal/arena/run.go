@@ -22,6 +22,8 @@ type RunConfig struct {
 	ProxyBaseURL string
 	Model        string
 	WallClock    time.Duration
+	// Anthropic means the upstream is Anthropic's Messages API, which contestants speak natively.
+	Anthropic bool
 	// MemoryMax caps the memory of each contestant's whole process tree (for example "8G");
 	// empty means no cap. See capMemory.
 	MemoryMax string
@@ -97,7 +99,11 @@ func (c SomaContestant) Run(ctx context.Context, cfg RunConfig, task Task, dir s
 	}
 	cmd := exec.CommandContext(ctx, c.Bin, "ask", "--dir", dir, "--max-turns", fmt.Sprint(turns), task.Goal)
 	cmd.Dir = dir
-	cmd.Env = append(append(cleanEnv(), c.Env...), "SOMA_API_BASE="+cfg.ProxyBaseURL, "SOMA_MODEL="+cfg.Model, "SOMA_API_KEY=arena")
+	base := cfg.ProxyBaseURL
+	if cfg.Anthropic {
+		base += "#anthropic" // soma's native Messages adapter instead of the OpenAI-compatible one
+	}
+	cmd.Env = append(append(cleanEnv(), c.Env...), "SOMA_API_BASE="+base, "SOMA_MODEL="+cfg.Model, "SOMA_API_KEY=arena")
 	if t := task.Tools; t != nil {
 		// soma's sandbox sees only /usr by default; the task's tooling is mounted read-only.
 		binds := append([]string(nil), t.ROPaths...)
@@ -158,16 +164,22 @@ func (c HermesContestant) config(cfg RunConfig, maxTurns int) string {
 	if e := strings.TrimSpace(c.ReasoningEffort); e != "" {
 		effortLine = fmt.Sprintf("  reasoning_effort: %q\n", e)
 	}
+	provider, base := "custom", cfg.ProxyBaseURL
+	if cfg.Anthropic {
+		// Hermes' native Anthropic provider (cache breakpoints, thinking handling). It accepts a
+		// base URL override only when the path ends in /anthropic; the proxy strips that prefix.
+		provider, base = "anthropic", strings.TrimSuffix(cfg.ProxyBaseURL, "/v1")+"/anthropic"
+	}
 	return fmt.Sprintf(`model:
   default: %q
-  provider: "custom"
+  provider: %q
   base_url: %q
   api_key: "arena"
 agent:
   max_turns: %d
 %sterminal:
   backend: "local"
-`, cfg.Model, cfg.ProxyBaseURL, maxTurns, effortLine)
+`, cfg.Model, provider, base, maxTurns, effortLine)
 }
 
 // hermesReady is printed by the supervisor script once Hermes' warm-up prompt has finished.
@@ -212,6 +224,10 @@ func (c HermesContestant) Prepare(ctx context.Context, cfg RunConfig, task Task,
 	if t := task.Tools; t != nil && t.PythonPath != "" {
 		// Hermes sees the host's files (read-only), so the libraries only need to be importable.
 		cmd.Env = append(cmd.Env, "PYTHONPATH="+t.PythonPath)
+	}
+	if cfg.Anthropic {
+		// A placeholder: the proxy replaces it with the real key, which Hermes never sees.
+		cmd.Env = append(cmd.Env, "ANTHROPIC_API_KEY=arena")
 	}
 	capMemory(cmd, cfg.MemoryMax)
 	stdin, err := cmd.StdinPipe()

@@ -205,3 +205,94 @@ func TestCapMemoryLive(t *testing.T) {
 		t.Fatalf("an empty cap must leave the command alone, got %s", uncapped.Path)
 	}
 }
+
+// With Anthropic upstream the proxy sends the real key as x-api-key (never as a bearer token and
+// never the contestant's placeholder), accepts Hermes' /anthropic path prefix, and meters cache
+// reads and writes at their own prices.
+func TestProxyAnthropicUpstream(t *testing.T) {
+	var gotPath, gotKey, gotAuth, gotVersion string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath, gotKey, gotAuth, gotVersion = r.URL.Path, r.Header.Get("x-api-key"), r.Header.Get("Authorization"), r.Header.Get("anthropic-version")
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":100,\"cache_read_input_tokens\":1000,\"cache_creation_input_tokens\":200,\"output_tokens\":1}}}\n\n"+
+			"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"name\":\"fs_read\"}}\n\n"+
+			"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"p\\\":1}\"}}\n\n"+
+			"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":50}}\n\n")
+	}))
+	defer up.Close()
+	p, err := NewProxy(up.URL+"/v1", "real-key", Price{Input: 1, Cached: 0.1, CacheWrite: 1.25, Output: 5}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = p.Close() }()
+	// The test server is not api.anthropic.com; force the mode the hostname would select.
+	p.upstream.Host = "api.anthropic.com"
+	if !p.AnthropicUpstream() {
+		t.Fatal("api.anthropic.com must select Anthropic mode")
+	}
+	p.upstream.Host = strings.TrimPrefix(up.URL, "http://")
+	p.forceAnthropic = true
+
+	p.Begin("s", 5)
+	root := strings.TrimSuffix(p.BaseURL(), "/v1")
+	req, _ := http.NewRequest(http.MethodPost, root+"/anthropic/v1/messages", strings.NewReader(`{"model":"m","stream":true,"system":[{"type":"text","text":"s","cache_control":{"type":"ephemeral"}}],"messages":[]}`))
+	req.Header.Set("x-api-key", "arena")
+	req.Header.Set("Authorization", "Bearer arena")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+
+	if gotPath != "/v1/messages" {
+		t.Errorf("upstream path = %q, want /v1/messages", gotPath)
+	}
+	if gotKey != "real-key" || gotAuth != "" || gotVersion == "" {
+		t.Errorf("upstream auth: x-api-key=%q authorization=%q version=%q", gotKey, gotAuth, gotVersion)
+	}
+	var u Usage
+	for i := 0; i < 200; i++ {
+		if u = p.End("s"); u.OutputTokens == 50 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if u.InputTokens != 1300 || u.CachedTokens != 1000 || u.CacheWriteTokens != 200 || u.OutputTokens != 50 {
+		t.Fatalf("usage = %+v", u)
+	}
+	want := (100*1.0 + 1000*0.1 + 200*1.25 + 50*5.0) / 1e6
+	if d := u.CostUSD - want; d > 1e-12 || d < -1e-12 {
+		t.Fatalf("cost = %v, want %v", u.CostUSD, want)
+	}
+	var calls []CallRecord
+	for i := 0; i < 200 && len(calls) == 0; i++ { // appended just after the usage is recorded
+		calls = p.Calls("s")
+		time.Sleep(5 * time.Millisecond)
+	}
+	if len(calls) != 1 || calls[0].CacheBreakpoints != 1 || calls[0].FinishReason != "tool_use" || len(calls[0].ToolNames) != 1 || calls[0].ToolArgChars != 7 {
+		t.Fatalf("call record = %+v", calls)
+	}
+
+	// The warm-up reply for a Messages request is Anthropic-shaped and never reaches the upstream.
+	gotPath = ""
+	p.BeginWarmup()
+	wresp, err := http.Post(root+"/anthropic/v1/messages", "application/json", strings.NewReader(`{"model":"m","stream":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wbody, _ := io.ReadAll(wresp.Body)
+	_ = wresp.Body.Close()
+	if gotPath != "" || !strings.Contains(string(wbody), `"type":"message_start"`) || !strings.Contains(string(wbody), `"text":"ok"`) {
+		t.Fatalf("warm-up must be local and Anthropic-shaped: upstream path %q, body %s", gotPath, wbody)
+	}
+}
+
+func TestPriceCacheWriteDefault(t *testing.T) {
+	if got := (Price{Input: 2}).cacheWrite(); got != 2.5 {
+		t.Fatalf("default cache-write price = %v, want 1.25x input", got)
+	}
+	if got := (Price{Input: 2, CacheWrite: 3}).cacheWrite(); got != 3 {
+		t.Fatalf("explicit cache-write price = %v", got)
+	}
+}

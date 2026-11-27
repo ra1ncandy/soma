@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -26,6 +27,26 @@ type AnthropicProvider struct {
 	OnDelta func(text string)
 	// StreamIdleTimeout bounds silence on the stream (default 180s).
 	StreamIdleTimeout time.Duration
+	// ReasoningEffort overrides SOMA_REASONING_EFFORT and the default (see anthropicEffort).
+	ReasoningEffort string
+
+	effortOmitted atomic.Bool // the model rejected output_config.effort once; stop sending it
+}
+
+// anthropicEffort maps soma's effort setting to the levels the Messages API accepts
+// (low, medium, high, xhigh, max). Thinking cannot be turned off on current models, so soma's
+// two lowest settings both become "low". An empty result means "send nothing".
+func anthropicEffort(explicit string) string {
+	switch e := effectiveReasoningEffort(explicit); e {
+	case "":
+		return ""
+	case "minimal", "none", "low":
+		return "low"
+	case "medium", "high", "xhigh", "max":
+		return e
+	default:
+		return ""
+	}
 }
 
 // NewAnthropicProvider creates a native Anthropic Messages client.
@@ -179,6 +200,11 @@ func (p *AnthropicProvider) Generate(ctx context.Context, req GenerateRequest) (
 	if t, ok := configuredTemperature(); ok {
 		payload["temperature"] = t
 	}
+	// Thinking is adaptive (and on by default) on current models; effort is the control for how
+	// much the model thinks and writes. Models without the setting get one retry without it.
+	if effort := anthropicEffort(p.ReasoningEffort); effort != "" && !p.effortOmitted.Load() {
+		payload["output_config"] = map[string]any{"effort": effort}
+	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
@@ -221,6 +247,16 @@ func (p *AnthropicProvider) Generate(ctx context.Context, req GenerateRequest) (
 		}
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 		_ = resp.Body.Close()
+		if _, sent := payload["output_config"]; sent && resp.StatusCode == http.StatusBadRequest &&
+			(bytes.Contains(errBody, []byte("effort")) || bytes.Contains(errBody, []byte("output_config"))) {
+			p.effortOmitted.Store(true)
+			delete(payload, "output_config")
+			if body, err = json.Marshal(payload); err != nil {
+				return nil, err
+			}
+			attempt--
+			continue
+		}
 		switch {
 		case resp.StatusCode == http.StatusTooManyRequests:
 			ra := parseRetryAfter(resp.Header.Get("Retry-After"))
@@ -376,6 +412,11 @@ func (p *AnthropicProvider) readStream(ctx context.Context, r io.Reader, req Gen
 			}
 			calls = append(calls, wireToolCall{ID: b.id, Name: b.name, Arguments: args})
 		}
+	}
+	if stopReason == "refusal" {
+		// A safety classifier declined the request (HTTP 200). There is nothing to act on, and
+		// treating the empty reply as "done" would end the run as if it had succeeded.
+		return nil, errors.New("anthropic: the model declined this request (stop_reason=refusal)")
 	}
 	if len(calls) == 0 && strings.TrimSpace(text.String()) == "" && stopReason == "max_tokens" {
 		return nil, &OutputTruncatedError{MaxTokens: p.MaxTokens}

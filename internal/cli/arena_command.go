@@ -21,7 +21,7 @@ func newArenaCmd() *cobra.Command {
 	var (
 		taskIDs, tier, contestants, baseURL, model, keyEnv, somaBin, hermesBin, hermesHome, outDir string
 		repeats, wallMinutes                                                                       int
-		capUSD, priceIn, priceCached, priceOut                                                     float64
+		capUSD, priceIn, priceCached, priceOut, priceCacheWrite                                    float64
 		keep                                                                                       bool
 		somaEnv                                                                                    []string
 		hermesEffort                                                                               string
@@ -83,7 +83,7 @@ func newArenaCmd() *cobra.Command {
 					return fmt.Errorf("unknown contestant %q (soma, hermes)", name)
 				}
 			}
-			proxy, err := arena.NewProxy(baseURL, key, arena.Price{Input: priceIn, Cached: priceCached, Output: priceOut}, capUSD)
+			proxy, err := arena.NewProxy(baseURL, key, arena.Price{Input: priceIn, Cached: priceCached, CacheWrite: priceCacheWrite, Output: priceOut}, capUSD)
 			if err != nil {
 				return err
 			}
@@ -91,7 +91,7 @@ func newArenaCmd() *cobra.Command {
 			out := cmd.OutOrStdout()
 			runner := &arena.Runner{
 				Proxy:       proxy,
-				Config:      arena.RunConfig{ProxyBaseURL: proxy.BaseURL(), Model: model, WallClock: time.Duration(wallMinutes) * time.Minute, MemoryMax: memoryMax},
+				Config:      arena.RunConfig{ProxyBaseURL: proxy.BaseURL(), Model: model, WallClock: time.Duration(wallMinutes) * time.Minute, MemoryMax: memoryMax, Anthropic: proxy.AnthropicUpstream()},
 				Contestants: cs,
 				Tasks:       tasks,
 				Repeats:     repeats,
@@ -162,6 +162,7 @@ func newArenaCmd() *cobra.Command {
 	run.Flags().Float64Var(&capUSD, "spend-cap-usd", 0, "Hard spend cap for the whole run (required)")
 	run.Flags().Float64Var(&priceIn, "price-in", 0, "USD per 1M uncached input tokens (for the spend cap)")
 	run.Flags().Float64Var(&priceCached, "price-cached", 0, "USD per 1M cached input tokens")
+	run.Flags().Float64Var(&priceCacheWrite, "price-cache-write", 0, "USD per 1M tokens written to the cache (default 1.25x --price-in)")
 	run.Flags().Float64Var(&priceOut, "price-out", 0, "USD per 1M output tokens")
 	run.Flags().StringVar(&somaBin, "soma-bin", "", "soma binary (default: this binary)")
 	run.Flags().StringArrayVar(&somaEnv, "soma-env", nil, "Extra SOMA_NAME=value setting for the soma contestant (repeatable), for comparing configurations")

@@ -29,20 +29,24 @@ func ProtocolForEndpoint(baseURL string) string {
 	case strings.Contains(u.Fragment, "responses"):
 		// Opt in for any endpoint by appending #responses to its base URL.
 		return ProtocolOpenAIResponses
+	case strings.Contains(u.Fragment, "anthropic"):
+		// Likewise #anthropic, for a proxy or gateway in front of the Anthropic Messages API.
+		return ProtocolAnthropic
 	}
 	return ProtocolOpenAIChat
 }
 
 // NewProvider is the single constructor every surface uses for an endpoint.
 func NewProvider(baseURL, apiKey string) ModelProvider {
-	switch ProtocolForEndpoint(baseURL) {
+	protocol := ProtocolForEndpoint(baseURL)
+	base := baseURL
+	if i := strings.Index(base, "#"); i >= 0 {
+		base = base[:i] // the fragment only selects the protocol
+	}
+	switch protocol {
 	case ProtocolAnthropic:
-		return NewAnthropicProvider(baseURL, apiKey)
+		return NewAnthropicProvider(base, apiKey)
 	case ProtocolOpenAIResponses:
-		base := baseURL
-		if i := strings.Index(base, "#"); i >= 0 {
-			base = base[:i]
-		}
 		return NewResponsesProvider(base, apiKey)
 	default:
 		return NewOpenAICompatProvider(baseURL, apiKey)

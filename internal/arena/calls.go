@@ -23,7 +23,8 @@ type CallRecord struct {
 	RequestBytes           int            `json:"request_bytes"`
 	SystemChars            int            `json:"system_chars"`
 	ToolSchemaChars        int            `json:"tool_schema_chars"`
-	ReplayedReasoningChars int            `json:"replayed_reasoning_chars"` // reasoning the contestant sent back from earlier turns
+	ReplayedReasoningChars int            `json:"replayed_reasoning_chars"`    // reasoning the contestant sent back from earlier turns
+	CacheBreakpoints       int            `json:"cache_breakpoints,omitempty"` // explicit cache_control markers in the request
 
 	// Response.
 	InputTokens     int      `json:"input_tokens"`
@@ -38,7 +39,7 @@ type CallRecord struct {
 }
 
 func summarizeRequest(body []byte) *CallRecord {
-	rec := &CallRecord{RequestBytes: len(body)}
+	rec := &CallRecord{RequestBytes: len(body), CacheBreakpoints: bytes.Count(body, []byte(`"cache_control"`))}
 	var top map[string]json.RawMessage
 	if json.Unmarshal(body, &top) != nil {
 		return rec
@@ -61,6 +62,17 @@ func summarizeRequest(body []byte) *CallRecord {
 				for _, key := range []string{"reasoning_content", "reasoning", "reasoning_details"} {
 					if v := m[key]; len(v) > 2 && string(v) != "null" {
 						rec.ReplayedReasoningChars += len(v)
+					}
+				}
+				// Anthropic Messages: reasoning comes back as thinking blocks inside content.
+				var blocks []map[string]json.RawMessage
+				if json.Unmarshal(m["content"], &blocks) == nil {
+					for _, b := range blocks {
+						var typ string
+						_ = json.Unmarshal(b["type"], &typ)
+						if typ == "thinking" || typ == "redacted_thinking" {
+							rec.ReplayedReasoningChars += len(b["thinking"]) + len(b["signature"]) + len(b["data"])
+						}
 					}
 				}
 			}
@@ -99,6 +111,21 @@ type callMessage struct {
 }
 
 type callChunk struct {
+	// Anthropic Messages stream events.
+	Type         string `json:"type"`
+	Index        int    `json:"index"`
+	ContentBlock *struct {
+		Type string `json:"type"`
+		Name string `json:"name"`
+	} `json:"content_block"`
+	Delta *struct {
+		Type        string `json:"type"`
+		Text        string `json:"text"`
+		Thinking    string `json:"thinking"`
+		PartialJSON string `json:"partial_json"`
+		StopReason  string `json:"stop_reason"`
+	} `json:"delta"`
+
 	Choices []struct {
 		Message      *callMessage `json:"message"`
 		Delta        *callMessage `json:"delta"`
@@ -117,6 +144,22 @@ func summarizeResponse(rec *CallRecord, body []byte, sse bool) {
 	apply := func(c callChunk) {
 		if c.Usage != nil && c.Usage.CompletionTokensDetails.ReasoningTokens > 0 {
 			rec.ReasoningTokens = c.Usage.CompletionTokensDetails.ReasoningTokens
+		}
+		switch c.Type {
+		case "content_block_start":
+			if c.ContentBlock != nil && c.ContentBlock.Type == "tool_use" {
+				names[c.Index] = c.ContentBlock.Name
+			}
+		case "content_block_delta":
+			if c.Delta != nil {
+				rec.ContentChars += len(c.Delta.Text)
+				rec.ReasoningChars += len(c.Delta.Thinking)
+				rec.ToolArgChars += len(c.Delta.PartialJSON)
+			}
+		case "message_delta":
+			if c.Delta != nil && c.Delta.StopReason != "" {
+				rec.FinishReason = c.Delta.StopReason
+			}
 		}
 		for _, ch := range c.Choices {
 			if ch.FinishReason != "" {
